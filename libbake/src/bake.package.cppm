@@ -9,6 +9,7 @@ module;
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
+#include <random>
 
 #include <nlohmann/json.hpp>
 
@@ -75,27 +76,75 @@ inline std::string Resolver::make_node_id(const std::string& name, const std::st
 }
 
 inline std::optional<std::string> Resolver::resolve_tag(const std::string& url, const std::string& tag) {
-    // Use git ls-remote to resolve tag to commit
-    std::vector<std::string> cmd = {"git", "ls-remote", url, "refs/tags/" + tag};
+    // Query both the tag ref and its peeled form (^{}).
+    // For annotated tags, ^{} gives the commit SHA; for lightweight tags
+    // (which point directly at commits) only the plain ref appears.
+    std::vector<std::string> cmd = {
+        "git", "ls-remote", url,
+        "refs/tags/" + tag,
+        "refs/tags/" + tag + "^{}"
+    };
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) return std::nullopt;
 
-    // Output format: <commit>\trefs/tags/<tag>
+    // Prefer the peeled (^{}) entry; fall back to the plain ref.
+    std::string commit;
+    std::string fallback_commit;
+
     auto& out = result.stdout_output;
-    size_t tab = out.find('\t');
-    if (tab == std::string::npos) return std::nullopt;
+    size_t pos = 0;
+    while (pos < out.size()) {
+        size_t tab = out.find('\t', pos);
+        if (tab == std::string::npos) break;
+        size_t eol = out.find('\n', tab);
+        if (eol == std::string::npos) eol = out.size();
 
-    std::string commit = out.substr(0, tab);
-    // Trim whitespace
-    while (!commit.empty() && (commit.back() == '\n' || commit.back() == '\r' || commit.back() == ' '))
-        commit.pop_back();
+        std::string sha = out.substr(pos, tab - pos);
+        std::string ref = out.substr(tab + 1, eol - tab - 1);
 
-    if (commit.empty()) return std::nullopt;
-    return commit;
+        // Trim whitespace
+        while (!sha.empty() && (sha.back() == '\n' || sha.back() == '\r' || sha.back() == ' '))
+            sha.pop_back();
+
+        if (ref.find("^{}") != std::string::npos) {
+            commit = sha;  // peeled commit — always prefer
+        } else if (fallback_commit.empty()) {
+            fallback_commit = sha;
+        }
+
+        pos = eol + 1;
+    }
+
+    if (!commit.empty()) return commit;
+    if (!fallback_commit.empty()) return fallback_commit;
+    return std::nullopt;
 }
 
 inline std::string Resolver::file_hash(const Path& file) {
     return SHA256::hex_file(file);
+}
+
+// Build the archive download URL for a given host.
+inline std::string build_archive_url(const std::string& url, const std::string& commit) {
+    // Normalize: strip trailing .git
+    std::string base = url;
+    if (ends_with(base, ".git")) {
+        base = base.substr(0, base.size() - 4);
+    }
+
+    // Detect host
+    if (base.find("gitlab.com") != std::string::npos ||
+        base.find("gitlab") != std::string::npos) {
+        // GitLab: <base>/-/archive/<commit>/<repo>.tar.gz
+        size_t last_slash = base.find_last_of('/');
+        std::string repo = (last_slash != std::string::npos)
+                           ? base.substr(last_slash + 1) : "repo";
+        return base + "/-/archive/" + commit + "/" + repo + ".tar.gz";
+    }
+
+    // GitHub and GitHub-compatible hosts (default):
+    // <base>/archive/<commit>.tar.gz
+    return base + "/archive/" + commit + ".tar.gz";
 }
 
 inline std::optional<Path> Resolver::download_archive(const std::string& url,
@@ -103,14 +152,7 @@ inline std::optional<Path> Resolver::download_archive(const std::string& url,
                                                        const Path& dest_dir) {
     dest_dir.mkdir_recursive();
 
-    // GitHub-style archive URL: <url>/archive/<commit>.tar.gz
-    std::string archive_url = url;
-    // Normalize: remove trailing .git
-    if (ends_with(archive_url, ".git")) {
-        archive_url = archive_url.substr(0, archive_url.size() - 4);
-    }
-    archive_url += "/archive/" + commit + ".tar.gz";
-
+    std::string archive_url = build_archive_url(url, commit);
     Path archive_path = dest_dir / (commit + ".tar.gz");
 
     std::vector<std::string> cmd = {"curl", "-sL", "-o", archive_path.string(), archive_url};
@@ -128,14 +170,87 @@ inline std::optional<Path> Resolver::download_archive(const std::string& url,
     return archive_path;
 }
 
+// Validate an extracted directory tree for safety.
+// Returns true if the tree passes all checks.
+inline bool validate_extracted_tree(const std::filesystem::path& tmpdir) {
+    namespace fs = std::filesystem;
+
+    const size_t MAX_FILES = 100'000;
+    const uintmax_t MAX_TOTAL_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
+
+    size_t file_count = 0;
+    uintmax_t total_size = 0;
+
+    fs::path canonical_tmp = fs::canonical(tmpdir);
+
+    for (auto& entry : fs::recursive_directory_iterator(
+            tmpdir, fs::directory_options::follow_directory_symlink)) {
+        // Defense in depth: reject any relative path containing ..
+        auto rel = fs::relative(entry.path(), tmpdir);
+        if (rel.string().find("..") != std::string::npos) {
+            std::fprintf(stderr, "bake: rejected path traversal in archive: %s\n",
+                         rel.string().c_str());
+            return false;
+        }
+
+        if (entry.is_symlink()) {
+            // Resolve the symlink target and ensure it stays inside tmpdir.
+            std::error_code ec;
+            fs::path resolved = fs::canonical(entry.path(), ec);
+            if (ec) {
+                std::fprintf(stderr, "bake: broken symlink in archive: %s\n",
+                             entry.path().string().c_str());
+                return false;
+            }
+            // Check that resolved path starts with canonical_tmp.
+            std::string r = resolved.string();
+            std::string t = canonical_tmp.string();
+            if (r.rfind(t, 0) != 0) {
+                std::fprintf(stderr, "bake: symlink escapes extraction directory: %s -> %s\n",
+                             entry.path().string().c_str(), r.c_str());
+                return false;
+            }
+        }
+
+        if (entry.is_regular_file()) {
+            file_count++;
+            total_size += entry.file_size();
+
+            if (file_count > MAX_FILES) {
+                std::fprintf(stderr, "bake: archive exceeds file count limit (%zu)\n", MAX_FILES);
+                return false;
+            }
+            if (total_size > MAX_TOTAL_SIZE) {
+                std::fprintf(stderr, "bake: archive exceeds size limit (1 GB)\n");
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir) {
-    // Create temp directory for extraction
-    Path tmp_dir = dest_dir.parent() / (dest_dir.stem_string() + ".tmp");
+    // Create a uniquely-named temp directory for extraction.
+    std::random_device rd;
+    std::uniform_int_distribution<unsigned> dist(0, 0xFFFFFF);
+    std::string suffix;
+    for (int i = 0; i < 6; ++i) {
+        char hex[4];
+        std::snprintf(hex, sizeof(hex), "%02x", dist(rd) & 0xFF);
+        suffix += hex;
+    }
+    Path tmp_dir = cache_dir_ / (".extract-" + suffix);
     tmp_dir.remove_all();
     tmp_dir.mkdir_recursive();
 
-    // Extract with tar
-    std::vector<std::string> cmd = {"tar", "xf", archive.string(), "-C", tmp_dir.string()};
+    // Extract with tar — strip ownership/permissions for safety.
+    std::vector<std::string> cmd = {
+        "tar", "xf", archive.string(),
+        "-C", tmp_dir.string(),
+        "--no-same-owner",
+        "--no-same-permissions"
+    };
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
         std::fprintf(stderr, "bake: failed to extract %s\n", archive.string().c_str());
@@ -143,16 +258,24 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
         return false;
     }
 
-    // Find the top-level directory (tarballs usually have one prefix dir)
+    // Validate the extracted tree before moving it anywhere.
+    if (!validate_extracted_tree(tmp_dir.fs())) {
+        tmp_dir.remove_all();
+        return false;
+    }
+
+    // Find the top-level directory (tarballs usually have one prefix dir).
+    // If there's exactly one top-level entry and it's a directory, strip it.
     std::string prefix_dir;
+    int top_count = 0;
     for (auto& entry : std::filesystem::directory_iterator(tmp_dir.fs())) {
-        if (entry.is_directory()) {
+        top_count++;
+        if (top_count == 1 && entry.is_directory()) {
             prefix_dir = entry.path().filename().string();
-            break;
         }
     }
 
-    if (!prefix_dir.empty()) {
+    if (top_count == 1 && !prefix_dir.empty()) {
         // Move contents of prefix dir to dest_dir
         Path prefix_path = tmp_dir / prefix_dir;
         dest_dir.remove_all();
@@ -160,8 +283,9 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
         std::filesystem::rename(prefix_path.fs(), dest_dir.fs());
         tmp_dir.remove_all();
     } else {
-        // No prefix, just rename tmp to dest
+        // No single prefix dir, rename tmp to dest
         dest_dir.remove_all();
+        dest_dir.parent().mkdir_recursive();
         std::filesystem::rename(tmp_dir.fs(), dest_dir.fs());
     }
 
@@ -219,8 +343,8 @@ inline std::optional<LockNode> Resolver::resolve_dependency(const Dependency& de
 
     std::string transport_hash = file_hash(*archive);
 
-    // Step 3: extract to temp dir and compute tree hash
-    Path extracted_dir = cache_dir_ / "pending";
+    // Step 3: extract to a unique temp dir and compute tree hash
+    Path extracted_dir = cache_dir_ / (".work-" + *commit);
     if (!extract_archive(*archive, extracted_dir)) return std::nullopt;
 
     std::string tree_hash = compute_tree_hash(extracted_dir);
