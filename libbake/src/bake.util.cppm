@@ -157,6 +157,33 @@ export inline bool write_file(const Path& path, std::string_view content) {
     return f.good();
 }
 
+// Atomic write: temp file → flush → rename.
+// Prevents partial writes from corrupting the destination on crash.
+export inline bool atomic_write_file(const Path& path, std::string_view content) {
+    if (!path.parent().exists()) { path.parent().mkdir_recursive(); }
+
+    std::string tmp = path.string() + ".tmp";
+
+    std::ofstream f(tmp, std::ios::binary);
+    if (!f) return false;
+    f.write(content.data(), static_cast<std::streamsize>(content.size()));
+    f.flush();
+    if (!f.good()) {
+        f.close();
+        std::filesystem::remove(tmp);
+        return false;
+    }
+    f.close();
+
+    std::error_code ec;
+    std::filesystem::rename(tmp, path.string(), ec);
+    if (ec) {
+        std::filesystem::remove(tmp);
+        return false;
+    }
+    return true;
+}
+
 export inline bool file_exists(const Path& p) { return p.is_regular_file(); }
 export inline bool dir_exists(const Path& p) { return p.is_directory(); }
 

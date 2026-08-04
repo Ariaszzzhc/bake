@@ -328,24 +328,42 @@ export struct Lockfile {
             content += "]\n\n";
         }
 
-        return write_file(path, content);
+        return atomic_write_file(path, content);
     }
 
-    // Check if lockfile is consistent with manifest dependencies
+    // Check if lockfile is consistent with manifest dependencies.
+    // A consistent lock has every non-path manifest dep pinned with a
+    // commit and both hashes populated.
     bool is_consistent(const Manifest& manifest) const {
-        // Every manifest dependency must have a root_dep entry
         for (auto& [name, dep] : manifest.dependencies) {
+            // Path deps are not tracked in the lockfile — skip entirely.
+            if (dep.is_path_dep) continue;
+
             auto it = root_deps.find(name);
             if (it == root_deps.end()) return false;
 
             // Node must exist
             if (nodes.find(it->second) == nodes.end()) return false;
 
-            // URL and tag must match
-            auto& node = nodes.at(it->second);
-            if (dep.is_path_dep) continue;  // path deps don't need lock
+            const auto& node = nodes.at(it->second);
+
+            // URL and tag must match the manifest
             if (node.url != dep.url) return false;
             if (node.tag != dep.tag) return false;
+
+            // Commit and both hashes must be populated (trustworthy pin)
+            if (node.commit.empty()) return false;
+            if (node.transport_sha256.empty()) return false;
+            if (node.tree_sha256.empty()) return false;
+        }
+        return true;
+    }
+
+    // True when the manifest declares only path dependencies (or none).
+    // In that case no lockfile is needed at all.
+    static bool has_only_path_deps(const Manifest& manifest) {
+        for (auto& [name, dep] : manifest.dependencies) {
+            if (!dep.is_path_dep) return false;
         }
         return true;
     }
