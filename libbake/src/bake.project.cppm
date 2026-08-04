@@ -185,33 +185,54 @@ export struct Manifest {
 
 export struct Layout {
     Path root;              // project root (contains bake.toml)
-    Path source_dir;        // src/
-    Path public_dir;        // public/
-    Path tests_dir;         // tests/
-    Path build_dir;         // .bake/
-    Path artifacts_dir;     // build/ (output executables/libs)
-    Path obj_dir;           // .bake/obj/
-    Path dep_dir;           // .bake/dep/ (staging for dependencies)
+    Path source_dir;        // root/src/
+    Path public_dir;        // root/public/
+    Path tests_dir;         // root/tests/
+    Path bake_dir;          // root/.bake/ (build script staging)
 
-    static Layout detect(const Path& root) {
+    // Unified output directory
+    Path out_dir;           // <out_root>/out/
+    Path bin_dir;           // out/bin/   (executables)
+    Path lib_dir;           // out/lib/   (static/shared libs)
+    Path obj_dir;           // out/obj/[<member>/]
+    Path bmi_dir;           // out/bmi/[<member>/]
+
+    // Detect layout. Pass ws_root for workspace members so all outputs
+    // go under the workspace root's out/ directory.
+    static Layout detect(const Path& root, const Path& ws_root = Path{}) {
         Layout l;
         l.root = root;
         l.source_dir = root / "src";
         l.public_dir = root / "public";
         l.tests_dir = root / "tests";
-        l.build_dir = root / ".bake";
-        l.artifacts_dir = root / "build";
-        l.obj_dir = l.build_dir / "obj";
-        l.dep_dir = l.build_dir / "dep";
+        l.bake_dir = root / ".bake";
+
+        Path out_base = ws_root.string().empty() ? root : ws_root;
+        l.out_dir = out_base / "out";
+        l.bin_dir = l.out_dir / "bin";
+        l.lib_dir = l.out_dir / "lib";
+
+        if (ws_root.string().empty() || ws_root == root) {
+            l.obj_dir = l.out_dir / "obj";
+            l.bmi_dir = l.out_dir / "bmi";
+        } else {
+            // Per-member subdirs to avoid name collisions in workspace builds
+            std::string member = root.filename_string();
+            l.obj_dir = l.out_dir / "obj" / member;
+            l.bmi_dir = l.out_dir / "bmi" / member;
+        }
         return l;
     }
 
     void create_directories() const {
         source_dir.mkdir_recursive();
         public_dir.mkdir_recursive();
-        build_dir.mkdir_recursive();
-        obj_dir.mkdir_recursive();
-        dep_dir.mkdir_recursive();
+        bake_dir.mkdir_recursive();
+    }
+
+    // Output directory for a given package type.
+    Path output_for(PackageType type) const {
+        return (type == PackageType::Executable) ? bin_dir : lib_dir;
     }
 };
 

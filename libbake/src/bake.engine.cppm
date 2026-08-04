@@ -281,7 +281,7 @@ export BuildPlan create_convention_plan(
     BuildPlan plan;
     plan.project_root = layout.root;
     plan.obj_dir = layout.obj_dir;
-    plan.bmi_dir = layout.build_dir / "bmi";
+    plan.bmi_dir = layout.bmi_dir;
 
     // Ensure build dirs exist
     plan.obj_dir.mkdir_recursive();
@@ -465,7 +465,7 @@ export BuildPlan create_convention_plan(
         }
 
         std::string out_name = library_name(pkg.name, pkg.type);
-        Path output = layout.artifacts_dir / out_name;
+        Path output = layout.output_for(pkg.type) / out_name;
         output.parent().mkdir_recursive();
 
         BuildAction link_action;

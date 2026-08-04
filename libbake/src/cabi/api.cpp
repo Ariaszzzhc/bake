@@ -162,7 +162,7 @@ BAKE_API bake_builder* bake_builder_new(void) noexcept {
 
         // Cache directory strings for the C API getters.
         b->source_dir_str = b->layout.source_dir.string();
-        b->build_dir_str  = b->layout.build_dir.string();
+        b->build_dir_str  = b->layout.bake_dir.string();
 
         return b.release();
     } catch (const std::exception& e) {
@@ -187,9 +187,10 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
 
     try {
         // Ensure output directories exist.
-        b->layout.build_dir.mkdir_recursive();
+        b->layout.bake_dir.mkdir_recursive();
         b->layout.obj_dir.mkdir_recursive();
-        b->layout.artifacts_dir.mkdir_recursive();
+        b->layout.bin_dir.mkdir_recursive();
+        b->layout.lib_dir.mkdir_recursive();
 
         auto actions = nlohmann::json::array();
 
@@ -231,7 +232,7 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 for (const auto& src : files) {
                     std::string src_rel = rel_to_root(src.fs(), b->layout.root.fs());
                     std::string stem    = src.stem_string();
-                    std::string obj_rel = ".bake/obj/" + stem + ".o";
+                    std::string obj_rel = "out/obj/" + stem + ".o";
                     std::string comp_id = target->name + "__" + src.filename_string();
 
                     compile_ids.push_back(comp_id);
@@ -285,7 +286,8 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 }
 
                 std::string out_name = bake::library_name(target->name, pkg_type);
-                std::string out_rel  = "build/" + out_name;
+                std::string out_subdir = (target->type == TargetType::Executable) ? "bin" : "lib";
+                std::string out_rel  = "out/" + out_subdir + "/" + out_name;
 
                 // Build link configuration.
                 bake::LinkConfig lc;
@@ -329,7 +331,7 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         nlohmann::json build_json;
         build_json["actions"] = std::move(actions);
 
-        bake::Path out_path = b->layout.build_dir / "build.json";
+        bake::Path out_path = b->layout.bake_dir / "build.json";
         std::string content = build_json.dump(2);
 
         if (!bake::write_file(out_path, content)) {

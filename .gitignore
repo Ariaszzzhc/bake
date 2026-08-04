@@ -1,6 +1,9 @@
 /.bake/
+/out/
 /build/
 /libbake/.bake/
+/libbake/out/
 /libbake/build/
 /bake/.bake/
+/bake/out/
 /bake/build/

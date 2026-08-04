@@ -586,7 +586,7 @@ export int cmd_build(const ParsedArgs& args) {
             }
 
             std::printf("bake: building '%s'\n", member_manifest->package->name.c_str());
-            auto layout = Layout::detect(member_dir);
+            auto layout = Layout::detect(member_dir, *root);
             auto tc = Toolchain::detect();
 
             auto plan = create_convention_plan(*member_manifest, layout, tc,
@@ -630,7 +630,7 @@ export int cmd_build(const ParsedArgs& args) {
             // Record this member for dependents
             BuiltMember bm;
             bm.name = member_manifest->package->name;
-            bm.bmi_dir = layout.build_dir / "bmi";
+            bm.bmi_dir = layout.bmi_dir;
             bm.lib_path = plan.primary_output;
 
             // Collect module names from BMI directory
@@ -698,36 +698,34 @@ export int cmd_clean(const ParsedArgs& args) {
         return 1;
     }
 
-    auto layout = Layout::detect(*root);
-
     int removed = 0;
-    if (layout.build_dir.exists()) {
-        layout.build_dir.remove_all();
-        std::printf("Removed %s\n", layout.build_dir.string().c_str());
-        removed++;
-    }
-    if (layout.artifacts_dir.exists()) {
-        layout.artifacts_dir.remove_all();
-        std::printf("Removed %s\n", layout.artifacts_dir.string().c_str());
+
+    // Remove unified output directory
+    Path out_dir = *root / "out";
+    if (out_dir.exists()) {
+        out_dir.remove_all();
+        std::printf("Removed %s\n", out_dir.string().c_str());
         removed++;
     }
 
-    // Clean workspace members
+    // Remove .bake/ (build script staging) for root and workspace members
     auto manifest = Manifest::load(*root);
     if (manifest && manifest->is_workspace()) {
         for (auto& member : manifest->workspace->members) {
             Path member_dir = *root / member;
-            auto ml = Layout::detect(member_dir);
-            if (ml.build_dir.exists()) {
-                ml.build_dir.remove_all();
-                std::printf("Removed %s\n", ml.build_dir.string().c_str());
+            Path member_bake = member_dir / ".bake";
+            if (member_bake.exists()) {
+                member_bake.remove_all();
+                std::printf("Removed %s\n", member_bake.string().c_str());
                 removed++;
             }
-            if (ml.artifacts_dir.exists()) {
-                ml.artifacts_dir.remove_all();
-                std::printf("Removed %s\n", ml.artifacts_dir.string().c_str());
-                removed++;
-            }
+        }
+    } else {
+        Path bake_dir = *root / ".bake";
+        if (bake_dir.exists()) {
+            bake_dir.remove_all();
+            std::printf("Removed %s\n", bake_dir.string().c_str());
+            removed++;
         }
     }
 
@@ -773,7 +771,7 @@ export int cmd_run(const ParsedArgs& args) {
 
         auto layout = Layout::detect(*root);
         std::string exe_name = library_name(manifest->package->name, PackageType::Executable);
-        exe_path = layout.artifacts_dir / exe_name;
+        exe_path = layout.bin_dir / exe_name;
     }
 
     if (!exe_path.exists()) {
