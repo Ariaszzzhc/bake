@@ -22,6 +22,14 @@ import bake.engine;
 #define BAKE_VERSION "0.1.0"
 #endif
 
+#ifndef BAKE_SRC_DIR
+#define BAKE_SRC_DIR "."
+#endif
+
+#ifndef BAKE_LIB_DIR
+#define BAKE_LIB_DIR "."
+#endif
+
 namespace bake::cli {
 
 // ===== Argument parsing =====
@@ -275,6 +283,132 @@ export int cmd_init(const ParsedArgs& args) {
     return 0;
 }
 
+// ===== build.cpp compilation + execution =====
+
+export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
+    auto tc = Toolchain::detect();
+    Path bake_dir = root / ".bake";
+    bake_dir.mkdir_recursive();
+
+    Path build_cpp = root / "build.cpp";
+    Path wrapper_src = Path(BAKE_SRC_DIR) / "libbake" / "public" / "bake.build.cppm";
+    Path cabi_header = Path(BAKE_SRC_DIR) / "libbake" / "src" / "cabi" / "bake_cabi.h";
+
+    // Copy wrapper + header to .bake/
+    Path wrapper_dst = bake_dir / "bake.build.cppm";
+    Path cabi_dst = bake_dir / "bake_cabi.h";
+    auto wrapper_content = read_file(wrapper_src);
+    auto cabi_content = read_file(cabi_header);
+    if (!wrapper_content || !cabi_content) {
+        std::fprintf(stderr, "bake: cannot find bake.build.cppm or bake_cabi.h\n");
+        return 1;
+    }
+    write_file(wrapper_dst, *wrapper_content);
+    write_file(cabi_dst, *cabi_content);
+
+    // Step 1: Compile wrapper module → BMI + .o
+    Path pcm = bake_dir / "bake.build.pcm";
+    Path wrapper_o = bake_dir / "bake.build.o";
+
+    std::printf("bake: compiling build script...\n");
+
+    {
+        std::vector<std::string> cmd;
+        cmd.push_back(tc.cxx_path);
+        cmd.push_back("-c");
+        cmd.push_back("-std=c++23");
+        cmd.push_back("-x");
+        cmd.push_back("c++-module");
+        cmd.push_back("-I" + bake_dir.string());
+        cmd.push_back("-fmodule-output=" + pcm.string());
+        cmd.push_back(wrapper_dst.string());
+        cmd.push_back("-o");
+        cmd.push_back(wrapper_o.string());
+
+        auto result = run_process(cmd, root, true);
+        if (!result.success()) {
+            std::fprintf(stderr, "%s", result.stderr_output.c_str());
+            std::fprintf(stderr, "bake: failed to compile bake.build.cppm\n");
+            return 1;
+        }
+    }
+
+    // Step 2: Compile build.cpp → .o
+    Path build_o = bake_dir / "build.o";
+    {
+        std::vector<std::string> cmd;
+        cmd.push_back(tc.cxx_path);
+        cmd.push_back("-c");
+        cmd.push_back("-std=c++23");
+        cmd.push_back("-I" + bake_dir.string());
+        if (tc.is_clang()) {
+            cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
+        }
+        cmd.push_back(build_cpp.string());
+        cmd.push_back("-o");
+        cmd.push_back(build_o.string());
+
+        auto result = run_process(cmd, root, true);
+        if (!result.success()) {
+            std::fprintf(stderr, "%s", result.stderr_output.c_str());
+            std::fprintf(stderr, "bake: failed to compile build.cpp\n");
+            return 1;
+        }
+    }
+
+    // Step 3: Link → build_app
+    Path build_app = bake_dir / "build_app";
+    {
+        std::vector<std::string> cmd;
+        cmd.push_back(tc.cxx_path);
+        cmd.push_back(wrapper_o.string());
+        cmd.push_back(build_o.string());
+        cmd.push_back("-L" + std::string(BAKE_LIB_DIR));
+        cmd.push_back("-lbake");
+        // RPATH so build_app can find libbake at runtime
+        cmd.push_back("-Wl,-rpath," + std::string(BAKE_LIB_DIR));
+        cmd.push_back("-o");
+        cmd.push_back(build_app.string());
+
+        auto result = run_process(cmd, root, true);
+        if (!result.success()) {
+            std::fprintf(stderr, "%s", result.stderr_output.c_str());
+            std::fprintf(stderr, "bake: failed to link build_app\n");
+            return 1;
+        }
+    }
+
+    // Step 4: Run build_app → .bake/build.json
+    {
+        auto result = run_process({build_app.string()}, root, true);
+        if (!result.success()) {
+            std::fprintf(stderr, "%s", result.stderr_output.c_str());
+            std::fprintf(stderr, "bake: build_app failed\n");
+            return 1;
+        }
+    }
+
+    // Step 5: Read build.json → execute
+    Path build_json = bake_dir / "build.json";
+    if (!build_json.is_regular_file()) {
+        std::fprintf(stderr, "bake: build_app did not produce .bake/build.json\n");
+        return 1;
+    }
+
+    auto plan = read_build_json(build_json, root);
+
+    // Write compile_commands.json
+    write_compile_commands(plan, root / "compile_commands.json");
+
+    // Get job count
+    int jobs = 0;
+    if (auto j = args.get_option("j")) {
+        jobs = std::atoi(j->c_str());
+    }
+
+    return execute_plan(plan, jobs);
+}
+
 // ===== build command =====
 
 export int cmd_build(const ParsedArgs& args) {
@@ -283,6 +417,12 @@ export int cmd_build(const ParsedArgs& args) {
     if (!root) {
         std::fprintf(stderr, "bake: no bake.toml found in current directory or any parent\n");
         return 1;
+    }
+
+    // Check for build.cpp (escape hatch mode)
+    Path build_cpp = *root / "build.cpp";
+    if (build_cpp.is_regular_file()) {
+        return build_with_build_cpp(*root, args);
     }
 
     // Load manifest
@@ -374,6 +514,9 @@ export int cmd_build(const ParsedArgs& args) {
 
     auto plan = create_convention_plan(*manifest, layout, tc, options);
 
+    // Write compile_commands.json
+    write_compile_commands(plan, *root / "compile_commands.json");
+
     // Get job count
     int jobs = 0;
     if (auto j = args.get_option("j")) {
@@ -443,17 +586,32 @@ export int cmd_run(const ParsedArgs& args) {
     auto root = find_project_root();
     if (!root) return 1;
 
-    auto manifest = Manifest::load(*root);
-    if (!manifest || !manifest->has_package()) return 1;
+    Path exe_path;
 
-    if (manifest->package->type != PackageType::Executable) {
-        std::fprintf(stderr, "bake: cannot run non-executable package\n");
-        return 1;
+    // If build.cpp was used, read primary output from build.json
+    Path build_json = *root / ".bake" / "build.json";
+    Path build_cpp = *root / "build.cpp";
+    if (build_cpp.is_regular_file() && build_json.is_regular_file()) {
+        auto plan = read_build_json(build_json, *root);
+        if (plan.primary_output.string() != "") {
+            exe_path = *root / plan.primary_output;
+        }
     }
 
-    auto layout = Layout::detect(*root);
-    std::string exe_name = library_name(manifest->package->name, PackageType::Executable);
-    Path exe_path = layout.artifacts_dir / exe_name;
+    // Convention mode fallback
+    if (exe_path.string() == "") {
+        auto manifest = Manifest::load(*root);
+        if (!manifest || !manifest->has_package()) return 1;
+
+        if (manifest->package->type != PackageType::Executable) {
+            std::fprintf(stderr, "bake: cannot run non-executable package\n");
+            return 1;
+        }
+
+        auto layout = Layout::detect(*root);
+        std::string exe_name = library_name(manifest->package->name, PackageType::Executable);
+        exe_path = layout.artifacts_dir / exe_name;
+    }
 
     if (!exe_path.exists()) {
         std::fprintf(stderr, "bake: built executable not found at %s\n", exe_path.string().c_str());

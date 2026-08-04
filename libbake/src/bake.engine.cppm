@@ -619,4 +619,105 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     return 0;
 }
 
+// ===== build.json reader =====
+
+export BuildPlan read_build_json(const Path& json_path, const Path& project_root) {
+    BuildPlan plan;
+    plan.project_root = project_root;
+
+    auto content = read_file(json_path);
+    if (!content) return plan;
+
+    nlohmann::json doc;
+    try {
+        doc = nlohmann::json::parse(*content);
+    } catch (...) {
+        return plan;
+    }
+
+    if (!doc.contains("actions")) return plan;
+
+    // First pass: create all actions
+    std::map<std::string, size_t> id_to_index;
+
+    for (auto& jaction : doc["actions"]) {
+        BuildAction action;
+        action.id = jaction.value("id", "");
+        action.description = action.id;
+
+        std::string type_str = jaction.value("type", "compile");
+        if (type_str == "compile") action.type = BuildAction::Type::Compile;
+        else if (type_str == "link") action.type = BuildAction::Type::Link;
+        else if (type_str == "archive") action.type = BuildAction::Type::Archive;
+        else action.type = BuildAction::Type::Compile;
+
+        for (auto& inp : jaction.value("inputs", std::vector<std::string>{})) {
+            action.inputs.push_back(Path(inp));
+        }
+        for (auto& out : jaction.value("outputs", std::vector<std::string>{})) {
+            action.outputs.push_back(Path(out));
+        }
+        for (auto& cmd : jaction.value("command", std::vector<std::string>{})) {
+            action.command.push_back(cmd);
+        }
+
+        size_t idx = plan.actions.size();
+        id_to_index[action.id] = idx;
+        plan.actions.push_back(std::move(action));
+    }
+
+    // Second pass: resolve depends_on (string IDs → indices)
+    for (auto& jaction : doc["actions"]) {
+        std::string id = jaction.value("id", "");
+        auto it = id_to_index.find(id);
+        if (it == id_to_index.end()) continue;
+
+        for (auto& dep : jaction.value("depends_on", std::vector<std::string>{})) {
+            auto dep_it = id_to_index.find(dep);
+            if (dep_it != id_to_index.end()) {
+                plan.actions[it->second].depends_on.push_back(dep_it->second);
+            }
+        }
+    }
+
+    // Find primary output (first link/archive action's output)
+    for (auto& a : plan.actions) {
+        if ((a.type == BuildAction::Type::Link || a.type == BuildAction::Type::Archive) &&
+            !a.outputs.empty()) {
+            plan.primary_output = a.outputs[0];
+            break;
+        }
+    }
+
+    return plan;
+}
+
+// ===== compile_commands.json output =====
+
+export void write_compile_commands(const BuildPlan& plan, const Path& output_path) {
+    nlohmann::json commands = nlohmann::json::array();
+
+    for (auto& action : plan.actions) {
+        if (!action.is_compile()) continue;
+        if (action.inputs.empty() || action.outputs.empty()) continue;
+
+        nlohmann::json entry;
+        entry["directory"] = plan.project_root.absolute().string();
+
+        // Join command args into a single string
+        std::string cmd_str;
+        for (size_t i = 0; i < action.command.size(); ++i) {
+            if (i > 0) cmd_str += " ";
+            cmd_str += action.command[i];
+        }
+        entry["command"] = cmd_str;
+        entry["file"] = action.inputs[0].absolute().string();
+        entry["output"] = action.outputs[0].absolute().string();
+
+        commands.push_back(entry);
+    }
+
+    write_file(output_path, commands.dump(2));
+}
+
 } // namespace bake

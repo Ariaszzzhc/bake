@@ -21,7 +21,9 @@ target_include_directories(nlohmann_json INTERFACE
 
 # ---- libbake (shared library) ----
 
-add_library(libbake SHARED)
+add_library(libbake SHARED
+    libbake/src/cabi/api.cpp
+)
 
 target_sources(libbake
     PUBLIC
@@ -34,12 +36,20 @@ target_sources(libbake
             libbake/src/bake.cli.cppm
 )
 
+set_target_properties(libbake PROPERTIES OUTPUT_NAME "bake")
+
 target_link_libraries(libbake PRIVATE tomlplusplus nlohmann_json)
 target_include_directories(libbake PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus
     ${CMAKE_SOURCE_DIR}/third_party
+    ${CMAKE_SOURCE_DIR}/libbake/src/cabi
 )
-target_compile_definitions(libbake PRIVATE BAKE_VERSION="${PROJECT_VERSION}")
+target_compile_definitions(libbake PRIVATE
+    BAKE_VERSION="${PROJECT_VERSION}"
+    BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
+    BAKE_LIB_DIR="${CMAKE_BINARY_DIR}"
+)
+target_compile_features(libbake PRIVATE cxx_std_23)
 
 # ---- bake (executable) ----
 

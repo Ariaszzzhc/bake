@@ -343,22 +343,13 @@ inline std::vector<Path> glob(const Path& base, std::string_view pattern) {
     std::vector<Path> results;
     if (!base.is_directory()) return results;
 
-    bool recursive = (pattern.find("**") != std::string_view::npos);
-
-    if (recursive) {
-        for (auto& entry : std::filesystem::recursive_directory_iterator(base.fs())) {
-            if (!entry.is_regular_file()) continue;
-            auto rel = std::filesystem::relative(entry.path(), base.fs());
-            if (detail::glob_match(rel.string(), pattern))
-                results.push_back(Path(entry.path()));
-        }
-    } else {
-        for (auto& entry : std::filesystem::directory_iterator(base.fs())) {
-            if (!entry.is_regular_file()) continue;
-            auto rel = std::filesystem::relative(entry.path(), base.fs());
-            if (detail::glob_match(rel.string(), pattern))
-                results.push_back(Path(entry.path()));
-        }
+    // Always use recursive iteration — patterns with directory prefixes
+    // (e.g. "src/*.cpp") need to descend into subdirectories.
+    for (auto& entry : std::filesystem::recursive_directory_iterator(base.fs())) {
+        if (!entry.is_regular_file()) continue;
+        auto rel = std::filesystem::relative(entry.path(), base.fs());
+        if (detail::glob_match(rel.string(), pattern))
+            results.push_back(Path(entry.path()));
     }
 
     std::sort(results.begin(), results.end());
