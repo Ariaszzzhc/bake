@@ -1,22 +1,10 @@
 module;
 
-#include <string>
-#include <string_view>
-#include <vector>
-#include <map>
-#include <set>
-#include <optional>
-#include <filesystem>
-#include <thread>
-#include <mutex>
-#include <mutex>
-#include <atomic>
-#include <cstdio>
-
 #include <nlohmann/json.hpp>
 
 export module bake.engine;
 
+import std;
 import bake.util;
 import bake.project;
 import bake.compiler;
@@ -132,7 +120,7 @@ export std::optional<ModuleInfo> scan_module_file(
             if (rule.contains("requires")) {
                 for (auto& req : rule["requires"]) {
                     std::string name = req.value("logical-name", "");
-                    if (!name.empty() && name != "std") {
+                    if (!name.empty()) {
                         info.imports.push_back(name);
                     }
                 }
@@ -277,7 +265,8 @@ export BuildPlan create_convention_plan(
         const std::map<std::string, BuildOption>& options,
         const std::vector<DepSourceEntry>& dep_sources = {},
         const std::vector<Path>& dep_include_dirs = {},
-        bool compile_path_deps = true) {
+        bool compile_path_deps = true,
+        const Path& std_module_pcm = {}) {
 
     BuildPlan plan;
     plan.project_root = layout.root;
@@ -342,6 +331,11 @@ export BuildPlan create_convention_plan(
 
     // Map module name → BMI path
     std::map<std::string, Path> module_bmi;
+
+    // Register the pre-built libc++ std module so import std; resolves.
+    if (!std_module_pcm.string().empty() && std_module_pcm.is_regular_file()) {
+        module_bmi["std"] = std_module_pcm;
+    }
 
     // Phase 1: Compile module interfaces (in dependency order)
     for (auto& mod_name : mod_graph.sorted) {
@@ -524,6 +518,12 @@ export BuildPlan create_convention_plan(
             lc.output = output;
             lc.type = pkg.type;
             link_action.command = make_link_command(tc, lc);
+
+            // Ensure libc++ at link time when import std is in use
+            if (!std_module_pcm.string().empty() && tc.is_clang()) {
+                link_action.command.insert(link_action.command.begin() + 1,
+                                           "-stdlib=libc++");
+            }
         }
 
         // Depends on all compile actions
@@ -566,7 +566,7 @@ export bool needs_rebuild(const BuildAction& action) {
 
 export int execute_plan(BuildPlan& plan, int jobs) {
     if (plan.actions.empty()) {
-        std::printf("bake: nothing to build\n");
+        std::println("bake: nothing to build");
         return 0;
     }
 
@@ -597,15 +597,15 @@ export int execute_plan(BuildPlan& plan, int jobs) {
                 continue;
             }
 
-            std::printf("[%d/%zu] %s\n", actions_done.load() + 1, plan.actions.size(),
-                        action.description.c_str());
+            std::println("[{}/{}] {}", actions_done.load() + 1, plan.actions.size(),
+                         action.description);
 
             auto result = run_process(action.command, plan.project_root);
             if (!result.success()) {
                 if (!result.stderr_output.empty()) {
-                    std::fprintf(stderr, "%s", result.stderr_output.c_str());
+                    std::print(std::cerr, "{}", result.stderr_output);
                 }
-                std::fprintf(stderr, "bake: failed to compile module\n");
+                std::println(std::cerr, "bake: failed to compile module");
                 status[i] = -1;
                 failed++;
                 return 1;
@@ -650,8 +650,8 @@ export int execute_plan(BuildPlan& plan, int jobs) {
 
                 {
                     std::lock_guard<std::mutex> lock(mtx);
-                    std::printf("[%d/%zu] %s\n", actions_done.load() + 1,
-                                plan.actions.size(), action.description.c_str());
+                    std::println("[{}/{}] {}", actions_done.load() + 1,
+                                 plan.actions.size(), action.description);
                 }
 
                 auto result = run_process(action.command, plan.project_root);
@@ -659,7 +659,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
                     std::lock_guard<std::mutex> lock(mtx);
                     if (!result.success()) {
                         if (!result.stderr_output.empty()) {
-                            std::fprintf(stderr, "%s", result.stderr_output.c_str());
+                            std::print(std::cerr, "{}", result.stderr_output);
                         }
                         compile_failed++;
                         status[i] = -1;
@@ -678,7 +678,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
         for (auto& th : threads) th.join();
 
         if (compile_failed.load() > 0) {
-            std::fprintf(stderr, "bake: compilation failed\n");
+            std::println(std::cerr, "bake: compilation failed");
             return 1;
         }
     }
@@ -695,15 +695,15 @@ export int execute_plan(BuildPlan& plan, int jobs) {
                 continue;
             }
 
-            std::printf("[%d/%zu] %s\n", actions_done.load() + 1, plan.actions.size(),
-                        action.description.c_str());
+            std::println("[{}/{}] {}", actions_done.load() + 1, plan.actions.size(),
+                         action.description);
 
             auto result = run_process(action.command, plan.project_root);
             if (!result.success()) {
                 if (!result.stderr_output.empty()) {
-                    std::fprintf(stderr, "%s", result.stderr_output.c_str());
+                    std::print(std::cerr, "{}", result.stderr_output);
                 }
-                std::fprintf(stderr, "bake: %s failed\n",
+                std::println(std::cerr, "bake: {} failed",
                              action.type == BuildAction::Type::Archive ? "archive" : "link");
                 return 1;
             }
@@ -713,9 +713,9 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     }
 
     if (total == 0 && skipped > 0) {
-        std::printf("bake: up to date (%d actions skipped)\n", skipped);
+        std::println("bake: up to date ({} actions skipped)", skipped);
     } else if (total > 0) {
-        std::printf("bake: build complete (%d compiled, %d skipped)\n", total, skipped);
+        std::println("bake: build complete ({} compiled, {} skipped)", total, skipped);
     }
 
     return 0;

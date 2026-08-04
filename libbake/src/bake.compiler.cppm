@@ -1,15 +1,6 @@
-module;
-
-#include <string>
-#include <string_view>
-#include <vector>
-#include <map>
-#include <optional>
-#include <cstdio>
-#include <cstdlib>
-
 export module bake.compiler;
 
+import std;
 import bake.util;
 import bake.project;
 
@@ -159,6 +150,17 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
 
     // Standard
     cmd.push_back("-std=" + cc.std_ver);
+
+    // When using import std;, Clang requires libc++.
+    // Detect this by checking if "std" is in module_deps.
+    bool needs_libcxx = false;
+    for (const auto& [mod_name, _] : cc.module_deps) {
+        if (mod_name == "std") { needs_libcxx = true; break; }
+    }
+    if (needs_libcxx && tc.is_clang()) {
+        cmd.push_back("-stdlib=libc++");
+        cmd.push_back("-Wno-reserved-module-identifier");
+    }
 
     // PIC
     if (cc.use_pic) {

@@ -1,21 +1,5 @@
 module;
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <array>
-#include <filesystem>
-#include <fstream>
-#include <sstream>
-#include <optional>
-#include <functional>
-#include <memory>
-#include <algorithm>
-
 #ifdef _WIN32
   #include <windows.h>
   #include <process.h>
@@ -31,6 +15,8 @@ module;
 #include <errno.h>
 
 export module bake.util;
+
+import std;
 
 // ============================================================
 // bake.util — foundational utilities
@@ -656,7 +642,7 @@ inline ProcessResult run_process(const std::vector<std::string>& args,
         argv_c.push_back(nullptr);
 
         execvp(argv_c[0], argv_c.data());
-        std::fprintf(stderr, "bake: failed to execute '%s': %s\n", argv_c[0], std::strerror(errno));
+        std::println(std::cerr, "bake: failed to execute '{}': {}", argv_c[0], std::strerror(errno));
         _exit(127);
     }
 

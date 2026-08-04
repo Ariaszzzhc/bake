@@ -11,18 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <string_view>
-#include <vector>
-#include <memory>
-#include <filesystem>
-#include <optional>
-#include <map>
-
+import std;
 import bake.util;
 import bake.project;
 import bake.compiler;

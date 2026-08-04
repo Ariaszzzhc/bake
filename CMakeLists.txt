@@ -1,4 +1,20 @@
-cmake_minimum_required(VERSION 3.28)
+cmake_minimum_required(VERSION 3.30)
+
+# ---- Enable import std (experimental gate) ----
+# Must be set before project() so the CXX toolchain probe detects support.
+set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD
+    "f35a9ac6-8463-4d38-8eec-5d6008153e7d")
+
+# ---- Locate libc++.modules.json (Homebrew Clang layout) ----
+# CMake needs this to discover std.cppm for import std.  On a standard
+# Clang install it's found automatically; Homebrew puts it in lib/c++/.
+if(DEFINED CMAKE_CXX_COMPILER AND EXISTS "${CMAKE_CXX_COMPILER}")
+    get_filename_component(_cxx_bindir "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(_cxx_prefix "${_cxx_bindir}" DIRECTORY)
+    if(EXISTS "${_cxx_prefix}/lib/c++/libc++.modules.json")
+        set(CMAKE_CXX_STDLIB_MODULES_JSON "${_cxx_prefix}/lib/c++/libc++.modules.json")
+    endif()
+endif()
 
 project(bake
     VERSION 0.1.0
@@ -8,6 +24,13 @@ project(bake
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_MODULE_STD ON)
+
+# Ensure libc++ (required for import std with Clang)
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    add_compile_options(-stdlib=libc++ -Wno-reserved-module-identifier)
+    add_link_options(-stdlib=libc++)
+endif()
 
 # ---- Third-party header-only libraries ----
 

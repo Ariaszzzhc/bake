@@ -1,19 +1,10 @@
 module;
 
-#include <string>
-#include <string_view>
-#include <vector>
-#include <map>
-#include <optional>
-#include <filesystem>
-#include <fstream>
-#include <variant>
-#include <cstdlib>
-
 #include <toml.hpp>
 
 export module bake.project;
 
+import std;
 import bake.util;
 
 // ============================================================
@@ -116,8 +107,8 @@ export struct Manifest {
         try {
             tbl = toml::parse_file(toml_path.string());
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "bake: error parsing %s: %s\n",
-                         toml_path.string().c_str(), e.what());
+            std::println(std::cerr, "bake: error parsing {}: {}",
+                         toml_path.string(), e.what());
             return std::nullopt;
         }
 

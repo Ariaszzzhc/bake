@@ -1,21 +1,10 @@
 module;
 
-#include <string>
-#include <string_view>
-#include <vector>
-#include <map>
-#include <optional>
-#include <filesystem>
-#include <cstdio>
-#include <cstdlib>
-#include <cstdint>
-#include <random>
-#include <sstream>
-
 #include <nlohmann/json.hpp>
 
 export module bake.package;
 
+import std;
 import bake.util;
 import bake.project;
 
@@ -51,6 +40,10 @@ public:
     // Resolve a single dependency: tag → commit → download → hash → extract
     // Returns the lock node
     std::optional<LockNode> resolve_dependency(const Dependency& dep);
+
+    // Re-download cached sources for all lock nodes using existing locked commits.
+    // Does NOT re-resolve tags. Used when cache is missing/corrupted but lock is valid.
+    bool redownload(const Lockfile& lockfile, const ResolverConfig& config);
 
 private:
     Path cache_dir_;
@@ -139,18 +132,18 @@ export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache
 
         Path cache_path = cache_dir / node.tree_sha256;
         if (!cache_path.is_directory()) {
-            std::fprintf(stderr,
-                "bake: cache for '%s' missing at %s\n",
-                id.c_str(), cache_path.string().c_str());
+            std::println(std::cerr,
+                "bake: cache for '{}' missing at {}",
+                id, cache_path.string());
             return false;
         }
 
         std::string actual_hash = compute_tree_sha256(cache_path);
         if (actual_hash != node.tree_sha256) {
-            std::fprintf(stderr,
-                "bake: cache tampered for '%s' (expected %s, got %s)\n",
-                id.c_str(), node.tree_sha256.substr(0, 12).c_str(),
-                actual_hash.substr(0, 12).c_str());
+            std::println(std::cerr,
+                "bake: cache tampered for '{}' (expected {}, got {})",
+                id, node.tree_sha256.substr(0, 12),
+                actual_hash.substr(0, 12));
             return false;
         }
     }
@@ -246,12 +239,12 @@ inline std::optional<Path> Resolver::download_archive(const std::string& url,
     std::vector<std::string> cmd = {"curl", "-sL", "-o", archive_path.string(), archive_url};
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
-        std::fprintf(stderr, "bake: failed to download %s\n", archive_url.c_str());
+        std::println(std::cerr, "bake: failed to download {}", archive_url);
         return std::nullopt;
     }
 
     if (!archive_path.is_regular_file() || archive_path.string() == "") {
-        std::fprintf(stderr, "bake: downloaded file missing\n");
+        std::println(std::cerr, "bake: downloaded file missing");
         return std::nullopt;
     }
 
@@ -276,8 +269,8 @@ inline bool validate_extracted_tree(const std::filesystem::path& tmpdir) {
         // Defense in depth: reject any relative path containing ..
         auto rel = fs::relative(entry.path(), tmpdir);
         if (rel.string().find("..") != std::string::npos) {
-            std::fprintf(stderr, "bake: rejected path traversal in archive: %s\n",
-                         rel.string().c_str());
+            std::println(std::cerr, "bake: rejected path traversal in archive: {}",
+                         rel.string());
             return false;
         }
 
@@ -286,16 +279,16 @@ inline bool validate_extracted_tree(const std::filesystem::path& tmpdir) {
             std::error_code ec;
             fs::path resolved = fs::canonical(entry.path(), ec);
             if (ec) {
-                std::fprintf(stderr, "bake: broken symlink in archive: %s\n",
-                             entry.path().string().c_str());
+                std::println(std::cerr, "bake: broken symlink in archive: {}",
+                             entry.path().string());
                 return false;
             }
             // Check that resolved path starts with canonical_tmp.
             std::string r = resolved.string();
             std::string t = canonical_tmp.string();
             if (r.rfind(t, 0) != 0) {
-                std::fprintf(stderr, "bake: symlink escapes extraction directory: %s -> %s\n",
-                             entry.path().string().c_str(), r.c_str());
+                std::println(std::cerr, "bake: symlink escapes extraction directory: {} -> {}",
+                             entry.path().string(), r);
                 return false;
             }
         }
@@ -305,11 +298,11 @@ inline bool validate_extracted_tree(const std::filesystem::path& tmpdir) {
             total_size += entry.file_size();
 
             if (file_count > MAX_FILES) {
-                std::fprintf(stderr, "bake: archive exceeds file count limit (%zu)\n", MAX_FILES);
+                std::println(std::cerr, "bake: archive exceeds file count limit ({})", MAX_FILES);
                 return false;
             }
             if (total_size > MAX_TOTAL_SIZE) {
-                std::fprintf(stderr, "bake: archive exceeds size limit (1 GB)\n");
+                std::println(std::cerr, "bake: archive exceeds size limit (1 GB)");
                 return false;
             }
         }
@@ -332,7 +325,7 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
     auto result = run_process(
         {"tar", "-tvf", archive.string()}, Path(), true);
     if (!result.success()) {
-        std::fprintf(stderr, "bake: failed to list archive entries\n");
+        std::println(std::cerr, "bake: failed to list archive entries");
         return false;
     }
 
@@ -399,9 +392,9 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
 
         // Reject absolute paths
         if (!entry.empty() && entry[0] == '/') {
-            std::fprintf(stderr,
-                "bake: rejecting archive entry with absolute path: %s\n",
-                entry.c_str());
+            std::println(std::cerr,
+                "bake: rejecting archive entry with absolute path: {}",
+                entry);
             return false;
         }
 
@@ -413,9 +406,9 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
                 bool right_ok = (dotdot + 2 >= entry.size() ||
                                 entry[dotdot + 2] == '/');
                 if (left_ok && right_ok) {
-                    std::fprintf(stderr,
-                        "bake: rejecting path traversal in archive: %s\n",
-                        entry.c_str());
+                    std::println(std::cerr,
+                        "bake: rejecting path traversal in archive: {}",
+                        entry);
                     return false;
                 }
                 dotdot += 2;
@@ -425,9 +418,9 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
         // Reject symlinks that escape the archive root
         if (type_char == 'l' && !link_target.empty()) {
             if (link_target[0] == '/') {
-                std::fprintf(stderr,
-                    "bake: rejecting symlink with absolute target: %s -> %s\n",
-                    entry.c_str(), link_target.c_str());
+                std::println(std::cerr,
+                    "bake: rejecting symlink with absolute target: {} -> {}",
+                    entry, link_target);
                 return false;
             }
             size_t dd = 0;
@@ -436,9 +429,9 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
                 bool right_ok = (dd + 2 >= link_target.size() ||
                                 link_target[dd + 2] == '/');
                 if (left_ok && right_ok) {
-                    std::fprintf(stderr,
-                        "bake: rejecting symlink escaping archive: %s -> %s\n",
-                        entry.c_str(), link_target.c_str());
+                    std::println(std::cerr,
+                        "bake: rejecting symlink escaping archive: {} -> {}",
+                        entry, link_target);
                     return false;
                 }
                 dd += 2;
@@ -447,9 +440,9 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
 
         // Reject hardlinks entirely
         if (type_char == 'h' || (type_char == 'l' && line.find(" link to ") != std::string::npos)) {
-            std::fprintf(stderr,
-                "bake: rejecting hardlink entry in archive: %s\n",
-                entry.c_str());
+            std::println(std::cerr,
+                "bake: rejecting hardlink entry in archive: {}",
+                entry);
             return false;
         }
 
@@ -470,14 +463,14 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
         }
 
         if (file_count > MAX_FILES) {
-            std::fprintf(stderr,
-                "bake: archive exceeds file count limit (%zu entries)\n",
+            std::println(std::cerr,
+                "bake: archive exceeds file count limit ({} entries)",
                 MAX_FILES);
             return false;
         }
         if (total_size > MAX_TOTAL_SIZE) {
-            std::fprintf(stderr,
-                "bake: archive exceeds size limit (1 GB)\n");
+            std::println(std::cerr,
+                "bake: archive exceeds size limit (1 GB)");
             return false;
         }
     }
@@ -524,7 +517,7 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
 #endif
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
-        std::fprintf(stderr, "bake: failed to extract %s\n", archive.string().c_str());
+        std::println(std::cerr, "bake: failed to extract {}", archive.string());
         tmp_dir.remove_all();
         return false;
     }
@@ -578,13 +571,13 @@ inline std::optional<LockNode> Resolver::resolve_dependency(const Dependency& de
         return node;
     }
 
-    std::fprintf(stderr, "bake: resolving %s (%s)...\n", dep.name.c_str(), dep.tag.c_str());
+    std::println(std::cerr, "bake: resolving {} ({})...", dep.name, dep.tag);
 
     // Step 1: tag → commit
     auto commit = resolve_tag(dep.url, dep.tag);
     if (!commit) {
-        std::fprintf(stderr, "bake: failed to resolve tag '%s' for %s\n",
-                     dep.tag.c_str(), dep.url.c_str());
+        std::println(std::cerr, "bake: failed to resolve tag '{}' for {}",
+                     dep.tag, dep.url);
         return std::nullopt;
     }
 
@@ -628,9 +621,67 @@ inline std::optional<LockNode> Resolver::resolve_dependency(const Dependency& de
     return node;
 }
 
+inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig& config) {
+    if (config.offline || config.frozen) {
+        std::println(std::cerr, "bake: cannot re-download in offline/frozen mode");
+        return false;
+    }
+
+    cache_dir_.mkdir_recursive();
+
+    for (auto& [id, node] : lockfile.nodes) {
+        if (node.commit.empty() || node.tree_sha256.empty()) continue;
+
+        Path cached = cache_dir_ / node.tree_sha256;
+        if (cached.is_directory()) continue;  // already cached
+
+        std::println(std::cerr, "bake: re-downloading '{}' (commit {})...",
+                     id, node.commit.substr(0, 12));
+
+        // Download by locked commit (no tag re-resolution)
+        Path download_dir = cache_dir_ / ".downloads";
+        auto archive = download_archive(node.url, node.commit, download_dir);
+        if (!archive) {
+            std::println(std::cerr, "bake: download failed for '{}'", id);
+            return false;
+        }
+
+        // Verify transport hash
+        std::string transport_hash = file_hash(*archive);
+        if (transport_hash != node.transport_sha256) {
+            std::println(std::cerr, "bake: transport hash mismatch for '{}'", id);
+            archive->remove();
+            return false;
+        }
+
+        // Extract and verify tree hash
+        Path extracted_dir = cache_dir_ / (".work-" + node.commit);
+        if (!extract_archive(*archive, extracted_dir)) {
+            archive->remove();
+            return false;
+        }
+
+        std::string tree_hash = compute_tree_hash(extracted_dir);
+        if (tree_hash != node.tree_sha256) {
+            std::println(std::cerr, "bake: tree hash mismatch for '{}'", id);
+            extracted_dir.remove_all();
+            archive->remove();
+            return false;
+        }
+
+        // Move to final cache location
+        Path final_dir = cache_dir_ / tree_hash;
+        final_dir.parent().mkdir_recursive();
+        std::filesystem::rename(extracted_dir.fs(), final_dir.fs());
+        archive->remove();
+    }
+
+    return true;
+}
+
 inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const ResolverConfig& config) {
     if (config.offline || config.frozen) {
-        std::fprintf(stderr, "bake: cannot resolve dependencies in offline/frozen mode\n");
+        std::println(std::cerr, "bake: cannot resolve dependencies in offline/frozen mode");
         return std::nullopt;
     }
 
@@ -663,7 +714,7 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
 
     while (!queue.empty()) {
         if (node_count >= MAX_NODES) {
-            std::fprintf(stderr, "bake: dependency graph exceeds limit (%zu nodes)\n", MAX_NODES);
+            std::println(std::cerr, "bake: dependency graph exceeds limit ({} nodes)", MAX_NODES);
             return std::nullopt;
         }
 
@@ -679,15 +730,15 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
             // We need to resolve the tag to know the commit.
             auto commit = resolve_tag(dep.url, dep.tag);
             if (!commit) {
-                std::fprintf(stderr, "bake: failed to resolve tag '%s' for %s\n",
-                             dep.tag.c_str(), dep.url.c_str());
+                std::println(std::cerr, "bake: failed to resolve tag '{}' for {}",
+                             dep.tag, dep.url);
                 return std::nullopt;
             }
 
             if (*commit != existing_commit) {
-                std::fprintf(stderr,
-                    "bake: conflict — %s resolved to commit %s, but same URL was already at %s\n",
-                    dep.url.c_str(), commit->c_str(), existing_commit.c_str());
+                std::println(std::cerr,
+                    "bake: conflict — {} resolved to commit {}, but same URL was already at {}",
+                    dep.url, *commit, existing_commit);
                 return std::nullopt;
             }
 
@@ -717,9 +768,9 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
         auto name_it = name_to_url.find(dep_name);
         if (name_it != name_to_url.end()) {
             if (name_it->second != dep.url) {
-                std::fprintf(stderr,
-                    "bake: conflict — dependency '%s' from %s, but already resolved from %s\n",
-                    dep_name.c_str(), dep.url.c_str(), name_it->second.c_str());
+                std::println(std::cerr,
+                    "bake: conflict — dependency '{}' from {}, but already resolved from {}",
+                    dep_name, dep.url, name_it->second);
                 return std::nullopt;
             }
         } else {
@@ -795,7 +846,7 @@ inline std::optional<Lockfile> Resolver::resolve_subtree(const Dependency& root_
 
     while (!queue.empty()) {
         if (node_count >= MAX_NODES) {
-            std::fprintf(stderr, "bake: dependency graph exceeds limit (%zu nodes)\n", MAX_NODES);
+            std::println(std::cerr, "bake: dependency graph exceeds limit ({} nodes)", MAX_NODES);
             return std::nullopt;
         }
 
@@ -807,7 +858,7 @@ inline std::optional<Lockfile> Resolver::resolve_subtree(const Dependency& root_
             auto commit = resolve_tag(dep.url, dep.tag);
             if (!commit || *commit != url_it->second) {
                 if (commit && *commit != url_it->second) {
-                    std::fprintf(stderr, "bake: conflict — same URL resolved to different commits\n");
+                    std::println(std::cerr, "bake: conflict — same URL resolved to different commits");
                     return std::nullopt;
                 }
                 return std::nullopt;

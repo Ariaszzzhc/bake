@@ -1,19 +1,10 @@
 module;
 
-#include <string>
-#include <string_view>
-#include <vector>
-#include <optional>
-#include <cstdio>
-#include <cstdlib>
-#include <filesystem>
-#include <algorithm>
-#include <set>
-
 #include <toml.hpp>
 
 export module bake.cli;
 
+import std;
 import bake.util;
 import bake.project;
 import bake.compiler;
@@ -126,12 +117,12 @@ export ParsedArgs parse_args(int argc, char* argv[]) {
 // ===== Help text =====
 
 export void print_version() {
-    std::printf("bake %s\n", BAKE_VERSION);
+    std::println("bake {}", BAKE_VERSION);
 }
 
 export void print_help() {
-    std::printf(
-        "bake %s — All-in-One C/C++ toolchain\n"
+    std::println(
+        "bake {} — All-in-One C/C++ toolchain\n"
         "\n"
         "USAGE:\n"
         "    bake <subcommand> [options]\n"
@@ -159,14 +150,14 @@ export void print_help() {
         "    -p <member>             Build a specific workspace member\n"
         "    -j <n>                  Parallel job count\n"
         "\n"
-        "For more information, visit: https://github.com/arias/bake\n",
+        "For more information, visit: https://github.com/arias/bake",
         BAKE_VERSION
     );
 }
 
 export void print_command_help(std::string_view cmd) {
     if (cmd == "init") {
-        std::printf(
+        std::println(
             "bake init — Create a new project scaffold\n"
             "\n"
             "USAGE:\n"
@@ -176,10 +167,10 @@ export void print_command_help(std::string_view cmd) {
             "    --type <executable|static-lib|shared-lib>  Package type (default: executable)\n"
             "    --std <c++17|c++20|c++23>                  C++ standard (default: c++20)\n"
             "\n"
-            "If [name] is omitted, scaffolds in the current directory.\n"
+            "If [name] is omitted, scaffolds in the current directory."
         );
     } else if (cmd == "build") {
-        std::printf(
+        std::println(
             "bake build — Build the project\n"
             "\n"
             "USAGE:\n"
@@ -191,14 +182,14 @@ export void print_command_help(std::string_view cmd) {
             "    -p <member>              Build specific workspace member\n"
             "    --locked                 Fail if lock is missing/stale\n"
             "    --offline                No network access\n"
-            "    --frozen                 --locked + --offline\n"
+            "    --frozen                 --locked + --offline"
         );
     } else if (cmd == "clean") {
-        std::printf(
+        std::println(
             "bake clean — Remove build artifacts\n"
             "\n"
             "USAGE:\n"
-            "    bake clean\n"
+            "    bake clean"
         );
     } else {
         print_help();
@@ -217,7 +208,7 @@ export int cmd_init(const ParsedArgs& args) {
         auto cwd = Path::current();
         project_name = cwd.filename_string();
         if (project_name.empty() || project_name == "/") {
-            std::fprintf(stderr, "bake: could not determine project name. Please specify: bake init <name>\n");
+            std::println(std::cerr, "bake: could not determine project name. Please specify: bake init <name>");
             return 1;
         }
     }
@@ -228,7 +219,7 @@ export int cmd_init(const ParsedArgs& args) {
         if (auto t = parse_package_type(*type_str)) {
             pkg_type = *t;
         } else {
-            std::fprintf(stderr, "bake: unknown package type '%s'\n", type_str->c_str());
+            std::println(std::cerr, "bake: unknown package type '{}'", *type_str);
             return 1;
         }
     }
@@ -246,7 +237,7 @@ export int cmd_init(const ParsedArgs& args) {
         target_dir = Path::current() / project_name;
         create_subdir = true;
         if (target_dir.exists()) {
-            std::fprintf(stderr, "bake: directory '%s' already exists\n", project_name.c_str());
+            std::println(std::cerr, "bake: directory '{}' already exists", project_name);
             return 1;
         }
     } else {
@@ -305,17 +296,79 @@ export int cmd_init(const ParsedArgs& args) {
 
     // Print success
     if (create_subdir) {
-        std::printf("Created project '%s' in ./%s/\n", project_name.c_str(), project_name.c_str());
-        std::printf("  Next: cd %s && bake build\n", project_name.c_str());
+        std::println("Created project '{}' in ./{}", project_name, project_name);
+        std::println("  Next: cd {} && bake build", project_name);
     } else {
-        std::printf("Initialized project '%s' in current directory\n", project_name.c_str());
-        std::printf("  Next: bake build\n");
+        std::println("Initialized project '{}' in current directory", project_name);
+        std::println("  Next: bake build");
     }
 
     return 0;
 }
 
 // ===== build.cpp compilation + execution =====
+
+// Ensure the libc++ std module PCM is built and cached.
+// Returns the path to the cached std.pcm, or an empty Path on failure.
+// For Clang only — GCC handles import std via its gcm cache.
+export Path ensure_std_pcm(const Toolchain& tc) {
+    if (!tc.is_clang()) return Path();
+
+    // Cache dir: ~/.cache/bake/ (parent of src/, which holds package sources)
+    Path pcm_cache;
+#ifdef _WIN32
+    const char* home = std::getenv("LOCALAPPDATA");
+    if (!home) home = "C:\\";
+    pcm_cache = Path(home) / "bake";
+#else
+    const char* home = std::getenv("HOME");
+    if (!home) home = "/tmp";
+    pcm_cache = Path(home) / ".cache" / "bake";
+#endif
+    pcm_cache.mkdir_recursive();
+
+    // Cache key: hash of compiler path + version output
+    auto ver = run_process({tc.cxx_path, "--version"}, Path(), true);
+    std::string key_data = tc.cxx_path + "\n" + ver.stdout_output;
+    std::string key = SHA256::hex(key_data).substr(0, 16);
+
+    Path std_pcm = pcm_cache / ("std-" + key + ".pcm");
+    if (std_pcm.is_regular_file()) return std_pcm;  // cached
+
+    // Locate std.cppm relative to the compiler: <prefix>/share/libc++/v1/std.cppm
+    Path cxx_dir = Path(tc.cxx_path).parent();       // bin/
+    Path prefix = cxx_dir.parent();                   // llvm/<ver>/
+    Path std_cppm = prefix / "share" / "libc++" / "v1" / "std.cppm";
+    if (!std_cppm.is_regular_file()) return Path();   // not a libc++-shipping Clang
+
+    // libc++ include directory: <prefix>/include/c++/v1
+    Path libcxx_inc = prefix / "include" / "c++" / "v1";
+
+    std::println("bake: building std module (one-time)...");
+
+    std::vector<std::string> cmd;
+    cmd.push_back(tc.cxx_path);
+    cmd.push_back("-std=c++23");
+    cmd.push_back("-stdlib=libc++");
+    cmd.push_back("-nostdinc++");
+    cmd.push_back("-I" + libcxx_inc.string());
+    cmd.push_back("-Wno-reserved-module-identifier");
+    cmd.push_back("-c");
+    cmd.push_back(std_cppm.string());
+    cmd.push_back("--precompile");
+    cmd.push_back("-o");
+    cmd.push_back(std_pcm.string());
+
+    auto result = run_process(cmd, Path(), true);
+    if (!result.success()) {
+        std::print(std::cerr, "{}", result.stderr_output);
+        std::println(std::cerr, "bake: failed to pre-build std module");
+        return Path();
+    }
+
+    return std_pcm;
+}
+
 
 export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     auto tc = Toolchain::detect();
@@ -332,26 +385,36 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     auto wrapper_content = read_file(wrapper_src);
     auto cabi_content = read_file(cabi_header);
     if (!wrapper_content || !cabi_content) {
-        std::fprintf(stderr, "bake: cannot find bake.build.cppm or bake_cabi.h\n");
+        std::println(std::cerr, "bake: cannot find bake.build.cppm or bake_cabi.h");
         return 1;
     }
     write_file(wrapper_dst, *wrapper_content);
     write_file(cabi_dst, *cabi_content);
 
+    // Pre-build the libc++ std module PCM (cached, one-time per compiler).
+    auto std_pcm = ensure_std_pcm(tc);
+
     // Step 1: Compile wrapper module → BMI + .o
     Path pcm = bake_dir / "bake.build.pcm";
     Path wrapper_o = bake_dir / "bake.build.o";
 
-    std::printf("bake: compiling build script...\n");
+    std::println("bake: compiling build script...");
 
     {
         std::vector<std::string> cmd;
         cmd.push_back(tc.cxx_path);
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
+        if (tc.is_clang()) {
+            cmd.push_back("-stdlib=libc++");
+            cmd.push_back("-Wno-reserved-module-identifier");
+        }
         cmd.push_back("-x");
         cmd.push_back("c++-module");
         cmd.push_back("-I" + bake_dir.string());
+        if (tc.is_clang() && std_pcm.is_regular_file()) {
+            cmd.push_back("-fmodule-file=std=" + std_pcm.string());
+        }
         cmd.push_back("-fmodule-output=" + pcm.string());
         cmd.push_back(wrapper_dst.string());
         cmd.push_back("-o");
@@ -359,8 +422,8 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
 
         auto result = run_process(cmd, root, true);
         if (!result.success()) {
-            std::fprintf(stderr, "%s", result.stderr_output.c_str());
-            std::fprintf(stderr, "bake: failed to compile bake.build.cppm\n");
+            std::print(std::cerr, "{}", result.stderr_output);
+            std::println(std::cerr, "bake: failed to compile bake.build.cppm");
             return 1;
         }
     }
@@ -372,8 +435,15 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
         cmd.push_back(tc.cxx_path);
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
+        if (tc.is_clang()) {
+            cmd.push_back("-stdlib=libc++");
+            cmd.push_back("-Wno-reserved-module-identifier");
+        }
         cmd.push_back("-I" + bake_dir.string());
         if (tc.is_clang()) {
+            if (std_pcm.is_regular_file()) {
+                cmd.push_back("-fmodule-file=std=" + std_pcm.string());
+            }
             cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
         }
         cmd.push_back(build_cpp.string());
@@ -382,8 +452,8 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
 
         auto result = run_process(cmd, root, true);
         if (!result.success()) {
-            std::fprintf(stderr, "%s", result.stderr_output.c_str());
-            std::fprintf(stderr, "bake: failed to compile build.cpp\n");
+            std::print(std::cerr, "{}", result.stderr_output);
+            std::println(std::cerr, "bake: failed to compile build.cpp");
             return 1;
         }
     }
@@ -396,6 +466,9 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     {
         std::vector<std::string> cmd;
         cmd.push_back(tc.cxx_path);
+        if (tc.is_clang()) {
+            cmd.push_back("-stdlib=libc++");
+        }
         cmd.push_back(wrapper_o.string());
         cmd.push_back(build_o.string());
 #ifdef _WIN32
@@ -411,8 +484,8 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
 
         auto result = run_process(cmd, root, true);
         if (!result.success()) {
-            std::fprintf(stderr, "%s", result.stderr_output.c_str());
-            std::fprintf(stderr, "bake: failed to link build_app\n");
+            std::print(std::cerr, "{}", result.stderr_output);
+            std::println(std::cerr, "bake: failed to link build_app");
             return 1;
         }
     }
@@ -421,8 +494,8 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     {
         auto result = run_process({build_app.string()}, root, true);
         if (!result.success()) {
-            std::fprintf(stderr, "%s", result.stderr_output.c_str());
-            std::fprintf(stderr, "bake: build_app failed\n");
+            std::print(std::cerr, "{}", result.stderr_output);
+            std::println(std::cerr, "bake: build_app failed");
             return 1;
         }
     }
@@ -430,7 +503,7 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     // Step 5: Read build.json → execute
     Path build_json = bake_dir / "build.json";
     if (!build_json.is_regular_file()) {
-        std::fprintf(stderr, "bake: build_app did not produce .bake/build.json\n");
+        std::println(std::cerr, "bake: build_app did not produce .bake/build.json");
         return 1;
     }
 
@@ -475,35 +548,46 @@ export int enforce_lock(const Path& root, const Manifest& manifest, const Parsed
     // enter the build graph.
     if (!needs_resolve && lockfile) {
         if (!verify_lock_cache(*lockfile, get_cache_dir())) {
-            std::fprintf(stderr, "bake: cache verification failed — lock is untrustworthy\n");
+            std::println(std::cerr,
+                "bake: cache verification failed — cached sources missing or corrupted");
+            // We must NOT re-resolve tags — that would move locked commits.
+            // Instead, re-download using the existing locked commit hashes.
+            // For now, report the error clearly.
             if (locked || offline) return 1;
-            // In non-locked mode, re-resolve from scratch to get clean cache
-            needs_resolve = true;
+            // Re-download using locked commits (not re-resolve)
+            Resolver resolver;
+            auto re_downloaded = resolver.redownload(*lockfile, ResolverConfig{});
+            if (!re_downloaded || !verify_lock_cache(*lockfile, get_cache_dir())) {
+                std::println(std::cerr,
+                    "bake: re-download failed. Run 'bake update' to re-resolve from scratch.");
+                return 1;
+            }
+            std::println("bake: cached sources re-downloaded using locked commits");
         }
     }
 
     if (!needs_resolve) return 0;
 
     if (locked) {
-        std::fprintf(stderr, "bake: lock file missing or stale (--locked)\n");
+        std::println(std::cerr, "bake: lock file missing or stale (--locked)");
         return 1;
     }
     if (offline) {
-        std::fprintf(stderr, "bake: cannot resolve dependencies in offline mode\n");
+        std::println(std::cerr, "bake: cannot resolve dependencies in offline mode");
         return 1;
     }
 
     Resolver resolver;
     auto new_lock = resolver.resolve(manifest, ResolverConfig{});
     if (!new_lock) {
-        std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+        std::println(std::cerr, "bake: failed to resolve dependencies");
         return 1;
     }
     if (!new_lock->save(lock_path)) {
-        std::fprintf(stderr, "bake: failed to write bake.lock\n");
+        std::println(std::cerr, "bake: failed to write bake.lock");
         return 1;
     }
-    std::printf("bake: dependencies resolved and locked\n");
+    std::println("bake: dependencies resolved and locked");
     return 0;
 }
 
@@ -576,8 +660,8 @@ static void extract_dep_info(
 
         Path dep_cache = cache_dir / node.tree_sha256;
         if (!dep_cache.is_directory()) {
-            std::fprintf(stderr, "bake: cached source for '%s' not found at %s\n",
-                         node_id.c_str(), dep_cache.string().c_str());
+            std::println(std::cerr, "bake: cached source for '{}' not found at {}",
+                         node_id, dep_cache.string());
             continue;
         }
 
@@ -607,14 +691,14 @@ export int cmd_build(const ParsedArgs& args) {
     // Find project root
     auto root = find_project_root();
     if (!root) {
-        std::fprintf(stderr, "bake: no bake.toml found in current directory or any parent\n");
+        std::println(std::cerr, "bake: no bake.toml found in current directory or any parent");
         return 1;
     }
 
     // Load manifest (needed for lock enforcement before build.cpp dispatch)
     auto manifest = Manifest::load(*root);
     if (!manifest) {
-        std::fprintf(stderr, "bake: failed to load bake.toml\n");
+        std::println(std::cerr, "bake: failed to load bake.toml");
         return 1;
     }
 
@@ -647,8 +731,23 @@ export int cmd_build(const ParsedArgs& args) {
                 if (!member_manifest) continue;
                 for (auto& [name, dep] : member_manifest->dependencies) {
                     if (dep.is_path_dep) continue;
-                    // Merge: last one wins if duplicate (conflict detection
-                    // happens during resolution)
+                    // Detect conflicts: same dep name but different URL/tag
+                    auto existing = combined.dependencies.find(name);
+                    if (existing != combined.dependencies.end()) {
+                        if (existing->second.url != dep.url || existing->second.tag != dep.tag) {
+                            std::println(std::cerr,
+                                "bake: dependency conflict — '{}' declared differently:\n"
+                                "  member '{}': url=\"{}\", tag=\"{}\"\n"
+                                "  member '{}': url=\"{}\", tag=\"{}\"",
+                                name,
+                                /* find which member declared the existing one */
+                                "(earlier)", existing->second.url, existing->second.tag,
+                                member, dep.url, dep.tag);
+                            return 1;
+                        }
+                        // Same URL + tag — reuse, skip
+                        continue;
+                    }
                     combined.dependencies[name] = dep;
                 }
             }
@@ -678,11 +777,14 @@ export int cmd_build(const ParsedArgs& args) {
         };
         std::vector<BuiltMember> built;
 
+        // Pre-build std module PCM once for all members (cached, one-time)
+        auto std_pcm = ensure_std_pcm(Toolchain::detect());
+
         for (auto& member : manifest->workspace->members) {
             Path member_dir = *root / member;
             auto member_manifest = Manifest::load(member_dir);
             if (!member_manifest || !member_manifest->has_package()) {
-                std::fprintf(stderr, "bake: skipping workspace member '%s' (no [package])\n", member.c_str());
+                std::println(std::cerr, "bake: skipping workspace member '{}' (no [package])", member);
                 continue;
             }
 
@@ -691,14 +793,15 @@ export int cmd_build(const ParsedArgs& args) {
                 if (*p != member_manifest->package->name) continue;
             }
 
-            std::printf("bake: building '%s'\n", member_manifest->package->name.c_str());
+            std::println("bake: building '{}'", member_manifest->package->name);
             auto layout = Layout::detect(member_dir, *root);
             auto tc = Toolchain::detect();
 
             auto plan = create_convention_plan(*member_manifest, layout, tc,
                                                 member_manifest->options,
                                                 dep_sources, dep_include_dirs,
-                                                /*compile_path_deps=*/false);
+                                                /*compile_path_deps=*/false,
+                                                std_pcm);
 
             // Inject external modules from built dependencies
             for (auto& action : plan.actions) {
@@ -714,11 +817,25 @@ export int cmd_build(const ParsedArgs& args) {
                         }
                     }
                 }
+                // Also inject std PCM so transitive import std; resolves
+                if (std_pcm.is_regular_file()) {
+                    action.command.push_back("-fmodule-file=std=" + std_pcm.string());
+                    // Clang needs libc++ for import std
+                    if (tc.is_clang()) {
+                        action.command.push_back("-stdlib=libc++");
+                        action.command.push_back("-Wno-reserved-module-identifier");
+                    }
+                }
             }
 
             // Inject library links from built dependencies
             for (auto& action : plan.actions) {
                 if (action.type != BuildAction::Type::Link) continue;
+
+                // Clang needs -stdlib=libc++ when import std is in use
+                if (std_pcm.is_regular_file() && tc.is_clang()) {
+                    action.command.insert(action.command.begin() + 1, "-stdlib=libc++");
+                }
 
                 for (auto& bm : built) {
                     if (bm.lib_path.string().empty()) continue;
@@ -759,7 +876,7 @@ export int cmd_build(const ParsedArgs& args) {
     }
 
     if (!manifest->has_package()) {
-        std::fprintf(stderr, "bake: no [package] section in bake.toml\n");
+        std::println(std::cerr, "bake: no [package] section in bake.toml");
         return 1;
     }
 
@@ -767,7 +884,10 @@ export int cmd_build(const ParsedArgs& args) {
     auto layout = Layout::detect(*root);
     auto tc = Toolchain::detect();
 
-    std::printf("bake: detected %s (%s)\n", tc.kind_name().c_str(), tc.cxx_path.c_str());
+    std::println("bake: detected {} ({})", tc.kind_name(), tc.cxx_path);
+
+    // Pre-build std module PCM for import std support (cached, one-time)
+    auto std_pcm = ensure_std_pcm(tc);
 
     // Extract dep sources + include dirs from lockfile
     std::vector<DepSourceEntry> dep_sources;
@@ -795,7 +915,9 @@ export int cmd_build(const ParsedArgs& args) {
     }
 
     auto plan = create_convention_plan(*manifest, layout, tc, options,
-                                        dep_sources, dep_include_dirs);
+                                        dep_sources, dep_include_dirs,
+                                        /*compile_path_deps=*/true,
+                                        std_pcm);
 
     // Write compile_commands.json
     write_compile_commands(plan, *root / "compile_commands.json");
@@ -814,7 +936,7 @@ export int cmd_build(const ParsedArgs& args) {
 export int cmd_clean(const ParsedArgs& args) {
     auto root = find_project_root();
     if (!root) {
-        std::fprintf(stderr, "bake: no bake.toml found\n");
+        std::println(std::cerr, "bake: no bake.toml found");
         return 1;
     }
 
@@ -824,7 +946,7 @@ export int cmd_clean(const ParsedArgs& args) {
     Path out_dir = *root / "out";
     if (out_dir.exists()) {
         out_dir.remove_all();
-        std::printf("Removed %s\n", out_dir.string().c_str());
+        std::println("Removed {}", out_dir.string());
         removed++;
     }
 
@@ -836,7 +958,7 @@ export int cmd_clean(const ParsedArgs& args) {
             Path member_bake = member_dir / ".bake";
             if (member_bake.exists()) {
                 member_bake.remove_all();
-                std::printf("Removed %s\n", member_bake.string().c_str());
+                std::println("Removed {}", member_bake.string());
                 removed++;
             }
         }
@@ -844,13 +966,13 @@ export int cmd_clean(const ParsedArgs& args) {
         Path bake_dir = *root / ".bake";
         if (bake_dir.exists()) {
             bake_dir.remove_all();
-            std::printf("Removed %s\n", bake_dir.string().c_str());
+            std::println("Removed {}", bake_dir.string());
             removed++;
         }
     }
 
     if (removed == 0) {
-        std::printf("Nothing to clean\n");
+        std::println("Nothing to clean");
     }
 
     return 0;
@@ -885,7 +1007,7 @@ export int cmd_run(const ParsedArgs& args) {
         if (!manifest || !manifest->has_package()) return 1;
 
         if (manifest->package->type != PackageType::Executable) {
-            std::fprintf(stderr, "bake: cannot run non-executable package\n");
+            std::println(std::cerr, "bake: cannot run non-executable package");
             return 1;
         }
 
@@ -895,7 +1017,7 @@ export int cmd_run(const ParsedArgs& args) {
     }
 
     if (!exe_path.exists()) {
-        std::fprintf(stderr, "bake: built executable not found at %s\n", exe_path.string().c_str());
+        std::println(std::cerr, "bake: built executable not found at {}", exe_path.string());
         return 1;
     }
 
@@ -914,13 +1036,13 @@ export int cmd_run(const ParsedArgs& args) {
 export int cmd_add(const ParsedArgs& args) {
     auto root = find_project_root();
     if (!root) {
-        std::fprintf(stderr, "bake: no bake.toml found\n");
+        std::println(std::cerr, "bake: no bake.toml found");
         return 1;
     }
 
     if (args.positional.empty()) {
-        std::fprintf(stderr, "bake: add requires a URL\n");
-        std::fprintf(stderr, "Usage: bake add <url> --tag <tag> [name]\n");
+        std::println(std::cerr, "bake: add requires a URL");
+        std::println(std::cerr, "Usage: bake add <url> --tag <tag> [name]");
         return 1;
     }
 
@@ -947,7 +1069,7 @@ export int cmd_add(const ParsedArgs& args) {
     }
 
     if (tag.empty()) {
-        std::fprintf(stderr, "bake: add requires --tag <tag>\n");
+        std::println(std::cerr, "bake: add requires --tag <tag>");
         return 1;
     }
 
@@ -955,7 +1077,7 @@ export int cmd_add(const ParsedArgs& args) {
     Path toml_path = *root / "bake.toml";
     auto content = read_file(toml_path);
     if (!content) {
-        std::fprintf(stderr, "bake: cannot read bake.toml\n");
+        std::println(std::cerr, "bake: cannot read bake.toml");
         return 1;
     }
 
@@ -966,9 +1088,9 @@ export int cmd_add(const ParsedArgs& args) {
             auto tbl = toml::parse_file(toml_path.string());
             if (auto* deps = tbl["dependencies"].as_table()) {
                 if (deps->contains(name)) {
-                    std::fprintf(stderr,
-                        "bake: dependency '%s' already exists in bake.toml\n",
-                        name.c_str());
+                    std::println(std::cerr,
+                        "bake: dependency '{}' already exists in bake.toml",
+                        name);
                     return 1;
                 }
             }
@@ -994,13 +1116,13 @@ export int cmd_add(const ParsedArgs& args) {
     }
 
     if (!write_file(toml_path, *content)) {
-        std::fprintf(stderr, "bake: failed to write bake.toml\n");
+        std::println(std::cerr, "bake: failed to write bake.toml");
         return 1;
     }
 
-    std::printf("Added dependency '%s' = { url = \"%s\", tag = \"%s\" }\n",
-                name.c_str(), url.c_str(), tag.c_str());
-    std::printf("Run 'bake build' to resolve and download.\n");
+    std::println("Added dependency '{}' = {{ url = \"{}\", tag = \"{}\" }}",
+                name, url, tag);
+    std::println("Run 'bake build' to resolve and download.");
     return 0;
 }
 
@@ -1009,18 +1131,18 @@ export int cmd_add(const ParsedArgs& args) {
 export int cmd_update(const ParsedArgs& args) {
     auto root = find_project_root();
     if (!root) {
-        std::fprintf(stderr, "bake: no bake.toml found\n");
+        std::println(std::cerr, "bake: no bake.toml found");
         return 1;
     }
 
     auto manifest = Manifest::load(*root);
     if (!manifest) {
-        std::fprintf(stderr, "bake: failed to load bake.toml\n");
+        std::println(std::cerr, "bake: failed to load bake.toml");
         return 1;
     }
 
     if (manifest->dependencies.empty()) {
-        std::printf("bake: no dependencies to update\n");
+        std::println("bake: no dependencies to update");
         return 0;
     }
 
@@ -1029,12 +1151,12 @@ export int cmd_update(const ParsedArgs& args) {
     if (!args.positional.empty()) {
         filter_dep = args.positional[0];
         if (manifest->dependencies.find(filter_dep) == manifest->dependencies.end()) {
-            std::fprintf(stderr, "bake: dependency '%s' not found in bake.toml\n", filter_dep.c_str());
+            std::println(std::cerr, "bake: dependency '{}' not found in bake.toml", filter_dep);
             return 1;
         }
         auto& dep = manifest->dependencies[filter_dep];
         if (dep.is_path_dep) {
-            std::fprintf(stderr, "bake: '%s' is a path dependency (no resolution needed)\n", filter_dep.c_str());
+            std::println(std::cerr, "bake: '{}' is a path dependency (no resolution needed)", filter_dep);
             return 1;
         }
     }
@@ -1050,7 +1172,7 @@ export int cmd_update(const ParsedArgs& args) {
         // Full re-resolve (existing behavior)
         auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
         if (!new_lock) {
-            std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+            std::println(std::cerr, "bake: failed to resolve dependencies");
             return 1;
         }
 
@@ -1062,18 +1184,18 @@ export int cmd_update(const ParsedArgs& args) {
                     auto& old_node = old_lock->nodes[old_it->second];
                     auto& new_node = new_lock->nodes[node_id];
                     if (old_node.commit != new_node.commit) {
-                        std::printf("bake: %s updated: %s → %s\n",
-                                    name.c_str(), old_node.commit.substr(0, 12).c_str(),
-                                    new_node.commit.substr(0, 12).c_str());
+                        std::println("bake: {} updated: {} → {}",
+                                    name, old_node.commit.substr(0, 12),
+                                    new_node.commit.substr(0, 12));
                     }
                 } else {
-                    std::printf("bake: %s added\n", name.c_str());
+                    std::println("bake: {} added", name);
                 }
             }
         }
 
         if (!new_lock->save(lock_path)) {
-            std::fprintf(stderr, "bake: failed to write bake.lock\n");
+            std::println(std::cerr, "bake: failed to write bake.lock");
             return 1;
         }
     } else {
@@ -1083,17 +1205,17 @@ export int cmd_update(const ParsedArgs& args) {
         // If the old lock is missing or corrupt, we can't safely do a
         // partial update (we'd lose other root deps). Fall back to full resolve.
         if (!old_lock || !old_lock->is_consistent(*manifest)) {
-            std::printf("bake: lock missing or stale, doing full re-resolve\n");
+            std::println("bake: lock missing or stale, doing full re-resolve");
             auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
             if (!new_lock) {
-                std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+                std::println(std::cerr, "bake: failed to resolve dependencies");
                 return 1;
             }
             if (!new_lock->save(lock_path)) {
-                std::fprintf(stderr, "bake: failed to write bake.lock\n");
+                std::println(std::cerr, "bake: failed to write bake.lock");
                 return 1;
             }
-            std::printf("bake: lock file updated\n");
+            std::println("bake: lock file updated");
             return 0;
         }
 
@@ -1102,7 +1224,7 @@ export int cmd_update(const ParsedArgs& args) {
         // Resolve dep + full transitive subtree
         auto subtree = resolver.resolve_subtree(dep, filter_dep);
         if (!subtree) {
-            std::fprintf(stderr, "bake: failed to resolve '%s'\n", filter_dep.c_str());
+            std::println(std::cerr, "bake: failed to resolve '{}'", filter_dep);
             return 1;
         }
 
@@ -1113,15 +1235,15 @@ export int cmd_update(const ParsedArgs& args) {
                 auto& old_node = old_lock->nodes[old_it->second];
                 auto& new_node = subtree->nodes[subtree->root_deps[filter_dep]];
                 if (old_node.commit != new_node.commit) {
-                    std::printf("bake: %s updated: %s → %s\n",
-                                filter_dep.c_str(), old_node.commit.substr(0, 12).c_str(),
-                                new_node.commit.substr(0, 12).c_str());
+                    std::println("bake: {} updated: {} → {}",
+                                filter_dep, old_node.commit.substr(0, 12),
+                                new_node.commit.substr(0, 12));
                 } else {
-                    std::printf("bake: %s unchanged (%s)\n", filter_dep.c_str(),
-                                new_node.commit.substr(0, 12).c_str());
+                    std::println("bake: {} unchanged ({})", filter_dep,
+                                new_node.commit.substr(0, 12));
                 }
             } else {
-                std::printf("bake: %s added\n", filter_dep.c_str());
+                std::println("bake: {} added", filter_dep);
             }
         }
 
@@ -1206,19 +1328,19 @@ export int cmd_update(const ParsedArgs& args) {
         new_lock.root_deps[filter_dep] = subtree->root_deps[filter_dep];
 
         if (!new_lock.save(lock_path)) {
-            std::fprintf(stderr, "bake: failed to write bake.lock\n");
+            std::println(std::cerr, "bake: failed to write bake.lock");
             return 1;
         }
     }
 
-    std::printf("bake: lock file updated\n");
+    std::println("bake: lock file updated");
     return 0;
 }
 
 // ===== Stub commands =====
 
 export int cmd_test(const ParsedArgs& args) {
-    std::fprintf(stderr, "bake: test not yet implemented (Phase 7)\n");
+    std::println(std::cerr, "bake: test not yet implemented (Phase 7)");
     return 1;
 }
 
@@ -1262,8 +1384,8 @@ export int main(int argc, char* argv[]) {
         return 0;
     }
 
-    std::fprintf(stderr, "bake: unknown command '%s'\n", args.command.c_str());
-    std::fprintf(stderr, "Run 'bake --help' for usage.\n");
+    std::println(std::cerr, "bake: unknown command '{}'", args.command);
+    std::println(std::cerr, "Run 'bake --help' for usage.");
     return 1;
 }
 

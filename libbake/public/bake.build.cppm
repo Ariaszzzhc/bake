@@ -3,12 +3,11 @@ module;
 // bake.build.cppm — Thin C++ wrapper over the bake C ABI.
 // Distributed as source; compiled fresh per project.
 
-#include <memory>
-#include <vector>
-#include <initializer_list>
 #include "bake_cabi.h"
 
 export module bake.build;
+
+import std;
 
 // ============================================================
 // bake.build — C++ API for build.cpp scripts
