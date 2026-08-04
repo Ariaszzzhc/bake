@@ -1,0 +1,8 @@
+[package]
+name = "bake"
+version = "0.1.0"
+type = "executable"
+std = "c++23"
+
+[dependencies]
+libbake = { path = "../libbake" }

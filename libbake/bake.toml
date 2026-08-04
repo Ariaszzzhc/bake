@@ -1,0 +1,5 @@
+[package]
+name = "libbake"
+version = "0.1.0"
+type = "shared-lib"
+std = "c++23"
