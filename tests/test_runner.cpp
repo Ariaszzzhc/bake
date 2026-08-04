@@ -364,23 +364,223 @@ TestResult test_update_single_dep() {
 }
 
 // ----------------------------------------------------------------
+// New tests: address Codex review P1/P2 issues
+// ----------------------------------------------------------------
+
+// Standalone path dep: the project has a path dep on a library with real
+// source code. The library's .cpp must be compiled and linked — not just
+// headers injected. This tests that path dep source compilation works
+// outside of workspace builds.
+TestResult test_standalone_path_dep_build() {
+    auto dir = make_temp_dir("standalone_path_dep");
+    copy_fixture("standalone_path_dep", dir);
+
+    auto r = run_bake("build", dir);
+    CHECK(r.success(), "bake build failed for standalone_path_dep: " + r.stdout);
+
+    // Verify the executable exists
+    fs::path exe = dir / "out" / "bin" / "calc";
+    CHECK(fs::exists(exe), "executable not found at out/bin/calc");
+
+    // Run it — should return 0 (multiply(3,4)=12, subtract(12,2)=10, 10-10=0)
+    auto run = run_cmd(exe.string(), dir);
+    CHECK_EQ(run.exit_code, 0,
+             "standalone path dep exe returned non-zero: "
+             + std::to_string(run.exit_code) + "\n" + run.stdout);
+
+    return {};
+}
+
+// Standalone path dep with --locked: should work since path deps don't need a lockfile.
+TestResult test_standalone_path_dep_locked() {
+    auto dir = make_temp_dir("standalone_path_dep_locked");
+    copy_fixture("standalone_path_dep", dir);
+
+    auto r = run_bake("build --locked", dir);
+    CHECK(r.success(), "--locked failed for standalone path dep: " + r.stdout);
+
+    return {};
+}
+
+// Duplicate add detection must work with compact TOML syntax too.
+// Previously, "name = " text search missed "name={url=...}" compact form.
+TestResult test_add_duplicate_compact() {
+    auto dir = make_temp_dir("add_dup_compact");
+    copy_fixture("simple_app", dir);
+
+    // Write bake.toml with compact TOML dependency (no spaces around =)
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"dup-test\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "std = \"c++17\"\n\n"
+        "[dependencies]\n"
+        "fmt={url=\"https://github.com/fmtlib/fmt\",tag=\"10.2.1\"}\n"
+    );
+    write_file(dir / "src" / "main.cpp", "int main() { return 0; }\n");
+
+    // Adding "fmt" again should fail
+    auto r = run_bake("add https://github.com/fmtlib/fmt --tag 10.2.1 fmt", dir);
+    CHECK(!r.success(), "duplicate add with compact TOML should have failed");
+    CHECK(r.stdout.find("already exists") != std::string::npos,
+          "expected 'already exists' for compact TOML: " + r.stdout);
+
+    return {};
+}
+
+// Lockfile transitive node consistency: if a root dep references a child
+// node that doesn't exist in the lock, is_consistent() must reject it.
+TestResult test_lock_transitive_consistency() {
+    auto dir = make_temp_dir("lock_transitive");
+    copy_fixture("simple_app", dir);
+
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"trans-test\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n\n"
+        "[dependencies]\n"
+        "fake = { url = \"https://github.com/example/fake\", tag = \"v1.0\" }\n"
+    );
+
+    // Write a lockfile where a node references a non-existent child
+    write_file(dir / "bake.lock",
+        "# AUTO-GENERATED. Do not edit.\n\n"
+        "[root_deps]\n"
+        "fake = \"fake-v1.0\"\n\n"
+        "[nodes.\"fake-v1.0\"]\n"
+        "url              = \"https://github.com/example/fake\"\n"
+        "tag              = \"v1.0\"\n"
+        "commit           = \"abc123def456\"\n"
+        "transport_sha256 = \"aaaabbbbccccdddd\"\n"
+        "tree_sha256      = \"1111222233334444\"\n"
+        "native           = false\n"
+        "dependencies     = [\"nonexistent-child-v2.0\"]\n"
+    );
+
+    // --locked should reject because the transitive child node doesn't exist
+    auto r = run_bake("build --locked", dir);
+    CHECK(!r.success(), "--locked should reject lock with missing transitive node");
+    CHECK(r.stdout.find("stale") != std::string::npos,
+          "expected 'stale' in error: " + r.stdout);
+
+    return {};
+}
+
+// Lockfile must reject when cache directory is missing for a frozen build.
+TestResult test_frozen_missing_cache() {
+    auto dir = make_temp_dir("frozen_missing_cache");
+    copy_fixture("simple_app", dir);
+
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"cache-test\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n\n"
+        "[dependencies]\n"
+        "fake = { url = \"https://github.com/example/fake\", tag = \"v1.0\" }\n"
+    );
+
+    // Write a lockfile with non-empty hashes but cache doesn't exist
+    write_file(dir / "bake.lock",
+        "# AUTO-GENERATED. Do not edit.\n\n"
+        "[root_deps]\n"
+        "fake = \"fake-v1.0\"\n\n"
+        "[nodes.\"fake-v1.0\"]\n"
+        "url              = \"https://github.com/example/fake\"\n"
+        "tag              = \"v1.0\"\n"
+        "commit           = \"abc123def456789abc123def456789abc123de\"\n"
+        "transport_sha256 = \"aaaabbbbccccddddeeeeffff0000111122223\"\n"
+        "tree_sha256      = \"1111222233334444555566667777888899aab\"\n"
+        "native           = false\n"
+        "dependencies     = []\n"
+    );
+
+    // --frozen should fail because cache directory doesn't exist
+    auto r = run_bake("build --frozen", dir);
+    CHECK(!r.success(),
+          "--frozen should fail when cache is missing");
+
+    return {};
+}
+
+// Workspace build: each member's output must go to the unified out/ dir
+// with per-member obj/ and bmi/ subdirectories.
+TestResult test_workspace_unified_output() {
+    auto dir = make_temp_dir("ws_unified");
+    copy_fixture("path_dep", dir);
+
+    auto r = run_bake("build", dir);
+    CHECK(r.success(), "workspace build failed: " + r.stdout);
+
+    // Check unified output layout
+    CHECK(fs::is_directory(dir / "out" / "bin"), "out/bin/ should exist");
+    CHECK(fs::is_directory(dir / "out" / "lib"), "out/lib/ should exist");
+
+    // Check per-member obj directories
+    CHECK(fs::is_directory(dir / "out" / "obj" / "mylib"),
+          "out/obj/mylib/ should exist for workspace member");
+    CHECK(fs::is_directory(dir / "out" / "obj" / "app"),
+          "out/obj/app/ should exist for workspace member");
+
+    // Verify executable runs
+    fs::path exe = dir / "out" / "bin" / "app";
+    CHECK(fs::exists(exe), "workspace exe not found");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK_EQ(run.exit_code, 0,
+             "workspace exe returned non-zero: " + std::to_string(run.exit_code));
+
+    return {};
+}
+
+// Workspace build with -p filter: only the specified member should be built.
+TestResult test_workspace_member_filter() {
+    auto dir = make_temp_dir("ws_filter");
+    copy_fixture("path_dep", dir);
+
+    // Build only mylib
+    auto r = run_bake("build -p mylib", dir);
+    CHECK(r.success(), "build -p mylib failed: " + r.stdout);
+
+    // mylib should be built
+    fs::path lib_dir = dir / "out" / "lib";
+    bool found_lib = false;
+    if (fs::exists(lib_dir)) {
+        for (auto& e : fs::directory_iterator(lib_dir)) {
+            if (e.path().extension() == ".a") { found_lib = true; break; }
+        }
+    }
+    CHECK(found_lib, "mylib .a should exist after build -p mylib");
+
+    return {};
+}
+
+// ----------------------------------------------------------------
 // Test registry
 // ----------------------------------------------------------------
 
 static std::vector<TestCase> all_tests = {
-    {"simple_app_build",       test_simple_app_build},
-    {"static_lib_build",       test_static_lib_build},
-    {"path_dep_build",         test_path_dep_build},
-    {"path_dep_locked",        test_path_dep_locked},
-    {"frozen_no_lock",         test_frozen_no_lock},
-    {"lock_consistency",       test_lock_consistency},
-    {"add_duplicate",          test_add_duplicate},
-    {"add_no_tag",             test_add_no_tag},
-    {"unified_output_layout",  test_unified_output_layout},
-    {"clean",                  test_clean},
-    {"init",                   test_init},
-    {"version",                test_version},
-    {"update_single_dep",      test_update_single_dep},
+    {"simple_app_build",              test_simple_app_build},
+    {"static_lib_build",              test_static_lib_build},
+    {"path_dep_build",                test_path_dep_build},
+    {"path_dep_locked",               test_path_dep_locked},
+    {"frozen_no_lock",                test_frozen_no_lock},
+    {"lock_consistency",              test_lock_consistency},
+    {"lock_transitive_consistency",   test_lock_transitive_consistency},
+    {"frozen_missing_cache",          test_frozen_missing_cache},
+    {"add_duplicate",                 test_add_duplicate},
+    {"add_duplicate_compact",         test_add_duplicate_compact},
+    {"add_no_tag",                    test_add_no_tag},
+    {"unified_output_layout",         test_unified_output_layout},
+    {"clean",                         test_clean},
+    {"init",                          test_init},
+    {"version",                       test_version},
+    {"update_single_dep",             test_update_single_dep},
+    {"standalone_path_dep_build",     test_standalone_path_dep_build},
+    {"standalone_path_dep_locked",    test_standalone_path_dep_locked},
+    {"workspace_unified_output",      test_workspace_unified_output},
+    {"workspace_member_filter",       test_workspace_member_filter},
 };
 
 // ----------------------------------------------------------------

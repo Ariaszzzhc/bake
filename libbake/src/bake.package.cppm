@@ -10,6 +10,7 @@ module;
 #include <cstdlib>
 #include <cstdint>
 #include <random>
+#include <sstream>
 
 #include <nlohmann/json.hpp>
 
@@ -42,6 +43,11 @@ public:
     // Returns a Lockfile on success.
     std::optional<Lockfile> resolve(const Manifest& manifest, const ResolverConfig& config);
 
+    // Resolve a single dependency AND its full transitive closure.
+    // Returns a Lockfile with the dep as the only root dep.
+    std::optional<Lockfile> resolve_subtree(const Dependency& root_dep,
+                                             const std::string& root_name);
+
     // Resolve a single dependency: tag → commit → download → hash → extract
     // Returns the lock node
     std::optional<LockNode> resolve_dependency(const Dependency& dep);
@@ -65,9 +71,91 @@ private:
     // Compute tree SHA-256 (normalized hash of all files in directory)
     std::string compute_tree_hash(const Path& dir);
 
+public:
     // Generate node ID from name and tag
     std::string make_node_id(const std::string& name, const std::string& tag);
 };
+
+// compute_tree_sha256 is exported below (as a free function) for use by
+// the CLI layer's cache verification. It lives here because bake.engine
+// does NOT import bake.package, so new exports here don't trigger the
+// clang 22 module deserialization crash in self-bootstrap.
+
+export inline std::string compute_tree_sha256(const Path& dir) {
+    std::vector<std::pair<std::string, std::string>> entries;
+
+    for (auto& entry : std::filesystem::recursive_directory_iterator(dir.fs())) {
+        // Use lexically_relative instead of filesystem::relative.
+        // filesystem::relative() resolves symlinks, so a symlink and its
+        // target would hash identically. lexically_relative() does a pure
+        // lexical computation that preserves the symlink's own path identity.
+        auto rel = entry.path().lexically_relative(dir.fs());
+        std::string path = rel.string();
+
+        for (auto& c : path) {
+            if (c == '\\') c = '/';
+        }
+
+        auto status = entry.symlink_status();
+        unsigned mode = static_cast<unsigned>(status.permissions());
+
+        std::string contribution = path;
+        contribution += '|';
+        contribution += std::to_string(mode);
+        contribution += '|';
+
+        if (std::filesystem::is_symlink(status)) {
+            std::error_code ec;
+            contribution += "S:";
+            contribution += std::filesystem::read_symlink(entry.path(), ec).string();
+        } else if (std::filesystem::is_regular_file(status)) {
+            contribution += "F:";
+            contribution += SHA256::hex_file(Path(entry.path()));
+        } else if (std::filesystem::is_directory(status)) {
+            contribution += "D";
+        } else {
+            continue;
+        }
+
+        entries.push_back({path, contribution});
+    }
+
+    std::sort(entries.begin(), entries.end());
+
+    std::string combined;
+    for (auto& [path, data] : entries) {
+        combined += data;
+        combined += '\n';
+    }
+
+    return SHA256::hex(combined);
+}
+
+// Verify that cached source for every lock node matches its tree_sha256.
+// Detects tampering with cached dependencies. Called by the CLI layer.
+export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache_dir) {
+    for (auto& [id, node] : lockfile.nodes) {
+        if (node.tree_sha256.empty()) continue;
+
+        Path cache_path = cache_dir / node.tree_sha256;
+        if (!cache_path.is_directory()) {
+            std::fprintf(stderr,
+                "bake: cache for '%s' missing at %s\n",
+                id.c_str(), cache_path.string().c_str());
+            return false;
+        }
+
+        std::string actual_hash = compute_tree_sha256(cache_path);
+        if (actual_hash != node.tree_sha256) {
+            std::fprintf(stderr,
+                "bake: cache tampered for '%s' (expected %s, got %s)\n",
+                id.c_str(), node.tree_sha256.substr(0, 12).c_str(),
+                actual_hash.substr(0, 12).c_str());
+            return false;
+        }
+    }
+    return true;
+}
 
 // ===== Implementation =====
 
@@ -230,8 +318,186 @@ inline bool validate_extracted_tree(const std::filesystem::path& tmpdir) {
     return true;
 }
 
+// Pre-scan a tarball's entry list to detect malicious content BEFORE
+// extracting. This prevents path traversal, symlink escapes, and zip bombs
+// from ever touching the filesystem.
+// Returns true if the archive passes all safety checks.
+inline bool prescan_archive(const Path& archive, size_t& out_file_count,
+                            uintmax_t& out_total_size) {
+    const size_t MAX_FILES = 100'000;
+    const uintmax_t MAX_TOTAL_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
+
+    // List all entries with metadata using `tar -tvf` (verbose).
+    // This gives us type, size, and symlink target for each entry.
+    auto result = run_process(
+        {"tar", "-tvf", archive.string()}, Path(), true);
+    if (!result.success()) {
+        std::fprintf(stderr, "bake: failed to list archive entries\n");
+        return false;
+    }
+
+    size_t file_count = 0;
+    uintmax_t total_size = 0;
+
+    // Parse the verbose listing line by line.
+    // Format example (BSD tar):
+    //   -rw-r--r--  0 user group     1234 Jan  1 12:00 prefix/file.txt
+    //   lrwxrwxrwx  0 user group        8 Jan  1 12:00 prefix/link -> target
+    const auto& listing = result.stdout_output;
+    size_t pos = 0;
+    while (pos < listing.size()) {
+        size_t eol = listing.find('\n', pos);
+        if (eol == std::string::npos) eol = listing.size();
+
+        std::string line = listing.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        if (line.empty()) continue;
+
+        char type_char = line[0];
+
+        // Find path: after timestamp pattern "HH:MM " in the line
+        size_t time_end = std::string::npos;
+        for (size_t i = 10; i + 1 < line.size(); ++i) {
+            if (line[i] == ':' && std::isdigit(static_cast<unsigned char>(line[i - 1]))) {
+                if (i + 2 < line.size() && line[i + 1] == ' ') {
+                    time_end = i + 2;
+                    break;
+                }
+                if (i + 3 < line.size() && std::isdigit(static_cast<unsigned char>(line[i + 1]))
+                    && line[i + 2] == ' ') {
+                    time_end = i + 3;
+                    break;
+                }
+            }
+        }
+        if (time_end == std::string::npos) continue;
+        while (time_end < line.size() && line[time_end] == ' ') time_end++;
+
+        std::string entry;
+        std::string link_target;
+        if (type_char == 'l') {
+            size_t arrow = line.find(" -> ", time_end);
+            if (arrow != std::string::npos) {
+                entry = line.substr(time_end, arrow - time_end);
+                link_target = line.substr(arrow + 4);
+            } else {
+                entry = line.substr(time_end);
+            }
+        } else {
+            entry = line.substr(time_end);
+        }
+
+        for (auto& c : entry) { if (c == '\\') c = '/'; }
+        for (auto& c : link_target) { if (c == '\\') c = '/'; }
+        while (!entry.empty() && (entry.back() == '\r' || entry.back() == ' '))
+            entry.pop_back();
+        while (!link_target.empty() && (link_target.back() == '\r' || link_target.back() == ' '))
+            link_target.pop_back();
+
+        if (entry.empty()) continue;
+
+        // Reject absolute paths
+        if (!entry.empty() && entry[0] == '/') {
+            std::fprintf(stderr,
+                "bake: rejecting archive entry with absolute path: %s\n",
+                entry.c_str());
+            return false;
+        }
+
+        // Reject path traversal (any component that is "..")
+        {
+            size_t dotdot = 0;
+            while ((dotdot = entry.find("..", dotdot)) != std::string::npos) {
+                bool left_ok = (dotdot == 0 || entry[dotdot - 1] == '/');
+                bool right_ok = (dotdot + 2 >= entry.size() ||
+                                entry[dotdot + 2] == '/');
+                if (left_ok && right_ok) {
+                    std::fprintf(stderr,
+                        "bake: rejecting path traversal in archive: %s\n",
+                        entry.c_str());
+                    return false;
+                }
+                dotdot += 2;
+            }
+        }
+
+        // Reject symlinks that escape the archive root
+        if (type_char == 'l' && !link_target.empty()) {
+            if (link_target[0] == '/') {
+                std::fprintf(stderr,
+                    "bake: rejecting symlink with absolute target: %s -> %s\n",
+                    entry.c_str(), link_target.c_str());
+                return false;
+            }
+            size_t dd = 0;
+            while ((dd = link_target.find("..", dd)) != std::string::npos) {
+                bool left_ok = (dd == 0 || link_target[dd - 1] == '/');
+                bool right_ok = (dd + 2 >= link_target.size() ||
+                                link_target[dd + 2] == '/');
+                if (left_ok && right_ok) {
+                    std::fprintf(stderr,
+                        "bake: rejecting symlink escaping archive: %s -> %s\n",
+                        entry.c_str(), link_target.c_str());
+                    return false;
+                }
+                dd += 2;
+            }
+        }
+
+        // Reject hardlinks entirely
+        if (type_char == 'h' || (type_char == 'l' && line.find(" link to ") != std::string::npos)) {
+            std::fprintf(stderr,
+                "bake: rejecting hardlink entry in archive: %s\n",
+                entry.c_str());
+            return false;
+        }
+
+        // Accumulate size for regular files
+        if (type_char == '-') {
+            std::string meta = line.substr(0, time_end);
+            std::istringstream iss(meta);
+            std::string field;
+            std::vector<std::string> fields;
+            while (iss >> field) fields.push_back(field);
+            if (fields.size() >= 5) {
+                uintmax_t fsize = 0;
+                std::istringstream sz(fields[4]);
+                sz >> fsize;
+                total_size += fsize;
+            }
+            file_count++;
+        }
+
+        if (file_count > MAX_FILES) {
+            std::fprintf(stderr,
+                "bake: archive exceeds file count limit (%zu entries)\n",
+                MAX_FILES);
+            return false;
+        }
+        if (total_size > MAX_TOTAL_SIZE) {
+            std::fprintf(stderr,
+                "bake: archive exceeds size limit (1 GB)\n");
+            return false;
+        }
+    }
+
+    out_file_count = file_count;
+    out_total_size = total_size;
+    return true;
+}
+
 inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir) {
-    // Create a uniquely-named temp directory for extraction.
+    // Phase 1: Pre-scan archive entries BEFORE extraction.
+    // This prevents malicious archives from writing to the filesystem
+    // before safety checks can run.
+    size_t file_count = 0;
+    uintmax_t total_size = 0;
+    if (!prescan_archive(archive, file_count, total_size)) {
+        return false;
+    }
+
+    // Phase 2: Create a uniquely-named temp directory for extraction.
     std::random_device rd;
     std::uniform_int_distribution<unsigned> dist(0, 0xFFFFFF);
     std::string suffix;
@@ -244,12 +510,15 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     tmp_dir.remove_all();
     tmp_dir.mkdir_recursive();
 
-    // Extract with tar — strip ownership/permissions for safety.
+    // Phase 3: Extract with tar, stripping ownership/permissions.
+    // Also use --hard-dereference to treat symlinks as regular files,
+    // and -P disabled (default) to prevent absolute path extraction.
     std::vector<std::string> cmd = {
         "tar", "xf", archive.string(),
         "-C", tmp_dir.string(),
         "--no-same-owner",
-        "--no-same-permissions"
+        "--no-same-permissions",
+        "--no-overwrite-dir"
     };
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
@@ -258,14 +527,15 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
         return false;
     }
 
-    // Validate the extracted tree before moving it anywhere.
+    // Phase 4: Post-extraction validation (defense in depth).
+    // The pre-scan should have caught everything, but verify the actual
+    // extracted tree as well — in case tar's behavior differs from -tf.
     if (!validate_extracted_tree(tmp_dir.fs())) {
         tmp_dir.remove_all();
         return false;
     }
 
     // Find the top-level directory (tarballs usually have one prefix dir).
-    // If there's exactly one top-level entry and it's a directory, strip it.
     std::string prefix_dir;
     int top_count = 0;
     for (auto& entry : std::filesystem::directory_iterator(tmp_dir.fs())) {
@@ -276,14 +546,12 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     }
 
     if (top_count == 1 && !prefix_dir.empty()) {
-        // Move contents of prefix dir to dest_dir
         Path prefix_path = tmp_dir / prefix_dir;
         dest_dir.remove_all();
         dest_dir.parent().mkdir_recursive();
         std::filesystem::rename(prefix_path.fs(), dest_dir.fs());
         tmp_dir.remove_all();
     } else {
-        // No single prefix dir, rename tmp to dest
         dest_dir.remove_all();
         dest_dir.parent().mkdir_recursive();
         std::filesystem::rename(tmp_dir.fs(), dest_dir.fs());
@@ -293,25 +561,7 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
 }
 
 inline std::string Resolver::compute_tree_hash(const Path& dir) {
-    // Collect all file paths sorted
-    std::vector<std::string> files;
-    for (auto& entry : std::filesystem::recursive_directory_iterator(dir.fs())) {
-        if (!entry.is_regular_file()) continue;
-        auto rel = std::filesystem::relative(entry.path(), dir.fs());
-        files.push_back(rel.string());
-    }
-    std::sort(files.begin(), files.end());
-
-    // Hash: concatenate relative path + file content hash
-    std::string combined;
-    for (auto& f : files) {
-        Path file_path = dir / f;
-        auto content = read_file(file_path);
-        if (!content) continue;
-        combined += f + "\0" + SHA256::hex(*content) + "\0";
-    }
-
-    return SHA256::hex(combined);
+    return compute_tree_sha256(dir);
 }
 
 inline std::optional<LockNode> Resolver::resolve_dependency(const Dependency& dep) {
@@ -401,8 +651,10 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
     }
 
     // Conflict tracking
-    std::map<std::string, std::string> url_to_commit;  // url → commit
-    std::map<std::string, std::string> name_to_url;    // name → url
+    std::map<std::string, std::string> url_to_commit;      // url → commit
+    std::map<std::string, std::string> name_to_url;        // name → url
+    std::map<std::string, std::string> url_commit_to_node; // "url\0commit" → node_id
+    std::map<std::string, std::string> name_to_node_id;    // dep_name → actual node_id
 
     const size_t MAX_NODES = 256;
     size_t node_count = 0;
@@ -416,22 +668,48 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
         auto [dep_name, dep, is_root] = queue.front();
         queue.erase(queue.begin());
 
+        // Check if this exact URL was already resolved (before downloading).
+        // This prevents redundant downloads and handles aliases correctly.
+        auto url_it = url_to_commit.find(dep.url);
+        if (url_it != url_to_commit.end()) {
+            const std::string& existing_commit = url_it->second;
+
+            // We need to resolve the tag to know the commit.
+            auto commit = resolve_tag(dep.url, dep.tag);
+            if (!commit) {
+                std::fprintf(stderr, "bake: failed to resolve tag '%s' for %s\n",
+                             dep.tag.c_str(), dep.url.c_str());
+                return std::nullopt;
+            }
+
+            if (*commit != existing_commit) {
+                std::fprintf(stderr,
+                    "bake: conflict — %s resolved to commit %s, but same URL was already at %s\n",
+                    dep.url.c_str(), commit->c_str(), existing_commit.c_str());
+                return std::nullopt;
+            }
+
+            // Same URL + same commit — alias the existing node.
+            std::string key = dep.url + std::string(1, '\0') + existing_commit;
+            auto alias_it = url_commit_to_node.find(key);
+            if (alias_it != url_commit_to_node.end()) {
+                if (is_root) {
+                    lockfile.root_deps[dep_name] = alias_it->second;
+                }
+                // Register the name mapping
+                name_to_url[dep_name] = dep.url;
+                name_to_node_id[dep_name] = alias_it->second;
+            }
+            continue;
+        }
+
+        // Not a duplicate URL — do the full resolve.
         auto node = resolve_dependency(dep);
         if (!node) return std::nullopt;
 
-        // Conflict check 1: same URL resolved to a different commit
-        auto url_it = url_to_commit.find(dep.url);
-        if (url_it != url_to_commit.end()) {
-            if (url_it->second != node->commit) {
-                std::fprintf(stderr,
-                    "bake: conflict — %s resolved to commit %s, but same URL was already at %s\n",
-                    dep.url.c_str(), node->commit.c_str(), url_it->second.c_str());
-                return std::nullopt;
-            }
-            // Same URL + same commit — already resolved, skip
-            continue;
-        }
         url_to_commit[dep.url] = node->commit;
+        std::string uc_key = dep.url + std::string(1, '\0') + node->commit;
+        url_commit_to_node[uc_key] = node->id;
 
         // Conflict check 2: same name from a different URL
         auto name_it = name_to_url.find(dep_name);
@@ -448,6 +726,7 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
 
         // Add to lockfile
         lockfile.nodes[node->id] = *node;
+        name_to_node_id[dep_name] = node->id;
         if (is_root) {
             lockfile.root_deps[dep_name] = node->id;
         }
@@ -462,13 +741,124 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
                 if (sub_manifest) {
                     for (auto& [sub_name, sub_dep] : sub_manifest->dependencies) {
                         if (sub_dep.is_path_dep) continue;
-                        node->dependencies.push_back(
-                            make_node_id(sub_name, sub_dep.tag));
+                        // Push the sub_name as a placeholder; it will be
+                        // resolved to the actual node_id in post-processing.
+                        node->dependencies.push_back(sub_name);
                         queue.push_back({sub_name, sub_dep, false});
                     }
                     // Update the node in lockfile with its dependency edges
                     lockfile.nodes[node->id].dependencies = node->dependencies;
                 }
+            }
+        }
+    }
+
+    // Post-processing: fix up dependency edges.
+    // Parent nodes store sub_name as their dependency edge, but the lockfile
+    // needs actual node IDs. Replace each placeholder with the real node ID.
+    for (auto& [id, node] : lockfile.nodes) {
+        for (auto& child_id : node.dependencies) {
+            if (lockfile.nodes.count(child_id)) continue;
+            auto nit = name_to_node_id.find(child_id);
+            if (nit != name_to_node_id.end()) {
+                child_id = nit->second;
+            }
+        }
+    }
+
+    return lockfile;
+}
+
+// Resolve a single dep + its transitive closure into a Lockfile.
+inline std::optional<Lockfile> Resolver::resolve_subtree(const Dependency& root_dep,
+                                                          const std::string& root_name) {
+    cache_dir_.mkdir_recursive();
+
+    Lockfile lockfile;
+
+    struct QueueEntry {
+        std::string name;
+        Dependency dep;
+        bool is_root;
+    };
+    std::vector<QueueEntry> queue;
+    queue.push_back({root_name, root_dep, true});
+
+    std::map<std::string, std::string> url_to_commit;
+    std::map<std::string, std::string> url_commit_to_node;
+    std::map<std::string, std::string> name_to_node_id;
+
+    const size_t MAX_NODES = 256;
+    size_t node_count = 0;
+
+    while (!queue.empty()) {
+        if (node_count >= MAX_NODES) {
+            std::fprintf(stderr, "bake: dependency graph exceeds limit (%zu nodes)\n", MAX_NODES);
+            return std::nullopt;
+        }
+
+        auto [dep_name, dep, is_root] = queue.front();
+        queue.erase(queue.begin());
+
+        auto url_it = url_to_commit.find(dep.url);
+        if (url_it != url_to_commit.end()) {
+            auto commit = resolve_tag(dep.url, dep.tag);
+            if (!commit || *commit != url_it->second) {
+                if (commit && *commit != url_it->second) {
+                    std::fprintf(stderr, "bake: conflict — same URL resolved to different commits\n");
+                    return std::nullopt;
+                }
+                return std::nullopt;
+            }
+            std::string key = dep.url + std::string(1, '\0') + url_it->second;
+            auto alias_it = url_commit_to_node.find(key);
+            if (alias_it != url_commit_to_node.end()) {
+                name_to_node_id[dep_name] = alias_it->second;
+                if (is_root) {
+                    lockfile.root_deps[dep_name] = alias_it->second;
+                }
+            }
+            continue;
+        }
+
+        auto node = resolve_dependency(dep);
+        if (!node) return std::nullopt;
+
+        url_to_commit[dep.url] = node->commit;
+        std::string uc_key = dep.url + std::string(1, '\0') + node->commit;
+        url_commit_to_node[uc_key] = node->id;
+
+        lockfile.nodes[node->id] = *node;
+        name_to_node_id[dep_name] = node->id;
+        if (is_root) {
+            lockfile.root_deps[dep_name] = node->id;
+        }
+        node_count++;
+
+        if (node->native && !node->tree_sha256.empty()) {
+            Path dep_cache = cache_dir_ / node->tree_sha256;
+            Path dep_toml = dep_cache / "bake.toml";
+            if (dep_toml.is_regular_file()) {
+                auto sub_manifest = Manifest::load(dep_cache);
+                if (sub_manifest) {
+                    for (auto& [sub_name, sub_dep] : sub_manifest->dependencies) {
+                        if (sub_dep.is_path_dep) continue;
+                        node->dependencies.push_back(sub_name);
+                        queue.push_back({sub_name, sub_dep, false});
+                    }
+                    lockfile.nodes[node->id].dependencies = node->dependencies;
+                }
+            }
+        }
+    }
+
+    // Post-processing: fix up dependency edges in resolve_subtree
+    for (auto& [id, node] : lockfile.nodes) {
+        for (auto& child_id : node.dependencies) {
+            if (lockfile.nodes.count(child_id)) continue;
+            auto nit = name_to_node_id.find(child_id);
+            if (nit != name_to_node_id.end()) {
+                child_id = nit->second;
             }
         }
     }

@@ -7,6 +7,10 @@ module;
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <algorithm>
+#include <set>
+
+#include <toml.hpp>
 
 export module bake.cli;
 
@@ -43,26 +47,33 @@ export struct ParsedArgs {
     bool help = false;
     bool version = false;
 
-    // Get an option value (--key=value or --key value)
+    // Get an option value (--key=value, --key value, -k value, or -k=value)
     std::optional<std::string> get_option(std::string_view name) const {
-        std::string prefix = std::string("--") + std::string(name) + "=";
+        std::string long_prefix = std::string("--") + std::string(name) + "=";
+        std::string short_prefix = std::string("-") + std::string(name) + "=";
         for (auto& opt : options) {
-            if (opt == prefix.substr(0, prefix.size() - 1)) {
+            if (opt == long_prefix.substr(0, long_prefix.size() - 1) ||
+                opt == short_prefix.substr(0, short_prefix.size() - 1)) {
                 return std::string("true");  // flag without value
             }
-            if (starts_with(opt, prefix)) {
-                return opt.substr(prefix.size());
+            if (starts_with(opt, long_prefix)) {
+                return opt.substr(long_prefix.size());
+            }
+            if (starts_with(opt, short_prefix)) {
+                return opt.substr(short_prefix.size());
             }
         }
         return std::nullopt;
     }
 
     bool has_option(std::string_view name) const {
-        std::string flag = std::string("--") + std::string(name);
-        std::string prefix = flag + "=";
+        std::string long_flag = std::string("--") + std::string(name);
+        std::string short_flag = std::string("-") + std::string(name);
+        std::string long_prefix = long_flag + "=";
+        std::string short_prefix = short_flag + "=";
         for (auto& opt : options) {
-            if (opt == flag) return true;
-            if (starts_with(opt, prefix)) return true;
+            if (opt == long_flag || opt == short_flag) return true;
+            if (starts_with(opt, long_prefix) || starts_with(opt, short_prefix)) return true;
         }
         return false;
     }
@@ -435,6 +446,7 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
 // Check and resolve the lockfile. Returns 0 if the lock is consistent
 // or was successfully (re)resolved. Returns non-zero on failure.
 // On success, root/bake.lock is guaranteed to exist and be consistent.
+// Cache integrity is verified on ALL builds to detect tampering.
 export int enforce_lock(const Path& root, const Manifest& manifest, const ParsedArgs& args) {
     if (Lockfile::has_only_path_deps(manifest)) return 0;
 
@@ -449,6 +461,18 @@ export int enforce_lock(const Path& root, const Manifest& manifest, const Parsed
         needs_resolve = true;
     } else if (!lockfile->is_consistent(manifest)) {
         needs_resolve = true;
+    }
+
+    // Verify cache integrity on all builds, not just frozen/locked.
+    // This detects tampered or corrupted cached dependencies before they
+    // enter the build graph.
+    if (!needs_resolve && lockfile) {
+        if (!verify_lock_cache(*lockfile, get_cache_dir())) {
+            std::fprintf(stderr, "bake: cache verification failed — lock is untrustworthy\n");
+            if (locked || offline) return 1;
+            // In non-locked mode, re-resolve from scratch to get clean cache
+            needs_resolve = true;
+        }
     }
 
     if (!needs_resolve) return 0;
@@ -479,13 +503,64 @@ export int enforce_lock(const Path& root, const Manifest& manifest, const Parsed
 // ===== Dep source extraction (bridges bake.package types to bake.engine types) =====
 
 // Extract bake-native dep sources and include dirs from a lockfile.
+// Walks ALL lock nodes (root + transitive) in topological order so that
+// dependencies are compiled before dependents.
 // CMake deps (native=false) are skipped — Phase 4 territory.
 static void extract_dep_info(
         const Lockfile& lockfile,
         const Path& cache_dir,
         std::vector<DepSourceEntry>& dep_sources,
         std::vector<Path>& dep_include_dirs) {
-    for (auto& [name, node_id] : lockfile.root_deps) {
+
+    // Topological sort of lock nodes by their dependency edges.
+    // Nodes with no dependencies come first.
+    std::vector<std::string> topo_order;
+    {
+        std::map<std::string, int> in_degree;
+        std::map<std::string, std::vector<std::string>> dependents;
+
+        for (auto& [id, node] : lockfile.nodes) {
+            in_degree[id] = 0;
+        }
+        for (auto& [id, node] : lockfile.nodes) {
+            for (auto& child_id : node.dependencies) {
+                if (lockfile.nodes.count(child_id)) {
+                    dependents[child_id].push_back(id);
+                    in_degree[id]++;
+                }
+            }
+        }
+
+        // Kahn's algorithm
+        std::vector<std::string> queue;
+        for (auto& [id, deg] : in_degree) {
+            if (deg == 0) queue.push_back(id);
+        }
+        std::sort(queue.begin(), queue.end());
+
+        while (!queue.empty()) {
+            std::string node_id = queue.front();
+            queue.erase(queue.begin());
+            topo_order.push_back(node_id);
+
+            for (auto& dep_id : dependents[node_id]) {
+                if (--in_degree[dep_id] == 0) {
+                    queue.push_back(dep_id);
+                }
+            }
+            std::sort(queue.begin(), queue.end());
+        }
+
+        // Append any remaining (cycle) nodes
+        for (auto& [id, node] : lockfile.nodes) {
+            if (std::find(topo_order.begin(), topo_order.end(), id) == topo_order.end()) {
+                topo_order.push_back(id);
+            }
+        }
+    }
+
+    // Walk nodes in topological order
+    for (auto& node_id : topo_order) {
         auto node_it = lockfile.nodes.find(node_id);
         if (node_it == lockfile.nodes.end()) continue;
         const auto& node = node_it->second;
@@ -495,7 +570,7 @@ static void extract_dep_info(
         Path dep_cache = cache_dir / node.tree_sha256;
         if (!dep_cache.is_directory()) {
             std::fprintf(stderr, "bake: cached source for '%s' not found at %s\n",
-                         name.c_str(), dep_cache.string().c_str());
+                         node_id.c_str(), dep_cache.string().c_str());
             continue;
         }
 
@@ -510,10 +585,10 @@ static void extract_dep_info(
         if (dep_src.is_directory()) {
             auto dep_disc = discover_sources(dep_src, dep_public);
             for (auto& cpp : dep_disc.cpp_files) {
-                dep_sources.push_back({name, cpp});
+                dep_sources.push_back({node_id, cpp});
             }
             for (auto& c : dep_disc.c_files) {
-                dep_sources.push_back({name, c});
+                dep_sources.push_back({node_id, c});
             }
         }
     }
@@ -539,16 +614,6 @@ export int cmd_build(const ParsedArgs& args) {
     // ===== Lock enforcement (before build.cpp so --locked/--frozen work universally)
     if (int rc = enforce_lock(*root, *manifest, args); rc != 0) return rc;
 
-    // Load the final lockfile (may have been just written by enforce_lock)
-    auto lockfile = Lockfile::load(*root / "bake.lock");
-
-    // Extract bake-native dep sources + include dirs for the build engine
-    std::vector<DepSourceEntry> dep_sources;
-    std::vector<Path> dep_include_dirs;
-    if (lockfile && !lockfile->empty()) {
-        extract_dep_info(*lockfile, get_cache_dir(), dep_sources, dep_include_dirs);
-    }
-
     // Check for build.cpp (escape hatch mode)
     Path build_cpp = *root / "build.cpp";
     if (build_cpp.is_regular_file()) {
@@ -561,6 +626,40 @@ export int cmd_build(const ParsedArgs& args) {
         int jobs = 0;
         if (auto j = args.get_option("j")) {
             jobs = std::atoi(j->c_str());
+        }
+
+        // Enforce lock for the workspace: merge all members' remote deps into
+        // a single combined manifest, then resolve once. This prevents each
+        // member's enforce_lock from overwriting the shared bake.lock.
+        {
+            Manifest combined;
+            combined.project_dir = *root;
+            for (auto& member : manifest->workspace->members) {
+                Path member_dir = *root / member;
+                auto member_manifest = Manifest::load(member_dir);
+                if (!member_manifest) continue;
+                for (auto& [name, dep] : member_manifest->dependencies) {
+                    if (dep.is_path_dep) continue;
+                    // Merge: last one wins if duplicate (conflict detection
+                    // happens during resolution)
+                    combined.dependencies[name] = dep;
+                }
+            }
+            if (!Lockfile::has_only_path_deps(combined)) {
+                if (int rc = enforce_lock(*root, combined, args); rc != 0) {
+                    return rc;
+                }
+            }
+        }
+
+        // Load the final lockfile (may have been updated by member enforcement)
+        auto lockfile = Lockfile::load(*root / "bake.lock");
+
+        // Extract dep sources + include dirs from lockfile
+        std::vector<DepSourceEntry> dep_sources;
+        std::vector<Path> dep_include_dirs;
+        if (lockfile && !lockfile->empty()) {
+            extract_dep_info(*lockfile, get_cache_dir(), dep_sources, dep_include_dirs);
         }
 
         // Track built members for inter-member dependency resolution
@@ -591,7 +690,8 @@ export int cmd_build(const ParsedArgs& args) {
 
             auto plan = create_convention_plan(*member_manifest, layout, tc,
                                                 member_manifest->options,
-                                                dep_sources, dep_include_dirs);
+                                                dep_sources, dep_include_dirs,
+                                                /*compile_path_deps=*/false);
 
             // Inject external modules from built dependencies
             for (auto& action : plan.actions) {
@@ -656,6 +756,14 @@ export int cmd_build(const ParsedArgs& args) {
     auto tc = Toolchain::detect();
 
     std::printf("bake: detected %s (%s)\n", tc.kind_name().c_str(), tc.cxx_path.c_str());
+
+    // Extract dep sources + include dirs from lockfile
+    std::vector<DepSourceEntry> dep_sources;
+    std::vector<Path> dep_include_dirs;
+    auto lockfile = Lockfile::load(*root / "bake.lock");
+    if (lockfile && !lockfile->empty()) {
+        extract_dep_info(*lockfile, get_cache_dir(), dep_sources, dep_include_dirs);
+    }
 
     // Apply option overrides
     auto options = manifest->options;
@@ -839,17 +947,21 @@ export int cmd_add(const ParsedArgs& args) {
         return 1;
     }
 
-    // Check for duplicate dependency name in [dependencies] section
+    // Check for duplicate dependency name by parsing the TOML properly.
+    // This handles both "name = { ... }" (compact) and "name = {url=...}" forms.
     {
-        std::string needle = name + " = ";
-        size_t dep_section = content->find("[dependencies]");
-        if (dep_section != std::string::npos) {
-            size_t search_from = dep_section;
-            size_t found = content->find(needle, search_from);
-            if (found != std::string::npos) {
-                std::fprintf(stderr, "bake: dependency '%s' already exists in bake.toml\n", name.c_str());
-                return 1;
+        try {
+            auto tbl = toml::parse_file(toml_path.string());
+            if (auto* deps = tbl["dependencies"].as_table()) {
+                if (deps->contains(name)) {
+                    std::fprintf(stderr,
+                        "bake: dependency '%s' already exists in bake.toml\n",
+                        name.c_str());
+                    return 1;
+                }
             }
+        } catch (...) {
+            // If TOML parsing fails, fall through — the write will still work
         }
     }
 
@@ -953,10 +1065,31 @@ export int cmd_update(const ParsedArgs& args) {
             return 1;
         }
     } else {
-        // Single-dep update: resolve only the specified dependency
+        // Single-dep update: resolve the dep AND its transitive closure,
+        // then prune old transitive nodes and merge new ones.
+        //
+        // If the old lock is missing or corrupt, we can't safely do a
+        // partial update (we'd lose other root deps). Fall back to full resolve.
+        if (!old_lock || !old_lock->is_consistent(*manifest)) {
+            std::printf("bake: lock missing or stale, doing full re-resolve\n");
+            auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
+            if (!new_lock) {
+                std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+                return 1;
+            }
+            if (!new_lock->save(lock_path)) {
+                std::fprintf(stderr, "bake: failed to write bake.lock\n");
+                return 1;
+            }
+            std::printf("bake: lock file updated\n");
+            return 0;
+        }
+
         auto& dep = manifest->dependencies[filter_dep];
-        auto node = resolver.resolve_dependency(dep);
-        if (!node) {
+
+        // Resolve dep + full transitive subtree
+        auto subtree = resolver.resolve_subtree(dep, filter_dep);
+        if (!subtree) {
             std::fprintf(stderr, "bake: failed to resolve '%s'\n", filter_dep.c_str());
             return 1;
         }
@@ -966,29 +1099,99 @@ export int cmd_update(const ParsedArgs& args) {
             auto old_it = old_lock->root_deps.find(filter_dep);
             if (old_it != old_lock->root_deps.end()) {
                 auto& old_node = old_lock->nodes[old_it->second];
-                if (old_node.commit != node->commit) {
+                auto& new_node = subtree->nodes[subtree->root_deps[filter_dep]];
+                if (old_node.commit != new_node.commit) {
                     std::printf("bake: %s updated: %s → %s\n",
                                 filter_dep.c_str(), old_node.commit.substr(0, 12).c_str(),
-                                node->commit.substr(0, 12).c_str());
+                                new_node.commit.substr(0, 12).c_str());
                 } else {
                     std::printf("bake: %s unchanged (%s)\n", filter_dep.c_str(),
-                                node->commit.substr(0, 12).c_str());
+                                new_node.commit.substr(0, 12).c_str());
                 }
             } else {
                 std::printf("bake: %s added\n", filter_dep.c_str());
             }
         }
 
-        // Merge into existing lock (or create new one)
+        // Build the merged lock:
+        // 1. Start with a fresh lockfile
+        // 2. Copy all old root_deps except the updated one
+        // 3. Copy all old nodes except those exclusively reachable from the old dep
+        // 4. Add all new nodes from the subtree
         Lockfile new_lock;
+
+        // Find the old node ID for the updated dep
+        std::string old_node_id;
         if (old_lock) {
-            // Preserve all existing entries
-            new_lock.root_deps = old_lock->root_deps;
-            new_lock.nodes = old_lock->nodes;
+            auto old_it = old_lock->root_deps.find(filter_dep);
+            if (old_it != old_lock->root_deps.end()) {
+                old_node_id = old_it->second;
+            }
         }
-        // Replace the updated dep's entry
-        new_lock.root_deps[filter_dep] = node->id;
-        new_lock.nodes[node->id] = *node;
+
+        // Compute set of nodes reachable from old_node_id (the old subtree)
+        std::set<std::string> old_subtree_nodes;
+        if (!old_node_id.empty() && old_lock) {
+            std::vector<std::string> queue = {old_node_id};
+            while (!queue.empty()) {
+                std::string nid = queue.back();
+                queue.pop_back();
+                if (old_subtree_nodes.count(nid)) continue;
+                old_subtree_nodes.insert(nid);
+                auto n_it = old_lock->nodes.find(nid);
+                if (n_it != old_lock->nodes.end()) {
+                    for (auto& child : n_it->second.dependencies) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+
+        // Compute set of nodes reachable from OTHER root deps (keep these)
+        std::set<std::string> keep_nodes;
+        if (old_lock) {
+            for (auto& [name, nid] : old_lock->root_deps) {
+                if (name == filter_dep) continue;
+                std::vector<std::string> queue = {nid};
+                while (!queue.empty()) {
+                    std::string id = queue.back();
+                    queue.pop_back();
+                    if (keep_nodes.count(id)) continue;
+                    keep_nodes.insert(id);
+                    auto n_it = old_lock->nodes.find(id);
+                    if (n_it != old_lock->nodes.end()) {
+                        for (auto& child : n_it->second.dependencies) {
+                            queue.push_back(child);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Copy old root_deps (except the updated dep)
+        if (old_lock) {
+            for (auto& [name, nid] : old_lock->root_deps) {
+                if (name == filter_dep) continue;
+                new_lock.root_deps[name] = nid;
+            }
+        }
+
+        // Copy old nodes that are NOT exclusively in the old subtree
+        if (old_lock) {
+            for (auto& [id, node] : old_lock->nodes) {
+                // Keep if not in old subtree, or if also reachable from other deps
+                if (old_subtree_nodes.count(id) && !keep_nodes.count(id)) {
+                    continue; // Prune stale transitive node
+                }
+                new_lock.nodes[id] = node;
+            }
+        }
+
+        // Add all new nodes from the subtree
+        for (auto& [id, node] : subtree->nodes) {
+            new_lock.nodes[id] = node;
+        }
+        new_lock.root_deps[filter_dep] = subtree->root_deps[filter_dep];
 
         if (!new_lock.save(lock_path)) {
             std::fprintf(stderr, "bake: failed to write bake.lock\n");

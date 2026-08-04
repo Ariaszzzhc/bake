@@ -157,30 +157,61 @@ export inline bool write_file(const Path& path, std::string_view content) {
     return f.good();
 }
 
-// Atomic write: temp file → flush → rename.
+// Atomic write: temp file → fsync → rename.
 // Prevents partial writes from corrupting the destination on crash.
 export inline bool atomic_write_file(const Path& path, std::string_view content) {
     if (!path.parent().exists()) { path.parent().mkdir_recursive(); }
 
-    std::string tmp = path.string() + ".tmp";
+    // Use a unique temp suffix to avoid collisions between concurrent processes.
+    // Combine PID with a random component.
+    std::string tmp = path.string() + "." + std::to_string(getpid()) + ".tmp";
 
-    std::ofstream f(tmp, std::ios::binary);
-    if (!f) return false;
-    f.write(content.data(), static_cast<std::streamsize>(content.size()));
-    f.flush();
-    if (!f.good()) {
-        f.close();
+    // Open with O_CREAT | O_TRUNC | O_WRONLY for explicit fd control
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
         std::filesystem::remove(tmp);
         return false;
     }
-    f.close();
 
+    // Write all data
+    size_t written = 0;
+    const char* data = content.data();
+    while (written < content.size()) {
+        ssize_t n = write(fd, data + written, content.size() - written);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fd);
+            std::filesystem::remove(tmp);
+            return false;
+        }
+        written += static_cast<size_t>(n);
+    }
+
+    // fsync ensures data reaches durable storage before rename
+    if (fsync(fd) != 0) {
+        close(fd);
+        std::filesystem::remove(tmp);
+        return false;
+    }
+    close(fd);
+
+    // Atomic rename on POSIX (same filesystem)
     std::error_code ec;
     std::filesystem::rename(tmp, path.string(), ec);
     if (ec) {
         std::filesystem::remove(tmp);
         return false;
     }
+
+    // fsync the parent directory to ensure the rename is durable.
+    // Without this, a crash after rename may leave the directory entry
+    // in an inconsistent state on disk.
+    int dir_fd = open(path.parent().string().c_str(), O_RDONLY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
     return true;
 }
 

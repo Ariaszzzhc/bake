@@ -276,7 +276,8 @@ export BuildPlan create_convention_plan(
         const Toolchain& tc,
         const std::map<std::string, BuildOption>& options,
         const std::vector<DepSourceEntry>& dep_sources = {},
-        const std::vector<Path>& dep_include_dirs = {}) {
+        const std::vector<Path>& dep_include_dirs = {},
+        bool compile_path_deps = true) {
 
     BuildPlan plan;
     plan.project_root = layout.root;
@@ -300,13 +301,30 @@ export BuildPlan create_convention_plan(
     if (layout.public_dir.is_directory()) {
         include_dirs.push_back(layout.public_dir);
     }
-    // Resolve path dependencies — add their public/ as include dirs
+    // Resolve path dependencies — add their public/ as include dirs AND
+    // collect their source files for compilation + linking.
+    // When compile_path_deps is false (workspace builds), only include dirs
+    // are added — the workspace build handles inter-member linking separately.
+    std::vector<DepSourceEntry> path_dep_sources;
     for (auto& [name, dep] : manifest.dependencies) {
         if (dep.is_path_dep) {
             Path dep_dir = manifest.project_dir / dep.path;
             Path dep_public = dep_dir / "public";
             if (dep_public.is_directory()) {
                 include_dirs.push_back(dep_public);
+            }
+            if (compile_path_deps) {
+                // Discover path dep's source files for compilation + linking
+                Path dep_src = dep_dir / "src";
+                if (dep_src.is_directory()) {
+                    auto pd = discover_sources(dep_src, dep_public);
+                    for (auto& cpp : pd.cpp_files) {
+                        path_dep_sources.push_back({"pathdep_" + name, cpp});
+                    }
+                    for (auto& c : pd.c_files) {
+                        path_dep_sources.push_back({"pathdep_" + name, c});
+                    }
+                }
             }
         }
     }
@@ -354,6 +372,12 @@ export BuildPlan create_convention_plan(
         action.id = "module:" + mod_name;
         action.description = "Compiling module " + mod_name;
         action.inputs = {src};
+        // Add imported BMI files as inputs so that when a dependency module
+        // changes, this module is rebuilt. Without this, the old BMI gets
+        // loaded alongside a new dependency BMI, crashing clang 22.
+        for (auto& [name, bmi] : cc.module_deps) {
+            action.inputs.push_back(bmi);
+        }
         action.outputs = {obj, bmi};
         action.command = make_compile_command(tc, cc);
 
@@ -424,10 +448,17 @@ export BuildPlan create_convention_plan(
         plan.actions.push_back(std::move(action));
     }
 
-    // Phase 2b: Compile sources from bake-native locked dependencies
-    for (auto& ds : dep_sources) {
-        // Unique object name to avoid collisions with project sources
-        std::string obj_name = "dep__" + ds.dep_name + "__" + ds.source.stem_string() + ".o";
+    // Phase 2b: Compile sources from bake-native locked dependencies + path deps
+    auto all_dep_sources = dep_sources;
+    for (auto& pds : path_dep_sources) {
+        all_dep_sources.push_back(pds);
+    }
+    for (auto& ds : all_dep_sources) {
+        // Unique object name: include dep name + hash of full source path
+        // to avoid collisions when two deps have files with the same stem.
+        std::string path_hash = SHA256::hex(ds.source.string()).substr(0, 8);
+        std::string obj_name = "dep__" + ds.dep_name + "__" +
+                               ds.source.stem_string() + "_" + path_hash + ".o";
         Path obj = plan.obj_dir / obj_name;
 
         CompileConfig cc;
@@ -456,7 +487,8 @@ export BuildPlan create_convention_plan(
     }
 
     // Phase 3: Link/Archive
-    if (!all_sources.empty() || !mod_graph.sorted.empty() || !dep_sources.empty()) {
+    if (!all_sources.empty() || !mod_graph.sorted.empty() ||
+        !all_dep_sources.empty()) {
         std::vector<Path> obj_files;
         for (auto& a : plan.actions) {
             if (a.is_compile() && !a.outputs.empty()) {

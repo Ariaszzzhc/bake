@@ -354,7 +354,8 @@ export struct Lockfile {
 
     // Check if lockfile is consistent with manifest dependencies.
     // A consistent lock has every non-path manifest dep pinned with a
-    // commit and both hashes populated.
+    // commit and both hashes populated, AND every node's dependency edges
+    // reference nodes that exist in the lock (transitive completeness).
     bool is_consistent(const Manifest& manifest) const {
         for (auto& [name, dep] : manifest.dependencies) {
             // Path deps are not tracked in the lockfile — skip entirely.
@@ -377,6 +378,14 @@ export struct Lockfile {
             if (node.transport_sha256.empty()) return false;
             if (node.tree_sha256.empty()) return false;
         }
+
+        // Transitive completeness: every node's child reference must exist.
+        for (auto& [id, node] : nodes) {
+            for (auto& child_id : node.dependencies) {
+                if (nodes.find(child_id) == nodes.end()) return false;
+            }
+        }
+
         return true;
     }
 
