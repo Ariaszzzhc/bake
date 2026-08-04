@@ -33,6 +33,7 @@ target_sources(libbake
             libbake/src/bake.project.cppm
             libbake/src/bake.compiler.cppm
             libbake/src/bake.engine.cppm
+            libbake/src/bake.package.cppm
             libbake/src/bake.cli.cppm
 )
 

@@ -8,6 +8,7 @@ module;
 #include <filesystem>
 #include <fstream>
 #include <variant>
+#include <cstdlib>
 
 #include <toml.hpp>
 
@@ -229,6 +230,134 @@ export std::optional<Path> find_project_root(const Path& start = Path::current()
         dir = parent;
     }
     return std::nullopt;
+}
+
+// ===== Lockfile =====
+
+export struct LockNode {
+    std::string id;                         // e.g., "fmt-10.2.1"
+    std::string url;
+    std::string tag;
+    std::string commit;
+    std::string transport_sha256;
+    std::string tree_sha256;
+    bool native = false;                    // has bake.toml
+    std::vector<std::string> dependencies;  // child node IDs
+};
+
+export struct Lockfile {
+    std::map<std::string, std::string> root_deps;   // dep_name → node_id
+    std::map<std::string, LockNode> nodes;           // node_id → node
+    Path lock_path;
+
+    static std::optional<Lockfile> load(const Path& path) {
+        if (!path.is_regular_file()) return std::nullopt;
+
+        Lockfile lf;
+        lf.lock_path = path;
+
+        toml::table tbl;
+        try {
+            tbl = toml::parse_file(path.string());
+        } catch (...) {
+            return std::nullopt;
+        }
+
+        // [root_deps]
+        if (auto* roots = tbl["root_deps"].as_table()) {
+            for (auto& [key, val] : *roots) {
+                if (auto v = val.value<std::string>()) {
+                    lf.root_deps[std::string(key.str())] = *v;
+                }
+            }
+        }
+
+        // [nodes.<id>]
+        if (auto* nodes = tbl["nodes"].as_table()) {
+            for (auto& [key, val] : *nodes) {
+                if (auto* node_tbl = val.as_table()) {
+                    LockNode node;
+                    node.id = std::string(key.str());
+                    node.url     = (*node_tbl)["url"].value_or("");
+                    node.tag     = (*node_tbl)["tag"].value_or("");
+                    node.commit  = (*node_tbl)["commit"].value_or("");
+                    node.transport_sha256 = (*node_tbl)["transport_sha256"].value_or("");
+                    node.tree_sha256      = (*node_tbl)["tree_sha256"].value_or("");
+                    node.native  = (*node_tbl)["native"].value_or(false);
+
+                    if (auto* deps = (*node_tbl)["dependencies"].as_array()) {
+                        for (auto& d : *deps) {
+                            if (auto s = d.value<std::string>()) {
+                                node.dependencies.push_back(*s);
+                            }
+                        }
+                    }
+                    lf.nodes[node.id] = std::move(node);
+                }
+            }
+        }
+
+        return lf;
+    }
+
+    bool save(const Path& path) const {
+        std::string content = "# AUTO-GENERATED. Do not edit.\n\n";
+
+        // [root_deps]
+        content += "[root_deps]\n";
+        for (auto& [name, node_id] : root_deps) {
+            content += name + " = \"" + node_id + "\"\n";
+        }
+        content += "\n";
+
+        // [nodes.<id>]
+        for (auto& [id, node] : nodes) {
+            content += "[nodes.\"" + id + "\"]\n";
+            content += "url              = \"" + node.url + "\"\n";
+            content += "tag              = \"" + node.tag + "\"\n";
+            content += "commit           = \"" + node.commit + "\"\n";
+            content += "transport_sha256 = \"" + node.transport_sha256 + "\"\n";
+            content += "tree_sha256      = \"" + node.tree_sha256 + "\"\n";
+            content += "native           = " + std::string(node.native ? "true" : "false") + "\n";
+
+            content += "dependencies     = [";
+            for (size_t i = 0; i < node.dependencies.size(); ++i) {
+                if (i > 0) content += ", ";
+                content += "\"" + node.dependencies[i] + "\"";
+            }
+            content += "]\n\n";
+        }
+
+        return write_file(path, content);
+    }
+
+    // Check if lockfile is consistent with manifest dependencies
+    bool is_consistent(const Manifest& manifest) const {
+        // Every manifest dependency must have a root_dep entry
+        for (auto& [name, dep] : manifest.dependencies) {
+            auto it = root_deps.find(name);
+            if (it == root_deps.end()) return false;
+
+            // Node must exist
+            if (nodes.find(it->second) == nodes.end()) return false;
+
+            // URL and tag must match
+            auto& node = nodes.at(it->second);
+            if (dep.is_path_dep) continue;  // path deps don't need lock
+            if (node.url != dep.url) return false;
+            if (node.tag != dep.tag) return false;
+        }
+        return true;
+    }
+
+    bool empty() const { return root_deps.empty(); }
+};
+
+// Get the global source cache directory
+export Path get_cache_dir() {
+    const char* home = std::getenv("HOME");
+    if (!home) home = "/tmp";
+    return Path(home) / ".cache" / "bake" / "src";
 }
 
 } // namespace bake

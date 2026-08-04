@@ -13,6 +13,7 @@ import bake.util;
 import bake.project;
 import bake.compiler;
 import bake.engine;
+import bake.package;
 
 // ============================================================
 // bake.cli — multicall dispatch, argument parsing, commands
@@ -69,8 +70,14 @@ export struct ParsedArgs {
 export ParsedArgs parse_args(int argc, char* argv[]) {
     ParsedArgs args;
 
+    // Options that consume the next argument as a value
+    auto takes_value = [](std::string_view opt) {
+        return opt == "--tag" || opt == "--type" || opt == "--std" ||
+               opt == "--target" || opt == "--glibc-version" ||
+               opt == "--option" || opt == "-j" || opt == "-p";
+    };
+
     int i = 1;
-    // First positional or --help/--version is the command
     while (i < argc) {
         std::string arg = argv[i];
 
@@ -78,8 +85,16 @@ export ParsedArgs parse_args(int argc, char* argv[]) {
             args.help = true;
         } else if (arg == "--version" || arg == "-V") {
             args.version = true;
-        } else if (starts_with(arg, "--")) {
-            args.options.push_back(arg);
+        } else if (starts_with(arg, "--") || (arg.size() > 1 && arg[0] == '-' && arg[1] != '\0')) {
+            // It's an option
+            if (contains(arg, "=")) {
+                args.options.push_back(arg);
+            } else if (takes_value(arg) && i + 1 < argc) {
+                args.options.push_back(arg + "=" + argv[i + 1]);
+                ++i;
+            } else {
+                args.options.push_back(arg);
+            }
         } else if (args.command.empty()) {
             args.command = arg;
         } else {
@@ -432,6 +447,46 @@ export int cmd_build(const ParsedArgs& args) {
         return 1;
     }
 
+    // ===== Lock resolution =====
+    bool offline = args.has_option("offline") || args.has_option("frozen");
+    bool locked = args.has_option("locked") || args.has_option("frozen");
+
+    if (!manifest->dependencies.empty()) {
+        Path lock_path = *root / "bake.lock";
+        auto lockfile = Lockfile::load(lock_path);
+
+        bool needs_resolve = false;
+        if (!lockfile) {
+            needs_resolve = true;
+        } else if (!lockfile->is_consistent(*manifest)) {
+            needs_resolve = true;
+        }
+
+        if (needs_resolve) {
+            if (locked) {
+                std::fprintf(stderr, "bake: lock file missing or stale (--locked)\n");
+                return 1;
+            }
+            if (offline) {
+                std::fprintf(stderr, "bake: cannot resolve dependencies in offline mode\n");
+                return 1;
+            }
+            // Resolve dependencies
+            Resolver resolver;
+            auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
+            if (!new_lock) {
+                std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+                return 1;
+            }
+            if (!new_lock->save(lock_path)) {
+                std::fprintf(stderr, "bake: failed to write bake.lock\n");
+                return 1;
+            }
+            std::printf("bake: dependencies resolved and locked\n");
+        }
+    }
+    // ===== End lock resolution =====
+
     // Handle workspace: build all members
     if (manifest->is_workspace()) {
         int result = 0;
@@ -628,17 +683,146 @@ export int cmd_run(const ParsedArgs& args) {
     return result.exit_code;
 }
 
-// ===== Stub commands (Phase 3+) =====
+// ===== add command =====
 
 export int cmd_add(const ParsedArgs& args) {
-    std::fprintf(stderr, "bake: add not yet implemented (Phase 3)\n");
-    return 1;
+    auto root = find_project_root();
+    if (!root) {
+        std::fprintf(stderr, "bake: no bake.toml found\n");
+        return 1;
+    }
+
+    if (args.positional.empty()) {
+        std::fprintf(stderr, "bake: add requires a URL\n");
+        std::fprintf(stderr, "Usage: bake add <url> --tag <tag> [name]\n");
+        return 1;
+    }
+
+    std::string url = args.positional[0];
+    std::string tag = args.get_option("tag").value_or("");
+    std::string name;
+
+    // Derive name from URL or use second positional
+    if (args.positional.size() >= 2) {
+        name = args.positional[1];
+    } else {
+        // Extract repo name from URL
+        // e.g., https://github.com/fmtlib/fmt → fmt
+        size_t last_slash = url.find_last_of('/');
+        if (last_slash != std::string::npos) {
+            name = url.substr(last_slash + 1);
+            // Remove .git suffix
+            if (ends_with(name, ".git")) {
+                name = name.substr(0, name.size() - 4);
+            }
+        } else {
+            name = "dep";
+        }
+    }
+
+    if (tag.empty()) {
+        std::fprintf(stderr, "bake: add requires --tag <tag>\n");
+        return 1;
+    }
+
+    // Read current bake.toml
+    Path toml_path = *root / "bake.toml";
+    auto content = read_file(toml_path);
+    if (!content) {
+        std::fprintf(stderr, "bake: cannot read bake.toml\n");
+        return 1;
+    }
+
+    // Append dependency to [dependencies] section
+    std::string dep_line = name + " = { url = \"" + url + "\", tag = \"" + tag + "\" }\n";
+
+    // Check if [dependencies] section exists
+    if (contains(*content, "[dependencies]")) {
+        // Insert after the [dependencies] line
+        size_t pos = content->find("[dependencies]");
+        pos = content->find('\n', pos);
+        if (pos == std::string::npos) pos = content->size();
+        content->insert(pos + 1, dep_line);
+    } else {
+        // Add new [dependencies] section at end
+        if (!content->empty() && content->back() != '\n') *content += "\n";
+        *content += "\n[dependencies]\n" + dep_line;
+    }
+
+    if (!write_file(toml_path, *content)) {
+        std::fprintf(stderr, "bake: failed to write bake.toml\n");
+        return 1;
+    }
+
+    std::printf("Added dependency '%s' = { url = \"%s\", tag = \"%s\" }\n",
+                name.c_str(), url.c_str(), tag.c_str());
+    std::printf("Run 'bake build' to resolve and download.\n");
+    return 0;
 }
 
+// ===== update command =====
+
 export int cmd_update(const ParsedArgs& args) {
-    std::fprintf(stderr, "bake: update not yet implemented (Phase 3)\n");
-    return 1;
+    auto root = find_project_root();
+    if (!root) {
+        std::fprintf(stderr, "bake: no bake.toml found\n");
+        return 1;
+    }
+
+    auto manifest = Manifest::load(*root);
+    if (!manifest) {
+        std::fprintf(stderr, "bake: failed to load bake.toml\n");
+        return 1;
+    }
+
+    if (manifest->dependencies.empty()) {
+        std::printf("bake: no dependencies to update\n");
+        return 0;
+    }
+
+    Path lock_path = *root / "bake.lock";
+
+    // Load existing lock for comparison
+    auto old_lock = Lockfile::load(lock_path);
+
+    // Re-resolve
+    Resolver resolver;
+    auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
+
+    if (!new_lock) {
+        std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+        return 1;
+    }
+
+    // Compare with old lock
+    if (old_lock) {
+        for (auto& [name, node_id] : new_lock->root_deps) {
+            auto old_it = old_lock->root_deps.find(name);
+            if (old_it != old_lock->root_deps.end()) {
+                auto& old_node = old_lock->nodes[old_it->second];
+                auto& new_node = new_lock->nodes[node_id];
+                if (old_node.commit != new_node.commit) {
+                    std::printf("bake: %s updated: %s → %s\n",
+                                name.c_str(), old_node.commit.substr(0, 12).c_str(),
+                                new_node.commit.substr(0, 12).c_str());
+                }
+            } else {
+                std::printf("bake: %s added\n", name.c_str());
+            }
+        }
+    }
+
+    // Write lock file
+    if (!new_lock->save(lock_path)) {
+        std::fprintf(stderr, "bake: failed to write bake.lock\n");
+        return 1;
+    }
+
+    std::printf("bake: lock file updated\n");
+    return 0;
 }
+
+// ===== Stub commands =====
 
 export int cmd_test(const ParsedArgs& args) {
     std::fprintf(stderr, "bake: test not yet implemented (Phase 7)\n");
