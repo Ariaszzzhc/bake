@@ -9,6 +9,7 @@ module;
 #include <filesystem>
 #include <thread>
 #include <mutex>
+#include <mutex>
 #include <atomic>
 #include <cstdio>
 
@@ -352,13 +353,28 @@ export BuildPlan create_convention_plan(
         cc.include_dirs = include_dirs;
         cc.use_pic = (pkg.type == PackageType::SharedLib);
 
-        // Check if this file imports modules
+        // Collect transitive module dependencies for this consumer
         auto consumer_it = mod_graph.consumers.find(src.string());
         if (consumer_it != mod_graph.consumers.end()) {
-            for (auto& imp : consumer_it->second.imports) {
-                auto bmi_it = module_bmi.find(imp);
+            std::set<std::string> visited;
+            std::vector<std::string> queue(consumer_it->second.imports.begin(),
+                                            consumer_it->second.imports.end());
+            while (!queue.empty()) {
+                std::string mod = queue.back();
+                queue.pop_back();
+                if (visited.count(mod)) continue;
+                visited.insert(mod);
+
+                auto bmi_it = module_bmi.find(mod);
                 if (bmi_it != module_bmi.end()) {
-                    cc.module_deps.push_back({imp, bmi_it->second});
+                    cc.module_deps.push_back({mod, bmi_it->second});
+                }
+                // Add transitive deps from this module
+                auto mod_it = mod_graph.modules.find(mod);
+                if (mod_it != mod_graph.modules.end()) {
+                    for (auto& imp : mod_it->second.imports) {
+                        if (!visited.count(imp)) queue.push_back(imp);
+                    }
                 }
             }
         }

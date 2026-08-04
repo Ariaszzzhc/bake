@@ -197,8 +197,8 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
         }
     }
 
-    // Module dependencies (BMI references for consumers)
-    if (!cc.is_module_interface && !cc.module_deps.empty()) {
+    // Module dependencies (BMI references for consumers AND interfaces)
+    if (!cc.module_deps.empty()) {
         for (auto& [mod_name, bmi_path] : cc.module_deps) {
             if (tc.is_clang()) {
                 cmd.push_back("-fmodule-file=" + mod_name + "=" + bmi_path.string());
