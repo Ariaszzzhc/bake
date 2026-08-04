@@ -90,9 +90,14 @@ export ParsedArgs parse_args(int argc, char* argv[]) {
             // It's an option
             if (contains(arg, "=")) {
                 args.options.push_back(arg);
-            } else if (takes_value(arg) && i + 1 < argc) {
-                args.options.push_back(arg + "=" + argv[i + 1]);
-                ++i;
+            } else if (takes_value(arg)) {
+                if (i + 1 < argc) {
+                    args.options.push_back(arg + "=" + argv[i + 1]);
+                    ++i;
+                } else {
+                    // Missing value — push as empty to trigger validation errors
+                    args.options.push_back(std::string(arg) + "=");
+                }
             } else {
                 args.options.push_back(arg);
             }
@@ -836,6 +841,20 @@ export int cmd_add(const ParsedArgs& args) {
         return 1;
     }
 
+    // Check for duplicate dependency name in [dependencies] section
+    {
+        std::string needle = name + " = ";
+        size_t dep_section = content->find("[dependencies]");
+        if (dep_section != std::string::npos) {
+            size_t search_from = dep_section;
+            size_t found = content->find(needle, search_from);
+            if (found != std::string::npos) {
+                std::fprintf(stderr, "bake: dependency '%s' already exists in bake.toml\n", name.c_str());
+                return 1;
+            }
+        }
+    }
+
     // Append dependency to [dependencies] section
     std::string dep_line = name + " = { url = \"" + url + "\", tag = \"" + tag + "\" }\n";
 
@@ -883,42 +902,100 @@ export int cmd_update(const ParsedArgs& args) {
         return 0;
     }
 
-    Path lock_path = *root / "bake.lock";
-
-    // Load existing lock for comparison
-    auto old_lock = Lockfile::load(lock_path);
-
-    // Re-resolve
-    Resolver resolver;
-    auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
-
-    if (!new_lock) {
-        std::fprintf(stderr, "bake: failed to resolve dependencies\n");
-        return 1;
-    }
-
-    // Compare with old lock
-    if (old_lock) {
-        for (auto& [name, node_id] : new_lock->root_deps) {
-            auto old_it = old_lock->root_deps.find(name);
-            if (old_it != old_lock->root_deps.end()) {
-                auto& old_node = old_lock->nodes[old_it->second];
-                auto& new_node = new_lock->nodes[node_id];
-                if (old_node.commit != new_node.commit) {
-                    std::printf("bake: %s updated: %s → %s\n",
-                                name.c_str(), old_node.commit.substr(0, 12).c_str(),
-                                new_node.commit.substr(0, 12).c_str());
-                }
-            } else {
-                std::printf("bake: %s added\n", name.c_str());
-            }
+    // Determine which dep to update (empty = all)
+    std::string filter_dep;
+    if (!args.positional.empty()) {
+        filter_dep = args.positional[0];
+        if (manifest->dependencies.find(filter_dep) == manifest->dependencies.end()) {
+            std::fprintf(stderr, "bake: dependency '%s' not found in bake.toml\n", filter_dep.c_str());
+            return 1;
+        }
+        auto& dep = manifest->dependencies[filter_dep];
+        if (dep.is_path_dep) {
+            std::fprintf(stderr, "bake: '%s' is a path dependency (no resolution needed)\n", filter_dep.c_str());
+            return 1;
         }
     }
 
-    // Write lock file
-    if (!new_lock->save(lock_path)) {
-        std::fprintf(stderr, "bake: failed to write bake.lock\n");
-        return 1;
+    Path lock_path = *root / "bake.lock";
+
+    // Load existing lock for comparison / preservation
+    auto old_lock = Lockfile::load(lock_path);
+
+    Resolver resolver;
+
+    if (filter_dep.empty()) {
+        // Full re-resolve (existing behavior)
+        auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
+        if (!new_lock) {
+            std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+            return 1;
+        }
+
+        // Report changes
+        if (old_lock) {
+            for (auto& [name, node_id] : new_lock->root_deps) {
+                auto old_it = old_lock->root_deps.find(name);
+                if (old_it != old_lock->root_deps.end()) {
+                    auto& old_node = old_lock->nodes[old_it->second];
+                    auto& new_node = new_lock->nodes[node_id];
+                    if (old_node.commit != new_node.commit) {
+                        std::printf("bake: %s updated: %s → %s\n",
+                                    name.c_str(), old_node.commit.substr(0, 12).c_str(),
+                                    new_node.commit.substr(0, 12).c_str());
+                    }
+                } else {
+                    std::printf("bake: %s added\n", name.c_str());
+                }
+            }
+        }
+
+        if (!new_lock->save(lock_path)) {
+            std::fprintf(stderr, "bake: failed to write bake.lock\n");
+            return 1;
+        }
+    } else {
+        // Single-dep update: resolve only the specified dependency
+        auto& dep = manifest->dependencies[filter_dep];
+        auto node = resolver.resolve_dependency(dep);
+        if (!node) {
+            std::fprintf(stderr, "bake: failed to resolve '%s'\n", filter_dep.c_str());
+            return 1;
+        }
+
+        // Report change
+        if (old_lock) {
+            auto old_it = old_lock->root_deps.find(filter_dep);
+            if (old_it != old_lock->root_deps.end()) {
+                auto& old_node = old_lock->nodes[old_it->second];
+                if (old_node.commit != node->commit) {
+                    std::printf("bake: %s updated: %s → %s\n",
+                                filter_dep.c_str(), old_node.commit.substr(0, 12).c_str(),
+                                node->commit.substr(0, 12).c_str());
+                } else {
+                    std::printf("bake: %s unchanged (%s)\n", filter_dep.c_str(),
+                                node->commit.substr(0, 12).c_str());
+                }
+            } else {
+                std::printf("bake: %s added\n", filter_dep.c_str());
+            }
+        }
+
+        // Merge into existing lock (or create new one)
+        Lockfile new_lock;
+        if (old_lock) {
+            // Preserve all existing entries
+            new_lock.root_deps = old_lock->root_deps;
+            new_lock.nodes = old_lock->nodes;
+        }
+        // Replace the updated dep's entry
+        new_lock.root_deps[filter_dep] = node->id;
+        new_lock.nodes[node->id] = *node;
+
+        if (!new_lock.save(lock_path)) {
+            std::fprintf(stderr, "bake: failed to write bake.lock\n");
+            return 1;
+        }
     }
 
     std::printf("bake: lock file updated\n");
