@@ -56,3 +56,31 @@ target_compile_features(libbake PRIVATE cxx_std_23)
 
 add_executable(bake bake/src/main.cpp)
 target_link_libraries(bake PRIVATE libbake)
+set_target_properties(bake PROPERTIES
+    BUILD_RPATH "${CMAKE_BINARY_DIR}"
+    INSTALL_RPATH "$ORIGIN/../lib"
+)
+
+# ---- Tests ----
+
+enable_testing()
+
+# Helper: bake binary path with correct library path
+set(BAKE_TEST_ENV "DYLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}")
+
+function(bake_sh_test name)
+    add_test(
+        NAME ${name}
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/${name}.sh ${CMAKE_BINARY_DIR}/bake
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    )
+    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BAKE_TEST_ENV}")
+endfunction()
+
+# Offline tests (no network needed)
+bake_sh_test(test_lock_consistency)
+bake_sh_test(test_add_duplicate)
+bake_sh_test(test_add_no_tag)
+bake_sh_test(test_path_dep_locked)
+bake_sh_test(test_frozen_no_lock)
+bake_sh_test(test_atomic_write)
