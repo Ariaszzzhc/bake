@@ -65,22 +65,15 @@ set_target_properties(bake PROPERTIES
 
 enable_testing()
 
-# Helper: bake binary path with correct library path
-set(BAKE_TEST_ENV "DYLD_LIBRARY_PATH=${CMAKE_BINARY_DIR}")
+# C++ test runner — spawns the bake binary on real project fixtures.
+add_executable(test_runner tests/test_runner.cpp)
+target_compile_features(test_runner PRIVATE cxx_std_17)
+target_compile_definitions(test_runner PRIVATE
+    BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
+)
 
-function(bake_sh_test name)
-    add_test(
-        NAME ${name}
-        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/${name}.sh ${CMAKE_BINARY_DIR}/bake
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    )
-    set_tests_properties(${name} PROPERTIES ENVIRONMENT "${BAKE_TEST_ENV}")
-endfunction()
-
-# Offline tests (no network needed)
-bake_sh_test(test_lock_consistency)
-bake_sh_test(test_add_duplicate)
-bake_sh_test(test_add_no_tag)
-bake_sh_test(test_path_dep_locked)
-bake_sh_test(test_frozen_no_lock)
-bake_sh_test(test_atomic_write)
+add_test(
+    NAME bake_test_suite
+    COMMAND test_runner $<TARGET_FILE:bake>
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
