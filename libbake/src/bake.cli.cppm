@@ -6,6 +6,7 @@ module;
 #include <optional>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 
 export module bake.cli;
 
@@ -487,9 +488,23 @@ export int cmd_build(const ParsedArgs& args) {
     }
     // ===== End lock resolution =====
 
-    // Handle workspace: build all members
+    // Handle workspace: build all members with inter-member deps
     if (manifest->is_workspace()) {
         int result = 0;
+        int jobs = 0;
+        if (auto j = args.get_option("j")) {
+            jobs = std::atoi(j->c_str());
+        }
+
+        // Track built members for inter-member dependency resolution
+        struct BuiltMember {
+            std::string name;
+            Path bmi_dir;
+            Path lib_path;
+            std::vector<std::string> module_names;
+        };
+        std::vector<BuiltMember> built;
+
         for (auto& member : manifest->workspace->members) {
             Path member_dir = *root / member;
             auto member_manifest = Manifest::load(member_dir);
@@ -507,34 +522,58 @@ export int cmd_build(const ParsedArgs& args) {
             auto layout = Layout::detect(member_dir);
             auto tc = Toolchain::detect();
 
-            // Apply option overrides
-            auto options = member_manifest->options;
-            for (auto& opt : args.options) {
-                if (starts_with(opt, "--option=") || opt == "--option") {
-                    // Parse --option name=value or --option=name=value
-                    std::string val = starts_with(opt, "--option=") ? opt.substr(9) : "";
-                    if (val.empty()) continue;
-                    size_t eq = val.find('=');
-                    std::string name = (eq == std::string::npos) ? val : val.substr(0, eq);
-                    std::string value = (eq == std::string::npos) ? "" : val.substr(eq + 1);
-                    if (!value.empty()) {
-                        options[name] = BuildOption::from_string(value);
-                    } else {
-                        options[name] = BuildOption::from_bool(true);
+            auto plan = create_convention_plan(*member_manifest, layout, tc,
+                                                member_manifest->options);
+
+            // Inject external modules from built dependencies
+            for (auto& action : plan.actions) {
+                if (action.type != BuildAction::Type::Compile &&
+                    action.type != BuildAction::Type::CompileModule) continue;
+
+                for (auto& bm : built) {
+                    if (!bm.bmi_dir.is_directory()) continue;
+                    for (auto& mod_name : bm.module_names) {
+                        Path bmi = bm.bmi_dir / (mod_name + ".pcm");
+                        if (bmi.is_regular_file()) {
+                            action.command.push_back("-fmodule-file=" + mod_name + "=" + bmi.string());
+                        }
                     }
                 }
             }
 
-            auto plan = create_convention_plan(*member_manifest, layout, tc, options);
+            // Inject library links from built dependencies
+            for (auto& action : plan.actions) {
+                if (action.type != BuildAction::Type::Link) continue;
 
-            // Get job count
-            int jobs = 0;
-            if (auto j = args.get_option("j")) {
-                jobs = std::atoi(j->c_str());
+                for (auto& bm : built) {
+                    if (bm.lib_path.string().empty()) continue;
+                    Path lib_dir = bm.lib_path.parent();
+                    action.command.insert(action.command.end() - 2,
+                        {"-L" + lib_dir.string(), "-l" + bm.name});
+                    // Add rpath for runtime
+                    action.command.insert(action.command.end() - 2,
+                        "-Wl,-rpath," + lib_dir.string());
+                }
             }
 
             int r = execute_plan(plan, jobs);
-            if (r != 0) result = r;
+            if (r != 0) { result = r; break; }
+
+            // Record this member for dependents
+            BuiltMember bm;
+            bm.name = member_manifest->package->name;
+            bm.bmi_dir = layout.build_dir / "bmi";
+            bm.lib_path = plan.primary_output;
+
+            // Collect module names from BMI directory
+            if (bm.bmi_dir.is_directory()) {
+                for (auto& entry : std::filesystem::directory_iterator(bm.bmi_dir.fs())) {
+                    if (entry.path().extension() == ".pcm") {
+                        bm.module_names.push_back(entry.path().stem().string());
+                    }
+                }
+            }
+            built.push_back(std::move(bm));
         }
         return result;
     }

@@ -1,0 +1,4 @@
+[package]
+name = "nlohmann_json"
+version = "3.11.3"
+type = "static-lib"

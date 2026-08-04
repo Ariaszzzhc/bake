@@ -292,6 +292,16 @@ export BuildPlan create_convention_plan(
     if (layout.public_dir.is_directory()) {
         include_dirs.push_back(layout.public_dir);
     }
+    // Resolve path dependencies — add their public/ as include dirs
+    for (auto& [name, dep] : manifest.dependencies) {
+        if (dep.is_path_dep) {
+            Path dep_dir = manifest.project_dir / dep.path;
+            Path dep_public = dep_dir / "public";
+            if (dep_public.is_directory()) {
+                include_dirs.push_back(dep_public);
+            }
+        }
+    }
 
     // Build module graph
     ModuleGraph mod_graph;
