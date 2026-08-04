@@ -425,6 +425,95 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     return execute_plan(plan, jobs);
 }
 
+// ===== Lock enforcement =====
+
+// Check and resolve the lockfile. Returns 0 if the lock is consistent
+// or was successfully (re)resolved. Returns non-zero on failure.
+// On success, root/bake.lock is guaranteed to exist and be consistent.
+export int enforce_lock(const Path& root, const Manifest& manifest, const ParsedArgs& args) {
+    if (Lockfile::has_only_path_deps(manifest)) return 0;
+
+    bool offline = args.has_option("offline") || args.has_option("frozen");
+    bool locked = args.has_option("locked") || args.has_option("frozen");
+
+    Path lock_path = root / "bake.lock";
+    auto lockfile = Lockfile::load(lock_path);
+
+    bool needs_resolve = false;
+    if (!lockfile) {
+        needs_resolve = true;
+    } else if (!lockfile->is_consistent(manifest)) {
+        needs_resolve = true;
+    }
+
+    if (!needs_resolve) return 0;
+
+    if (locked) {
+        std::fprintf(stderr, "bake: lock file missing or stale (--locked)\n");
+        return 1;
+    }
+    if (offline) {
+        std::fprintf(stderr, "bake: cannot resolve dependencies in offline mode\n");
+        return 1;
+    }
+
+    Resolver resolver;
+    auto new_lock = resolver.resolve(manifest, ResolverConfig{});
+    if (!new_lock) {
+        std::fprintf(stderr, "bake: failed to resolve dependencies\n");
+        return 1;
+    }
+    if (!new_lock->save(lock_path)) {
+        std::fprintf(stderr, "bake: failed to write bake.lock\n");
+        return 1;
+    }
+    std::printf("bake: dependencies resolved and locked\n");
+    return 0;
+}
+
+// ===== Dep source extraction (bridges bake.package types to bake.engine types) =====
+
+// Extract bake-native dep sources and include dirs from a lockfile.
+// CMake deps (native=false) are skipped — Phase 4 territory.
+static void extract_dep_info(
+        const Lockfile& lockfile,
+        const Path& cache_dir,
+        std::vector<DepSourceEntry>& dep_sources,
+        std::vector<Path>& dep_include_dirs) {
+    for (auto& [name, node_id] : lockfile.root_deps) {
+        auto node_it = lockfile.nodes.find(node_id);
+        if (node_it == lockfile.nodes.end()) continue;
+        const auto& node = node_it->second;
+        if (!node.native) continue;
+        if (node.tree_sha256.empty()) continue;
+
+        Path dep_cache = cache_dir / node.tree_sha256;
+        if (!dep_cache.is_directory()) {
+            std::fprintf(stderr, "bake: cached source for '%s' not found at %s\n",
+                         name.c_str(), dep_cache.string().c_str());
+            continue;
+        }
+
+        // Add dep's public/ to include dirs
+        Path dep_public = dep_cache / "public";
+        if (dep_public.is_directory()) {
+            dep_include_dirs.push_back(dep_public);
+        }
+
+        // Discover dep's source files (.cpp, .c only — no modules in Phase 3)
+        Path dep_src = dep_cache / "src";
+        if (dep_src.is_directory()) {
+            auto dep_disc = discover_sources(dep_src, dep_public);
+            for (auto& cpp : dep_disc.cpp_files) {
+                dep_sources.push_back({name, cpp});
+            }
+            for (auto& c : dep_disc.c_files) {
+                dep_sources.push_back({name, c});
+            }
+        }
+    }
+}
+
 // ===== build command =====
 
 export int cmd_build(const ParsedArgs& args) {
@@ -435,58 +524,31 @@ export int cmd_build(const ParsedArgs& args) {
         return 1;
     }
 
-    // Check for build.cpp (escape hatch mode)
-    Path build_cpp = *root / "build.cpp";
-    if (build_cpp.is_regular_file()) {
-        return build_with_build_cpp(*root, args);
-    }
-
-    // Load manifest
+    // Load manifest (needed for lock enforcement before build.cpp dispatch)
     auto manifest = Manifest::load(*root);
     if (!manifest) {
         std::fprintf(stderr, "bake: failed to load bake.toml\n");
         return 1;
     }
 
-    // ===== Lock resolution =====
-    bool offline = args.has_option("offline") || args.has_option("frozen");
-    bool locked = args.has_option("locked") || args.has_option("frozen");
+    // ===== Lock enforcement (before build.cpp so --locked/--frozen work universally)
+    if (int rc = enforce_lock(*root, *manifest, args); rc != 0) return rc;
 
-    if (!manifest->dependencies.empty()) {
-        Path lock_path = *root / "bake.lock";
-        auto lockfile = Lockfile::load(lock_path);
+    // Load the final lockfile (may have been just written by enforce_lock)
+    auto lockfile = Lockfile::load(*root / "bake.lock");
 
-        bool needs_resolve = false;
-        if (!lockfile) {
-            needs_resolve = true;
-        } else if (!lockfile->is_consistent(*manifest)) {
-            needs_resolve = true;
-        }
-
-        if (needs_resolve) {
-            if (locked) {
-                std::fprintf(stderr, "bake: lock file missing or stale (--locked)\n");
-                return 1;
-            }
-            if (offline) {
-                std::fprintf(stderr, "bake: cannot resolve dependencies in offline mode\n");
-                return 1;
-            }
-            // Resolve dependencies
-            Resolver resolver;
-            auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
-            if (!new_lock) {
-                std::fprintf(stderr, "bake: failed to resolve dependencies\n");
-                return 1;
-            }
-            if (!new_lock->save(lock_path)) {
-                std::fprintf(stderr, "bake: failed to write bake.lock\n");
-                return 1;
-            }
-            std::printf("bake: dependencies resolved and locked\n");
-        }
+    // Extract bake-native dep sources + include dirs for the build engine
+    std::vector<DepSourceEntry> dep_sources;
+    std::vector<Path> dep_include_dirs;
+    if (lockfile && !lockfile->empty()) {
+        extract_dep_info(*lockfile, get_cache_dir(), dep_sources, dep_include_dirs);
     }
-    // ===== End lock resolution =====
+
+    // Check for build.cpp (escape hatch mode)
+    Path build_cpp = *root / "build.cpp";
+    if (build_cpp.is_regular_file()) {
+        return build_with_build_cpp(*root, args);
+    }
 
     // Handle workspace: build all members with inter-member deps
     if (manifest->is_workspace()) {
@@ -523,7 +585,8 @@ export int cmd_build(const ParsedArgs& args) {
             auto tc = Toolchain::detect();
 
             auto plan = create_convention_plan(*member_manifest, layout, tc,
-                                                member_manifest->options);
+                                                member_manifest->options,
+                                                dep_sources, dep_include_dirs);
 
             // Inject external modules from built dependencies
             for (auto& action : plan.actions) {
@@ -606,7 +669,8 @@ export int cmd_build(const ParsedArgs& args) {
         }
     }
 
-    auto plan = create_convention_plan(*manifest, layout, tc, options);
+    auto plan = create_convention_plan(*manifest, layout, tc, options,
+                                        dep_sources, dep_include_dirs);
 
     // Write compile_commands.json
     write_compile_commands(plan, *root / "compile_commands.json");

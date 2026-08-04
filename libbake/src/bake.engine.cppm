@@ -263,12 +263,20 @@ export struct BuildPlan {
     // Returns nullopt if configuration is valid.
 };
 
+// Dependent source entry — populated by the CLI layer from the lockfile/cache.
+export struct DepSourceEntry {
+    std::string dep_name;
+    Path source;
+};
+
 // Create a build plan using convention rules
 export BuildPlan create_convention_plan(
         const Manifest& manifest,
         const Layout& layout,
         const Toolchain& tc,
-        const std::map<std::string, BuildOption>& options) {
+        const std::map<std::string, BuildOption>& options,
+        const std::vector<DepSourceEntry>& dep_sources = {},
+        const std::vector<Path>& dep_include_dirs = {}) {
 
     BuildPlan plan;
     plan.project_root = layout.root;
@@ -301,6 +309,11 @@ export BuildPlan create_convention_plan(
                 include_dirs.push_back(dep_public);
             }
         }
+    }
+
+    // Add include dirs from locked bake-native dependencies (populated by CLI)
+    for (auto& inc : dep_include_dirs) {
+        include_dirs.push_back(inc);
     }
 
     // Build module graph
@@ -411,8 +424,39 @@ export BuildPlan create_convention_plan(
         plan.actions.push_back(std::move(action));
     }
 
+    // Phase 2b: Compile sources from bake-native locked dependencies
+    for (auto& ds : dep_sources) {
+        // Unique object name to avoid collisions with project sources
+        std::string obj_name = "dep__" + ds.dep_name + "__" + ds.source.stem_string() + ".o";
+        Path obj = plan.obj_dir / obj_name;
+
+        CompileConfig cc;
+        cc.source = ds.source;
+        cc.output = obj;
+        cc.std_ver = std_ver;
+        cc.include_dirs = include_dirs;
+        cc.use_pic = (pkg.type == PackageType::SharedLib);
+
+        BuildAction action;
+        action.type = BuildAction::Type::Compile;
+        action.id = "dep-compile:" + ds.dep_name + ":" + ds.source.filename_string();
+        action.description = "Compiling dep " + ds.dep_name + "/" + ds.source.filename_string();
+        action.inputs = {ds.source};
+        action.outputs = {obj};
+        action.command = make_compile_command(tc, cc);
+
+        // Depend on all module compilations (dep sources may import modules)
+        for (size_t i = 0; i < plan.actions.size(); ++i) {
+            if (plan.actions[i].type == BuildAction::Type::CompileModule) {
+                action.depends_on.push_back(i);
+            }
+        }
+
+        plan.actions.push_back(std::move(action));
+    }
+
     // Phase 3: Link/Archive
-    if (!all_sources.empty() || !mod_graph.sorted.empty()) {
+    if (!all_sources.empty() || !mod_graph.sorted.empty() || !dep_sources.empty()) {
         std::vector<Path> obj_files;
         for (auto& a : plan.actions) {
             if (a.is_compile() && !a.outputs.empty()) {
