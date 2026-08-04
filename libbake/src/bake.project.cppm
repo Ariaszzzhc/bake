@@ -403,9 +403,15 @@ export struct Lockfile {
 
 // Get the global source cache directory
 export Path get_cache_dir() {
+#ifdef _WIN32
+    const char* home = std::getenv("LOCALAPPDATA");
+    if (!home) home = "C:\\";
+    return Path(home) / "bake" / "src";
+#else
     const char* home = std::getenv("HOME");
     if (!home) home = "/tmp";
     return Path(home) / ".cache" / "bake" / "src";
+#endif
 }
 
 } // namespace bake

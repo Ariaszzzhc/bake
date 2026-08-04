@@ -50,16 +50,32 @@ target_compile_definitions(libbake PRIVATE
     BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
     BAKE_LIB_DIR="${CMAKE_BINARY_DIR}"
 )
+
+# On Windows, libbake exports symbols; consumers import them.
+if(WIN32)
+    target_compile_definitions(libbake PRIVATE BAKE_BUILDING_DLL)
+endif()
+
 target_compile_features(libbake PRIVATE cxx_std_23)
 
 # ---- bake (executable) ----
 
 add_executable(bake bake/src/main.cpp)
 target_link_libraries(bake PRIVATE libbake)
-set_target_properties(bake PROPERTIES
-    BUILD_RPATH "${CMAKE_BINARY_DIR}"
-    INSTALL_RPATH "$ORIGIN/../lib"
-)
+
+# Platform-specific runtime library search path
+if(APPLE)
+    set_target_properties(bake PROPERTIES
+        BUILD_RPATH "${CMAKE_BINARY_DIR}"
+        INSTALL_RPATH "@loader_path/../lib"
+    )
+elseif(UNIX)
+    set_target_properties(bake PROPERTIES
+        BUILD_RPATH "${CMAKE_BINARY_DIR}"
+        INSTALL_RPATH "$ORIGIN/../lib"
+    )
+endif()
+# Windows: no RPATH concept — DLLs found via PATH or same directory as EXE
 
 # ---- Tests ----
 

@@ -390,15 +390,22 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
 
     // Step 3: Link → build_app
     Path build_app = bake_dir / "build_app";
+#ifdef _WIN32
+    build_app = bake_dir / "build_app.exe";
+#endif
     {
         std::vector<std::string> cmd;
         cmd.push_back(tc.cxx_path);
         cmd.push_back(wrapper_o.string());
         cmd.push_back(build_o.string());
+#ifdef _WIN32
+        // Windows: link against the import library directly
+        cmd.push_back(std::string(BAKE_LIB_DIR) + "/bake.lib");
+#else
         cmd.push_back("-L" + std::string(BAKE_LIB_DIR));
         cmd.push_back("-lbake");
-        // RPATH so build_app can find libbake at runtime
         cmd.push_back("-Wl,-rpath," + std::string(BAKE_LIB_DIR));
+#endif
         cmd.push_back("-o");
         cmd.push_back(build_app.string());
 
@@ -716,11 +723,16 @@ export int cmd_build(const ParsedArgs& args) {
                 for (auto& bm : built) {
                     if (bm.lib_path.string().empty()) continue;
                     Path lib_dir = bm.lib_path.parent();
+#ifdef _WIN32
+                    // Windows: link the .lib directly
+                    action.command.insert(action.command.end() - 2,
+                        (lib_dir / (bm.name + ".lib")).string());
+#else
                     action.command.insert(action.command.end() - 2,
                         {"-L" + lib_dir.string(), "-l" + bm.name});
-                    // Add rpath for runtime
                     action.command.insert(action.command.end() - 2,
                         "-Wl,-rpath," + lib_dir.string());
+#endif
                 }
             }
 

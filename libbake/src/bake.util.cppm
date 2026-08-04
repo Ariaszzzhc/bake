@@ -15,9 +15,19 @@ module;
 #include <functional>
 #include <memory>
 #include <algorithm>
-#include <sys/wait.h>
-#include <unistd.h>
-#include <fcntl.h>
+
+#ifdef _WIN32
+  #include <windows.h>
+  #include <process.h>
+  #include <io.h>
+  #ifndef NOMINMAX
+    #define NOMINMAX
+  #endif
+#else
+  #include <sys/wait.h>
+  #include <unistd.h>
+  #include <fcntl.h>
+#endif
 #include <errno.h>
 
 export module bake.util;
@@ -94,7 +104,14 @@ public:
 
     const std::filesystem::path& fs() const { return m_path; }
     std::string string() const { return m_path.string(); }
-    std::string native() const { return m_path.native(); }
+    // On Windows, path::native() returns wstring. Use string() for portable narrow string.
+    std::string native() const {
+#ifdef _WIN32
+        return m_path.string();
+#else
+        return m_path.native();
+#endif
+    }
 
     Path operator/(const Path& rhs) const { return Path(m_path / rhs.m_path); }
     Path operator/(const char* rhs) const { return Path(m_path / rhs); }
@@ -139,6 +156,51 @@ private:
 
 export inline std::string to_string(const Path& p) { return p.string(); }
 
+// ===== Cross-platform PATH search =====
+
+// Search PATH for an executable. On Windows, also tries .exe/.cmd/.bat extensions.
+export inline std::optional<Path> find_in_path(const std::string& name) {
+    const char* path_env = std::getenv("PATH");
+    if (!path_env) return std::nullopt;
+
+#ifdef _WIN32
+    const char path_sep = ';';
+    std::vector<std::string> exts = {".exe", ".cmd", ".bat"};
+    // If name already has an extension, don't append others
+    auto dot = name.find_last_of('.');
+    if (dot != std::string::npos) exts.clear();
+#else
+    const char path_sep = ':';
+#endif
+
+    std::string path_str(path_env);
+    size_t start = 0;
+    while (start <= path_str.size()) {
+        size_t end = path_str.find(path_sep, start);
+        if (end == std::string::npos) end = path_str.size();
+        std::string dir = path_str.substr(start, end - start);
+        start = end + 1;
+
+        if (dir.empty()) continue;
+
+#ifdef _WIN32
+        if (exts.empty()) {
+            Path candidate = Path(dir) / name;
+            if (candidate.is_regular_file()) return candidate;
+        } else {
+            for (auto& ext : exts) {
+                Path candidate = Path(dir) / (name + ext);
+                if (candidate.is_regular_file()) return candidate;
+            }
+        }
+#else
+        Path candidate = Path(dir) / name;
+        if (candidate.is_regular_file()) return candidate;
+#endif
+    }
+    return std::nullopt;
+}
+
 // ===== File utilities =====
 
 export inline std::optional<std::string> read_file(const Path& path) {
@@ -162,18 +224,35 @@ export inline bool write_file(const Path& path, std::string_view content) {
 export inline bool atomic_write_file(const Path& path, std::string_view content) {
     if (!path.parent().exists()) { path.parent().mkdir_recursive(); }
 
-    // Use a unique temp suffix to avoid collisions between concurrent processes.
-    // Combine PID with a random component.
+#ifdef _WIN32
+    // Windows: write to temp file, then MoveFileEx with REPLACE_EXISTING.
+    std::string tmp = path.string() + "." + std::to_string(GetCurrentProcessId()) + ".tmp";
+
+    // Write content using ofstream
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) { std::filesystem::remove(tmp); return false; }
+    f.write(content.data(), static_cast<std::streamsize>(content.size()));
+    if (!f.good()) { f.close(); std::filesystem::remove(tmp); return false; }
+    f.close();
+
+    // Atomic replace via MoveFileEx
+    std::wstring wtmp = std::filesystem::path(tmp).wstring();
+    std::wstring wdest = path.fs().wstring();
+    if (!MoveFileExW(wtmp.c_str(), wdest.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        std::filesystem::remove(tmp);
+        return false;
+    }
+    return true;
+#else
+    // POSIX: open + write + fsync + rename + dir fsync
     std::string tmp = path.string() + "." + std::to_string(getpid()) + ".tmp";
 
-    // Open with O_CREAT | O_TRUNC | O_WRONLY for explicit fd control
     int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
         std::filesystem::remove(tmp);
         return false;
     }
 
-    // Write all data
     size_t written = 0;
     const char* data = content.data();
     while (written < content.size()) {
@@ -187,7 +266,6 @@ export inline bool atomic_write_file(const Path& path, std::string_view content)
         written += static_cast<size_t>(n);
     }
 
-    // fsync ensures data reaches durable storage before rename
     if (fsync(fd) != 0) {
         close(fd);
         std::filesystem::remove(tmp);
@@ -195,7 +273,6 @@ export inline bool atomic_write_file(const Path& path, std::string_view content)
     }
     close(fd);
 
-    // Atomic rename on POSIX (same filesystem)
     std::error_code ec;
     std::filesystem::rename(tmp, path.string(), ec);
     if (ec) {
@@ -203,9 +280,7 @@ export inline bool atomic_write_file(const Path& path, std::string_view content)
         return false;
     }
 
-    // fsync the parent directory to ensure the rename is durable.
-    // Without this, a crash after rename may leave the directory entry
-    // in an inconsistent state on disk.
+    // fsync parent directory for durability
     int dir_fd = open(path.parent().string().c_str(), O_RDONLY);
     if (dir_fd >= 0) {
         fsync(dir_fd);
@@ -213,6 +288,7 @@ export inline bool atomic_write_file(const Path& path, std::string_view content)
     }
 
     return true;
+#endif
 }
 
 export inline bool file_exists(const Path& p) { return p.is_regular_file(); }
@@ -426,6 +502,116 @@ inline ProcessResult run_process(const std::string& cmd,
     return run_process(full_args, working_dir, capture_output);
 }
 
+#ifdef _WIN32
+
+// Windows implementation using CreateProcessW
+inline ProcessResult run_process(const std::vector<std::string>& args,
+                          const Path& working_dir,
+                          bool capture_output) {
+    ProcessResult result;
+    if (args.empty()) return result;
+
+    // Build command line string with proper quoting
+    std::string cmdline;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i > 0) cmdline += ' ';
+        // Quote args containing spaces
+        if (args[i].find(' ') != std::string::npos ||
+            args[i].find('\t') != std::string::npos) {
+            cmdline += '"';
+            cmdline += args[i];
+            cmdline += '"';
+        } else {
+            cmdline += args[i];
+        }
+    }
+
+    // Convert to wide string
+    std::wstring wcmdline(cmdline.begin(), cmdline.end());
+    std::wstring wworkdir;
+    if (!working_dir.string().empty()) {
+        wworkdir = working_dir.fs().wstring();
+    }
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+
+    HANDLE stdout_read = nullptr, stdout_write = nullptr;
+    HANDLE stderr_read = nullptr, stderr_write = nullptr;
+
+    if (capture_output) {
+        CreatePipe(&stdout_read, &stdout_write, &sa, 0);
+        CreatePipe(&stderr_read, &stderr_write, &sa, 0);
+        // Prevent child from inheriting read ends
+        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+        SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
+    }
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    if (capture_output) {
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdOutput = stdout_write;
+        si.hStdError = stderr_write;
+        // stdin: use the parent's
+        si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    }
+
+    BOOL ok = CreateProcessW(
+        nullptr,                           // lpApplicationName (NULL = parse cmdline)
+        const_cast<LPWSTR>(wcmdline.c_str()),
+        nullptr, nullptr,                  // process/thread security
+        capture_output ? TRUE : FALSE,     // inherit handles
+        0,                                 // creation flags
+        nullptr,                           // environment (inherit)
+        wworkdir.empty() ? nullptr : wworkdir.c_str(),
+        &si, &pi);
+
+    if (!ok) {
+        if (capture_output) {
+            if (stdout_read) CloseHandle(stdout_read);
+            if (stdout_write) CloseHandle(stdout_write);
+            if (stderr_read) CloseHandle(stderr_read);
+            if (stderr_write) CloseHandle(stderr_write);
+        }
+        return result;
+    }
+
+    // Close write ends in parent
+    if (capture_output) {
+        CloseHandle(stdout_write);
+        CloseHandle(stderr_write);
+    }
+
+    // Read captured output
+    if (capture_output) {
+        char buf[4096];
+        DWORD n = 0;
+        while (ReadFile(stdout_read, buf, sizeof(buf), &n, nullptr) && n > 0)
+            result.stdout_output.append(buf, n);
+        while (ReadFile(stderr_read, buf, sizeof(buf), &n, nullptr) && n > 0)
+            result.stderr_output.append(buf, n);
+        CloseHandle(stdout_read);
+        CloseHandle(stderr_read);
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+
+    DWORD exit_code = 0;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    result.exit_code = static_cast<int>(exit_code);
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return result;
+}
+
+#else
+
+// POSIX implementation using fork/exec
 inline ProcessResult run_process(const std::vector<std::string>& args,
                           const Path& working_dir,
                           bool capture_output) {
@@ -494,5 +680,7 @@ inline ProcessResult run_process(const std::vector<std::string>& args,
     result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     return result;
 }
+
+#endif // _WIN32
 
 } // namespace bake

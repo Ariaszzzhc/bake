@@ -6,7 +6,11 @@ extern "C" {
 #endif
 
 #if defined(_WIN32) || defined(__CYGWIN__)
-  #define BAKE_API __declspec(dllexport)
+  #ifdef BAKE_BUILDING_DLL
+    #define BAKE_API __declspec(dllexport)
+  #else
+    #define BAKE_API __declspec(dllimport)
+  #endif
 #else
   #define BAKE_API __attribute__((visibility("default")))
 #endif

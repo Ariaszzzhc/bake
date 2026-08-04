@@ -49,17 +49,15 @@ export struct Toolchain {
 
         // 2. Prefer clang++ on PATH (better module support than Apple Clang's c++)
         if (tc.cxx_path.empty()) {
-            auto which = run_process({"sh", "-c", "command -v clang++"}, Path(), true);
-            if (which.success()) {
-                tc.cxx_path = trim(which.stdout_output);
+            if (auto p = find_in_path("clang++")) {
+                tc.cxx_path = p->string();
             }
         }
 
         // 3. Fall back to c++
         if (tc.cxx_path.empty()) {
-            auto which = run_process({"sh", "-c", "command -v c++"}, Path(), true);
-            if (which.success()) {
-                tc.cxx_path = trim(which.stdout_output);
+            if (auto p = find_in_path("c++")) {
+                tc.cxx_path = p->string();
             }
         }
         if (tc.cxx_path.empty()) {
@@ -70,17 +68,17 @@ export struct Toolchain {
         if (const char* cc_env = std::getenv("CC")) {
             tc.cc_path = cc_env;
         } else {
-            auto which_cc = run_process({"sh", "-c", "command -v clang || command -v cc"}, Path(), true);
-            if (which_cc.success()) {
-                tc.cc_path = trim(which_cc.stdout_output);
+            if (auto p = find_in_path("clang")) {
+                tc.cc_path = p->string();
+            } else if (auto p = find_in_path("cc")) {
+                tc.cc_path = p->string();
             }
         }
         if (tc.cc_path.empty()) tc.cc_path = "cc";
 
         // Find ar
-        auto which_ar = run_process({"sh", "-c", "command -v ar"}, Path(), true);
-        if (which_ar.success()) {
-            tc.ar_path = trim(which_ar.stdout_output);
+        if (auto p = find_in_path("ar")) {
+            tc.ar_path = p->string();
         }
         if (tc.ar_path.empty()) {
             tc.ar_path = "ar";
@@ -106,9 +104,8 @@ export struct Toolchain {
             if (candidate.is_regular_file()) {
                 tc.scanner_path = candidate.string();
             } else {
-                auto which_scan = run_process({"sh", "-c", "command -v clang-scan-deps"}, Path(), true);
-                if (which_scan.success()) {
-                    tc.scanner_path = trim(which_scan.stdout_output);
+                if (auto p = find_in_path("clang-scan-deps")) {
+                    tc.scanner_path = p->string();
                 }
             }
         }
@@ -262,15 +259,28 @@ export std::vector<std::string> make_archive_command(const Toolchain& tc,
 
 // Determine the output library name based on type and platform
 export std::string library_name(std::string_view base_name, PackageType type) {
+    if (type == PackageType::SharedLib) {
 #if defined(__APPLE__)
-    if (type == PackageType::SharedLib) return "lib" + std::string(base_name) + ".dylib";
-#elif defined(__linux__)
-    if (type == PackageType::SharedLib) return "lib" + std::string(base_name) + ".so";
+        return "lib" + std::string(base_name) + ".dylib";
+#elif defined(_WIN32)
+        return std::string(base_name) + ".dll";
 #else
-    if (type == PackageType::SharedLib) return std::string(base_name) + ".dll";
+        return "lib" + std::string(base_name) + ".so";
 #endif
-    if (type == PackageType::StaticLib) return "lib" + std::string(base_name) + ".a";
+    }
+    if (type == PackageType::StaticLib) {
+#if defined(_WIN32)
+        return std::string(base_name) + ".lib";
+#else
+        return "lib" + std::string(base_name) + ".a";
+#endif
+    }
+    // Executable
+#if defined(_WIN32)
+    return std::string(base_name) + ".exe";
+#else
     return std::string(base_name);
+#endif
 }
 
 } // namespace bake

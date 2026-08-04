@@ -510,16 +510,18 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     tmp_dir.remove_all();
     tmp_dir.mkdir_recursive();
 
-    // Phase 3: Extract with tar, stripping ownership/permissions.
-    // Also use --hard-dereference to treat symlinks as regular files,
-    // and -P disabled (default) to prevent absolute path extraction.
+    // Phase 3: Extract with tar.
+    // POSIX: strip ownership/permissions with GNU-specific flags.
+    // Windows: plain extraction (Windows tar.exe doesn't support those flags).
     std::vector<std::string> cmd = {
         "tar", "xf", archive.string(),
-        "-C", tmp_dir.string(),
-        "--no-same-owner",
-        "--no-same-permissions",
-        "--no-overwrite-dir"
+        "-C", tmp_dir.string()
     };
+#ifndef _WIN32
+    cmd.push_back("--no-same-owner");
+    cmd.push_back("--no-same-permissions");
+    cmd.push_back("--no-overwrite-dir");
+#endif
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
         std::fprintf(stderr, "bake: failed to extract %s\n", archive.string().c_str());
