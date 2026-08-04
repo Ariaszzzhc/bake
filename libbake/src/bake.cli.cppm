@@ -11,6 +11,8 @@ export module bake.cli;
 
 import bake.util;
 import bake.project;
+import bake.compiler;
+import bake.engine;
 
 // ============================================================
 // bake.cli — multicall dispatch, argument parsing, commands
@@ -273,12 +275,202 @@ export int cmd_init(const ParsedArgs& args) {
     return 0;
 }
 
-// ===== Stub commands (Phase 1+ implementations) =====
+// ===== build command =====
 
 export int cmd_build(const ParsedArgs& args) {
-    std::fprintf(stderr, "bake: build not yet implemented (Phase 1)\n");
-    return 1;
+    // Find project root
+    auto root = find_project_root();
+    if (!root) {
+        std::fprintf(stderr, "bake: no bake.toml found in current directory or any parent\n");
+        return 1;
+    }
+
+    // Load manifest
+    auto manifest = Manifest::load(*root);
+    if (!manifest) {
+        std::fprintf(stderr, "bake: failed to load bake.toml\n");
+        return 1;
+    }
+
+    // Handle workspace: build all members
+    if (manifest->is_workspace()) {
+        int result = 0;
+        for (auto& member : manifest->workspace->members) {
+            Path member_dir = *root / member;
+            auto member_manifest = Manifest::load(member_dir);
+            if (!member_manifest || !member_manifest->has_package()) {
+                std::fprintf(stderr, "bake: skipping workspace member '%s' (no [package])\n", member.c_str());
+                continue;
+            }
+
+            // Check -p flag
+            if (auto p = args.get_option("p")) {
+                if (*p != member_manifest->package->name) continue;
+            }
+
+            std::printf("bake: building '%s'\n", member_manifest->package->name.c_str());
+            auto layout = Layout::detect(member_dir);
+            auto tc = Toolchain::detect();
+
+            // Apply option overrides
+            auto options = member_manifest->options;
+            for (auto& opt : args.options) {
+                if (starts_with(opt, "--option=") || opt == "--option") {
+                    // Parse --option name=value or --option=name=value
+                    std::string val = starts_with(opt, "--option=") ? opt.substr(9) : "";
+                    if (val.empty()) continue;
+                    size_t eq = val.find('=');
+                    std::string name = (eq == std::string::npos) ? val : val.substr(0, eq);
+                    std::string value = (eq == std::string::npos) ? "" : val.substr(eq + 1);
+                    if (!value.empty()) {
+                        options[name] = BuildOption::from_string(value);
+                    } else {
+                        options[name] = BuildOption::from_bool(true);
+                    }
+                }
+            }
+
+            auto plan = create_convention_plan(*member_manifest, layout, tc, options);
+
+            // Get job count
+            int jobs = 0;
+            if (auto j = args.get_option("j")) {
+                jobs = std::atoi(j->c_str());
+            }
+
+            int r = execute_plan(plan, jobs);
+            if (r != 0) result = r;
+        }
+        return result;
+    }
+
+    if (!manifest->has_package()) {
+        std::fprintf(stderr, "bake: no [package] section in bake.toml\n");
+        return 1;
+    }
+
+    // Single package build
+    auto layout = Layout::detect(*root);
+    auto tc = Toolchain::detect();
+
+    std::printf("bake: detected %s (%s)\n", tc.kind_name().c_str(), tc.cxx_path.c_str());
+
+    // Apply option overrides
+    auto options = manifest->options;
+    for (auto& opt : args.options) {
+        if (starts_with(opt, "--option=") || opt == "--option") {
+            std::string val = starts_with(opt, "--option=") ? opt.substr(9) : "";
+            if (val.empty()) continue;
+            size_t eq = val.find('=');
+            std::string name = (eq == std::string::npos) ? val : val.substr(0, eq);
+            std::string value = (eq == std::string::npos) ? "" : val.substr(eq + 1);
+            if (!value.empty()) {
+                options[name] = BuildOption::from_string(value);
+            } else {
+                options[name] = BuildOption::from_bool(true);
+            }
+        }
+    }
+
+    auto plan = create_convention_plan(*manifest, layout, tc, options);
+
+    // Get job count
+    int jobs = 0;
+    if (auto j = args.get_option("j")) {
+        jobs = std::atoi(j->c_str());
+    }
+
+    return execute_plan(plan, jobs);
 }
+
+// ===== clean command =====
+
+export int cmd_clean(const ParsedArgs& args) {
+    auto root = find_project_root();
+    if (!root) {
+        std::fprintf(stderr, "bake: no bake.toml found\n");
+        return 1;
+    }
+
+    auto layout = Layout::detect(*root);
+
+    int removed = 0;
+    if (layout.build_dir.exists()) {
+        layout.build_dir.remove_all();
+        std::printf("Removed %s\n", layout.build_dir.string().c_str());
+        removed++;
+    }
+    if (layout.artifacts_dir.exists()) {
+        layout.artifacts_dir.remove_all();
+        std::printf("Removed %s\n", layout.artifacts_dir.string().c_str());
+        removed++;
+    }
+
+    // Clean workspace members
+    auto manifest = Manifest::load(*root);
+    if (manifest && manifest->is_workspace()) {
+        for (auto& member : manifest->workspace->members) {
+            Path member_dir = *root / member;
+            auto ml = Layout::detect(member_dir);
+            if (ml.build_dir.exists()) {
+                ml.build_dir.remove_all();
+                std::printf("Removed %s\n", ml.build_dir.string().c_str());
+                removed++;
+            }
+            if (ml.artifacts_dir.exists()) {
+                ml.artifacts_dir.remove_all();
+                std::printf("Removed %s\n", ml.artifacts_dir.string().c_str());
+                removed++;
+            }
+        }
+    }
+
+    if (removed == 0) {
+        std::printf("Nothing to clean\n");
+    }
+
+    return 0;
+}
+
+// ===== run command =====
+
+export int cmd_run(const ParsedArgs& args) {
+    // First build
+    int build_result = cmd_build(args);
+    if (build_result != 0) return build_result;
+
+    // Find the built executable
+    auto root = find_project_root();
+    if (!root) return 1;
+
+    auto manifest = Manifest::load(*root);
+    if (!manifest || !manifest->has_package()) return 1;
+
+    if (manifest->package->type != PackageType::Executable) {
+        std::fprintf(stderr, "bake: cannot run non-executable package\n");
+        return 1;
+    }
+
+    auto layout = Layout::detect(*root);
+    std::string exe_name = library_name(manifest->package->name, PackageType::Executable);
+    Path exe_path = layout.artifacts_dir / exe_name;
+
+    if (!exe_path.exists()) {
+        std::fprintf(stderr, "bake: built executable not found at %s\n", exe_path.string().c_str());
+        return 1;
+    }
+
+    // Build command line: executable + remaining args
+    std::vector<std::string> run_args;
+    for (auto& p : args.positional) {
+        run_args.push_back(p);
+    }
+
+    auto result = run_process(exe_path.string(), run_args, *root);
+    return result.exit_code;
+}
+
+// ===== Stub commands (Phase 3+) =====
 
 export int cmd_add(const ParsedArgs& args) {
     std::fprintf(stderr, "bake: add not yet implemented (Phase 3)\n");
@@ -290,18 +482,8 @@ export int cmd_update(const ParsedArgs& args) {
     return 1;
 }
 
-export int cmd_run(const ParsedArgs& args) {
-    std::fprintf(stderr, "bake: run not yet implemented (Phase 1)\n");
-    return 1;
-}
-
 export int cmd_test(const ParsedArgs& args) {
     std::fprintf(stderr, "bake: test not yet implemented (Phase 7)\n");
-    return 1;
-}
-
-export int cmd_clean(const ParsedArgs& args) {
-    std::fprintf(stderr, "bake: clean not yet implemented (Phase 1)\n");
     return 1;
 }
 

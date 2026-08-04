@@ -17,7 +17,7 @@ target_include_directories(tomlplusplus INTERFACE
 
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE
-    ${CMAKE_SOURCE_DIR}/third_party/nlohmann)
+    ${CMAKE_SOURCE_DIR}/third_party)
 
 # ---- libbake (shared library) ----
 
@@ -29,13 +29,15 @@ target_sources(libbake
         FILES
             libbake/src/bake.util.cppm
             libbake/src/bake.project.cppm
+            libbake/src/bake.compiler.cppm
+            libbake/src/bake.engine.cppm
             libbake/src/bake.cli.cppm
 )
 
 target_link_libraries(libbake PRIVATE tomlplusplus nlohmann_json)
 target_include_directories(libbake PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus
-    ${CMAKE_SOURCE_DIR}/third_party/nlohmann
+    ${CMAKE_SOURCE_DIR}/third_party
 )
 target_compile_definitions(libbake PRIVATE BAKE_VERSION="${PROJECT_VERSION}")
 
