@@ -386,17 +386,91 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
 
     Lockfile lockfile;
 
+    // BFS queue: (dep_name, dep, is_root)
+    struct QueueEntry {
+        std::string name;
+        Dependency dep;
+        bool is_root;
+    };
+    std::vector<QueueEntry> queue;
+
+    // Seed with root manifest dependencies
     for (auto& [name, dep] : manifest.dependencies) {
         if (dep.is_path_dep) continue;
+        queue.push_back({name, dep, true});
+    }
+
+    // Conflict tracking
+    std::map<std::string, std::string> url_to_commit;  // url → commit
+    std::map<std::string, std::string> name_to_url;    // name → url
+
+    const size_t MAX_NODES = 256;
+    size_t node_count = 0;
+
+    while (!queue.empty()) {
+        if (node_count >= MAX_NODES) {
+            std::fprintf(stderr, "bake: dependency graph exceeds limit (%zu nodes)\n", MAX_NODES);
+            return std::nullopt;
+        }
+
+        auto [dep_name, dep, is_root] = queue.front();
+        queue.erase(queue.begin());
 
         auto node = resolve_dependency(dep);
         if (!node) return std::nullopt;
 
-        std::string node_id = node->id;
-        lockfile.root_deps[name] = node_id;
-        lockfile.nodes[node_id] = *node;
+        // Conflict check 1: same URL resolved to a different commit
+        auto url_it = url_to_commit.find(dep.url);
+        if (url_it != url_to_commit.end()) {
+            if (url_it->second != node->commit) {
+                std::fprintf(stderr,
+                    "bake: conflict — %s resolved to commit %s, but same URL was already at %s\n",
+                    dep.url.c_str(), node->commit.c_str(), url_it->second.c_str());
+                return std::nullopt;
+            }
+            // Same URL + same commit — already resolved, skip
+            continue;
+        }
+        url_to_commit[dep.url] = node->commit;
 
-        // TODO: recursive resolution for bake-native deps
+        // Conflict check 2: same name from a different URL
+        auto name_it = name_to_url.find(dep_name);
+        if (name_it != name_to_url.end()) {
+            if (name_it->second != dep.url) {
+                std::fprintf(stderr,
+                    "bake: conflict — dependency '%s' from %s, but already resolved from %s\n",
+                    dep_name.c_str(), dep.url.c_str(), name_it->second.c_str());
+                return std::nullopt;
+            }
+        } else {
+            name_to_url[dep_name] = dep.url;
+        }
+
+        // Add to lockfile
+        lockfile.nodes[node->id] = *node;
+        if (is_root) {
+            lockfile.root_deps[dep_name] = node->id;
+        }
+        node_count++;
+
+        // Recursive: if bake-native, load its bake.toml and enqueue its deps
+        if (node->native && !node->tree_sha256.empty()) {
+            Path dep_cache = cache_dir_ / node->tree_sha256;
+            Path dep_toml = dep_cache / "bake.toml";
+            if (dep_toml.is_regular_file()) {
+                auto sub_manifest = Manifest::load(dep_cache);
+                if (sub_manifest) {
+                    for (auto& [sub_name, sub_dep] : sub_manifest->dependencies) {
+                        if (sub_dep.is_path_dep) continue;
+                        node->dependencies.push_back(
+                            make_node_id(sub_name, sub_dep.tag));
+                        queue.push_back({sub_name, sub_dep, false});
+                    }
+                    // Update the node in lockfile with its dependency edges
+                    lockfile.nodes[node->id].dependencies = node->dependencies;
+                }
+            }
+        }
     }
 
     return lockfile;
