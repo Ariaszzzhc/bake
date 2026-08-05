@@ -88,12 +88,33 @@ target_sources(libbake
 
 set_target_properties(libbake PROPERTIES OUTPUT_NAME "bake")
 
+# Static linking against all LLVM/Clang/LLD libraries.
+file(GLOB BAKE_LLVM_STATIC_LIBS  "${LLVM_PREFIX}/lib/libLLVM*.a")
+file(GLOB BAKE_CLANG_STATIC_LIBS "${LLVM_PREFIX}/lib/libclang*.a")
+file(GLOB BAKE_LLD_STATIC_LIBS   "${LLVM_PREFIX}/lib/liblld*.a")
+
 target_link_libraries(libbake PRIVATE
     tomlplusplus nlohmann_json
-    clang-cpp
-    lldELF lldCOFF lldMachO lldWasm lldCommon
-    LLVM
+    ${BAKE_CLANG_STATIC_LIBS}
+    ${BAKE_LLD_STATIC_LIBS}
+    ${BAKE_LLVM_STATIC_LIBS}
 )
+
+# System libraries needed by LLVM static libs
+# dead_strip ensures only referenced code is kept in the final binary
+find_package(ZLIB QUIET)
+find_package(LibXml2 QUIET)
+find_package(zstd QUIET)
+target_link_libraries(libbake PRIVATE
+    ${ZLIB_LIBRARIES}
+    ${LIBXML2_LIBRARIES}
+    $<TARGET_NAME_IF_EXISTS:zstd::libzstd_shared>
+    $<TARGET_NAME_IF_EXISTS:zstd::libzstd_static>
+)
+# Fallback: link system libs by name if find_package didn't find them
+if(APPLE)
+    target_link_options(libbake PRIVATE -Wl,-dead_strip)
+endif()
 target_include_directories(libbake PRIVATE
     ${LLVM_INCLUDE_DIRS}
     ${CLANG_INCLUDE_DIRS}
