@@ -557,6 +557,50 @@ TestResult test_workspace_member_filter() {
 }
 
 // ----------------------------------------------------------------
+// Phase 4: CMake bridge tests
+// ----------------------------------------------------------------
+
+// build.cpp mode: CMake dep is built via the bridge, usage requirements
+// (includes + lib) are applied to the target.
+TestResult test_cmake_dep_build() {
+    auto dir = make_temp_dir("cmake_dep");
+    copy_fixture("cmake_dep", dir);
+
+    auto r = run_bake("build", dir);
+    CHECK(r.success(), "bake build failed for cmake_dep:\n" + r.stdout);
+
+    // Verify the executable exists and runs correctly
+    fs::path exe = dir / "out" / "bin" / "cmake-test";
+    CHECK(fs::exists(exe), "executable not found at out/bin/cmake-test");
+
+    auto run = run_cmd(exe.string(), dir);
+    CHECK_EQ(run.exit_code, 0,
+             "cmake-test returned non-zero: " + std::to_string(run.exit_code) + "\n" + run.stdout);
+
+    return {};
+}
+
+// Convention mode: no build.cpp — bake auto-detects CMakeLists.txt in
+// path dep and runs the bridge.
+TestResult test_cmake_dep_convention() {
+    auto dir = make_temp_dir("cmake_dep_conv");
+    copy_fixture("cmake_dep_convention", dir);
+
+    auto r = run_bake("build", dir);
+    CHECK(r.success(), "bake build failed for cmake_dep_convention:\n" + r.stdout);
+
+    // Verify the executable exists and runs correctly
+    fs::path exe = dir / "out" / "bin" / "cmake-conv-test";
+    CHECK(fs::exists(exe), "executable not found at out/bin/cmake-conv-test");
+
+    auto run = run_cmd(exe.string(), dir);
+    CHECK_EQ(run.exit_code, 0,
+             "cmake-conv-test returned non-zero: " + std::to_string(run.exit_code) + "\n" + run.stdout);
+
+    return {};
+}
+
+// ----------------------------------------------------------------
 // Test registry
 // ----------------------------------------------------------------
 
@@ -581,6 +625,8 @@ static std::vector<TestCase> all_tests = {
     {"standalone_path_dep_locked",    test_standalone_path_dep_locked},
     {"workspace_unified_output",      test_workspace_unified_output},
     {"workspace_member_filter",       test_workspace_member_filter},
+    {"cmake_dep_build",               test_cmake_dep_build},
+    {"cmake_dep_convention",          test_cmake_dep_convention},
 };
 
 // ----------------------------------------------------------------

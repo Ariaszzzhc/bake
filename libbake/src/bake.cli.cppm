@@ -938,6 +938,27 @@ export int cmd_build(const ParsedArgs& args) {
                          dep_sources, dep_include_dirs, external_libs);
     }
 
+    // Scan path deps for CMakeLists.txt — run CMake bridge for those
+    for (auto& [name, dep] : manifest->dependencies) {
+        if (!dep.is_path_dep) continue;
+        Path dep_dir = manifest->project_dir / dep.path;
+        if ((dep_dir / "CMakeLists.txt").is_regular_file()) {
+            std::println("bake: building CMake dependency '{}'...", name);
+            Path staging = *root / ".bake" / "staging" / name;
+            CMakeConfig config;
+            config.source_dir = dep_dir;
+            config.staging_dir = staging;
+            config.toolchain = &tc;
+            auto usage = run_cmake_bridge(config);
+            if (usage) {
+                for (auto& inc : usage->includes)
+                    dep_include_dirs.push_back(Path(inc));
+                for (auto& lib : usage->libraries)
+                    external_libs.push_back(lib);
+            }
+        }
+    }
+
     // Apply option overrides
     auto options = manifest->options;
     for (auto& opt : args.options) {

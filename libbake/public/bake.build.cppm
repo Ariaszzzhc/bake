@@ -17,6 +17,7 @@ export namespace bake {
 
 class Builder;
 class Step;
+class CMakeBuild;
 
 class Target {
     friend class Builder;
