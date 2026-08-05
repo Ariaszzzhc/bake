@@ -136,7 +136,67 @@ void append_unique(std::vector<T>& values, const T& value) {
 // Convert an absolute filesystem path to one relative to the project root.
 std::string rel_to_root(const std::filesystem::path& p,
                         const std::filesystem::path& root) {
-    return std::filesystem::relative(p, root).string();
+    std::error_code ec;
+    auto relative = std::filesystem::relative(p, root, ec);
+    if (!ec && !relative.empty())
+        return relative.lexically_normal().generic_string();
+    return p.lexically_normal().generic_string();
+}
+
+std::string build_action_id(std::string_view kind,
+                            std::string_view package,
+                            std::string_view target,
+                            std::string_view identity = {}) {
+    std::string result = std::string(kind) + ":" + std::string(package) +
+                         ":" + std::string(target);
+    if (!identity.empty()) result += ":" + std::string(identity);
+    return result;
+}
+
+std::string action_owner(std::string_view package, std::string_view target) {
+    if (package == target) return std::string(package);
+    return std::string(package) + "/" + std::string(target);
+}
+
+std::optional<std::string> relative_if_within(
+    const std::filesystem::path& path,
+    const std::filesystem::path& root) {
+    std::error_code ec;
+    auto relative = std::filesystem::relative(path, root, ec);
+    if (ec || relative.empty()) return std::nullopt;
+    relative = relative.lexically_normal();
+    if (*relative.begin() == "..") return std::nullopt;
+    return relative.generic_string();
+}
+
+struct SourceActionNames {
+    std::string identity;
+    std::string display;
+};
+
+SourceActionNames source_action_names(const bake_builder& builder,
+                                      const bake::Path& source) {
+    if (auto local = relative_if_within(
+            source.fs(), builder.layout.root.fs())) {
+        auto display = relative_if_within(
+            source.fs(), builder.layout.source_dir.fs());
+        return {*local, display.value_or(*local)};
+    }
+
+    for (const auto& dependency : builder.deps) {
+        if (!dependency->src_dir_resolved ||
+            dependency->cached_src_dir.empty()) {
+            continue;
+        }
+        if (auto relative = relative_if_within(
+                source.fs(), dependency->cached_src_dir)) {
+            return {"dependency/" + dependency->name + "/" + *relative,
+                    *relative};
+        }
+    }
+
+    return {source.fs().lexically_normal().generic_string(),
+            source.filename_string()};
 }
 
 std::vector<bake::Path> expand_source_pattern(
@@ -395,6 +455,20 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         b->layout.bin_dir.mkdir_recursive();
         b->layout.lib_dir.mkdir_recursive();
 
+        const std::string package_name =
+            b->manifest && b->manifest->package
+                ? b->manifest->package->name
+                : (b->layout.package_name.empty()
+                       ? b->layout.root.filename_string()
+                       : b->layout.package_name);
+        const std::string package_version =
+            b->manifest && b->manifest->package
+                ? b->manifest->package->version
+                : "";
+        auto step_action_id = [&](std::string_view step_name) {
+            return build_action_id("custom", package_name, step_name);
+        };
+
         auto actions = nlohmann::json::array();
 
         // ---------------------------------------------------
@@ -405,7 +479,8 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         for (const auto& step : b->steps) {
             nlohmann::json action;
             action["type"]       = "custom";
-            action["id"]         = step->name;
+            action["id"]         = step_action_id(step->name);
+            action["description"] = package_name + ": run " + step->name;
             action["inputs"]     = nlohmann::json::array();
             action["outputs"]    = to_json_array(step->outputs);
 
@@ -427,6 +502,7 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         for (const auto& target : b->targets) {
             std::vector<std::string> compile_ids;
             std::vector<std::string> object_paths;
+            std::set<std::string> emitted_compile_ids;
             bool has_cxx_sources = false;
 
             // -- Expand source glob patterns --
@@ -436,12 +512,19 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 for (const auto& src : files) {
                     if (!src.is_c()) has_cxx_sources = true;
                     std::string src_rel = rel_to_root(src.fs(), b->layout.root.fs());
+                    const auto source_names = source_action_names(*b, src);
                     std::string stem    = src.stem_string();
+                    std::string comp_id = build_action_id(
+                        "compile", package_name, target->name,
+                        source_names.identity);
+                    if (!emitted_compile_ids.insert(comp_id).second) continue;
+                    std::string object_hash =
+                        bake::SHA256::hex(comp_id).substr(0, 12);
                     std::string object_path =
                         (b->layout.obj_dir /
-                         (target->name + "__" + stem + ".o"))
+                         (target->name + "__" + stem + "_" +
+                          object_hash + ".o"))
                             .absolute().string();
-                    std::string comp_id = target->name + "__" + src.filename_string();
 
                     compile_ids.push_back(comp_id);
                     object_paths.push_back(object_path);
@@ -472,6 +555,9 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                     nlohmann::json action;
                     action["type"]       = "compile";
                     action["id"]         = comp_id;
+                    action["description"] =
+                        action_owner(package_name, target->name) + ": " +
+                        source_names.display;
                     action["inputs"]     = to_json_array({src_rel});
                     action["outputs"]    = to_json_array({object_path});
                     action["command"]    = to_json_array(cmd);
@@ -547,7 +633,7 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 for (const auto& id : compile_ids)
                     depends.push_back(id);
                 for (const auto* step : target->depends_on_steps)
-                    depends.push_back(step->name);
+                    depends.push_back(step_action_id(step->name));
 
                 std::vector<std::string> link_inputs = object_paths;
                 if (target->type != TargetType::StaticLib) {
@@ -558,7 +644,12 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
 
                 nlohmann::json action;
                 action["type"]       = type_str;
-                action["id"]         = target->name + "__link";
+                action["id"]         = build_action_id(
+                    type_str, package_name, target->name);
+                action["description"] =
+                    action_owner(package_name, target->name) + ": " +
+                    (type_str == "archive" ? "archive " : "link ") +
+                    out_name;
                 action["inputs"]     = to_json_array(link_inputs);
                 action["outputs"]    = to_json_array({output_path});
                 action["command"]    = to_json_array(cmd);
@@ -575,6 +666,10 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         // Phase 3: serialize to .bake/build.json
         // ---------------------------------------------------
         nlohmann::json build_json;
+        build_json["package"] = {
+            {"name", package_name},
+            {"version", package_version},
+        };
         build_json["actions"] = std::move(actions);
 
         bake::Path out_path = b->layout.bake_dir / "build.json";

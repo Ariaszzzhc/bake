@@ -19,7 +19,11 @@ int main() {
     const std::string level_define = std::to_string(b.option_int("level"));
 
     b.executable("option-app")
-        .sources("src/main.c")
+        .sources({
+            "src/main.c",
+            "src/left/value.c",
+            "src/right/value.c",
+        })
         .private_define("SELECTED_BACKEND", backend_define.c_str())
         .private_define("DIAGNOSTICS_ENABLED", diagnostics_define.c_str())
         .private_define("OPTION_LEVEL", level_define.c_str())

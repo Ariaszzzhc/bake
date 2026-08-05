@@ -190,6 +190,16 @@ TestResult test_pure_c_build() {
     CHECK(compile_commands.find("-std=c17") != std::string::npos,
           "pure C compile command does not select C17: " + compile_commands);
 
+    int same_stem_objects = 0;
+    for (const auto& entry : fs::directory_iterator(dir / "out" / ".obj")) {
+        const std::string filename = entry.path().filename().string();
+        if (filename.find("value_") == 0 && entry.path().extension() == ".o") {
+            ++same_stem_objects;
+        }
+    }
+    CHECK_EQ(same_stem_objects, 2,
+             "convention build overwrote same-named source objects");
+
     return {};
 }
 
@@ -826,11 +836,50 @@ TestResult test_build_cpp_options() {
 
     auto initial = run_option_bake("build");
     CHECK(initial.success(), "default option build failed: " + initial.stdout);
+    CHECK(initial.stdout.find("Building option-app v0.1.0") !=
+              std::string::npos,
+          "build output did not identify the project: " + initial.stdout);
+    CHECK(initial.stdout.find("option-app: main.c") != std::string::npos,
+          "build output did not use the readable action description: " +
+              initial.stdout);
+    CHECK(initial.stdout.find("option-app: left/value.c") !=
+              std::string::npos &&
+              initial.stdout.find("option-app: right/value.c") !=
+              std::string::npos,
+          "same-named sources were not displayed with distinct paths: " +
+              initial.stdout);
+    CHECK(initial.stdout.find("option-app__main.c") == std::string::npos,
+          "build output leaked an internal action ID: " + initial.stdout);
+    CHECK(initial.stdout.find("Finished option-app v0.1.0") !=
+              std::string::npos,
+          "build output did not identify the completed package: " +
+              initial.stdout);
     CHECK(fs::is_directory(dir / "out" / ".bmi" / ".std"),
           "std module was not built in the project-local out/.bmi tree");
     CHECK(!fs::exists(test_home / ".cache" / "bake") &&
               !fs::exists(test_home / "bake"),
           "build artifacts leaked into the global Bake source cache");
+
+    int same_stem_objects = 0;
+    for (const auto& entry : fs::directory_iterator(dir / "out" / ".obj")) {
+        const std::string filename = entry.path().filename().string();
+        if (filename.find("option-app__value_") == 0 &&
+            entry.path().extension() == ".o") {
+            ++same_stem_objects;
+        }
+    }
+    CHECK_EQ(same_stem_objects, 2,
+             "same-named sources did not receive distinct object files");
+
+    const auto build_graph = read_file(dir / "out" / ".bake" / "build.json");
+    CHECK(build_graph.find(
+              "compile:option-app:option-app:src/left/value.c") !=
+              std::string::npos &&
+              build_graph.find(
+              "compile:option-app:option-app:src/right/value.c") !=
+              std::string::npos,
+          "build graph action IDs do not include stable source identities: " +
+              build_graph);
 
     fs::path exe = dir / "out" / "bin" / "option-app";
     CHECK(fs::exists(exe), "option-app executable was not produced");

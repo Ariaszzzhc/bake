@@ -227,7 +227,10 @@ private:
 export struct BuildAction {
     enum class Type { CompileModule, Compile, Link, Archive };
     Type type;
+    // Machine identity: deterministic and unique within a package build.
+    // This is used by dependencies and incremental state, never as UI text.
     std::string id;
+    // User-facing progress text. Cosmetic changes must not invalidate cache.
     std::string description;
     std::vector<Path> inputs;
     std::vector<Path> outputs;
@@ -247,6 +250,8 @@ export struct BuildPlan {
     Path state_dir;
     Path obj_dir;
     Path bmi_dir;
+    std::string package_name;
+    std::string package_version;
 
     // Apply build options to std version etc.
     // Returns nullopt if configuration is valid.
@@ -270,6 +275,31 @@ export struct PackageUsageRequirements {
     std::vector<std::string> frameworks;
     bool uses_cxx = false;
 };
+
+namespace {
+
+std::string normalized_action_path(const Path& root, const Path& source) {
+    std::error_code ec;
+    auto relative = std::filesystem::relative(source.fs(), root.fs(), ec);
+    if (!ec && !relative.empty())
+        return relative.lexically_normal().generic_string();
+    return source.fs().lexically_normal().generic_string();
+}
+
+std::string compile_action_id(std::string_view package,
+                              std::string_view target,
+                              std::string_view kind,
+                              std::string_view source_identity) {
+    return std::string(kind) + ":" + std::string(package) + ":" +
+           std::string(target) + ":" + std::string(source_identity);
+}
+
+std::string object_name_for(const Path& source, std::string_view action_id) {
+    return source.stem_string() + "_" +
+           SHA256::hex(action_id).substr(0, 12) + ".o";
+}
+
+} // namespace
 
 // Create a build plan using convention rules
 export BuildPlan create_convention_plan(
@@ -296,6 +326,8 @@ export BuildPlan create_convention_plan(
     if (!manifest.has_package()) return plan;
 
     const auto& pkg = *manifest.package;
+    plan.package_name = pkg.name;
+    plan.package_version = pkg.version;
     std::string std_ver = pkg.std_version;
 
     // Discover sources
@@ -403,8 +435,12 @@ export BuildPlan create_convention_plan(
     for (auto& mod_name : mod_graph.sorted) {
         auto& info = mod_graph.modules[mod_name];
         Path src(info.source_path);
+        const std::string source_identity =
+            normalized_action_path(manifest.project_dir, src);
+        const std::string action_id = compile_action_id(
+            pkg.name, mod_name, "module", source_identity);
         Path bmi = plan.bmi_dir / (mod_name + ".pcm");
-        Path obj = plan.obj_dir / (src.stem_string() + ".o");
+        Path obj = plan.obj_dir / object_name_for(src, action_id);
 
         CompileConfig cc;
         cc.source = src;
@@ -427,8 +463,8 @@ export BuildPlan create_convention_plan(
 
         BuildAction action;
         action.type = BuildAction::Type::CompileModule;
-        action.id = "module:" + mod_name;
-        action.description = "Compiling module " + mod_name;
+        action.id = action_id;
+        action.description = pkg.name + ": module " + mod_name;
         action.inputs = {src};
         // Add imported BMI files as inputs so that when a dependency module
         // changes, this module is rebuilt. Without this, the old BMI gets
@@ -449,7 +485,11 @@ export BuildPlan create_convention_plan(
     for (auto& f : sources.c_files) all_sources.push_back(f);
 
     for (auto& src : all_sources) {
-        Path obj = plan.obj_dir / (src.stem_string() + ".o");
+        const std::string source_identity =
+            normalized_action_path(manifest.project_dir, src);
+        const std::string action_id = compile_action_id(
+            pkg.name, pkg.name, "compile", source_identity);
+        Path obj = plan.obj_dir / object_name_for(src, action_id);
 
         CompileConfig cc;
         cc.source = src;
@@ -490,8 +530,9 @@ export BuildPlan create_convention_plan(
 
         BuildAction action;
         action.type = BuildAction::Type::Compile;
-        action.id = "compile:" + src.string();
-        action.description = "Compiling " + src.filename_string();
+        action.id = action_id;
+        action.description = pkg.name + ": " +
+                             normalized_action_path(layout.source_dir, src);
         action.inputs = {src};
         // Add BMI files as inputs so module changes trigger consumer recompile
         for (auto& [name, bmi] : cc.module_deps) {
@@ -516,12 +557,11 @@ export BuildPlan create_convention_plan(
         all_dep_sources.push_back(pds);
     }
     for (auto& ds : all_dep_sources) {
-        // Unique object name: include dep name + hash of full source path
-        // to avoid collisions when two deps have files with the same stem.
-        std::string path_hash = SHA256::hex(ds.source.string()).substr(0, 8);
-        std::string obj_name = "dep__" + ds.dep_name + "__" +
-                               ds.source.stem_string() + "_" + path_hash + ".o";
-        Path obj = plan.obj_dir / obj_name;
+        const std::string source_identity =
+            normalized_action_path(manifest.project_dir, ds.source);
+        const std::string action_id = compile_action_id(
+            pkg.name, ds.dep_name, "dependency-compile", source_identity);
+        Path obj = plan.obj_dir / object_name_for(ds.source, action_id);
 
         CompileConfig cc;
         cc.source = ds.source;
@@ -534,8 +574,9 @@ export BuildPlan create_convention_plan(
 
         BuildAction action;
         action.type = BuildAction::Type::Compile;
-        action.id = "dep-compile:" + ds.dep_name + ":" + ds.source.filename_string();
-        action.description = "Compiling dep " + ds.dep_name + "/" + ds.source.filename_string();
+        action.id = action_id;
+        action.description = pkg.name + "/" + ds.dep_name + ": " +
+                             ds.source.filename_string();
         action.inputs = {ds.source};
         action.outputs = {obj};
         action.command = make_compile_command(tc, cc);
@@ -570,8 +611,8 @@ export BuildPlan create_convention_plan(
 
         if (pkg.type == PackageType::StaticLib) {
             link_action.type = BuildAction::Type::Archive;
-            link_action.id = "archive:" + pkg.name;
-            link_action.description = "Creating " + out_name;
+            link_action.id = "archive:" + pkg.name + ":" + pkg.name;
+            link_action.description = pkg.name + ": archive " + out_name;
 
             LinkConfig lc;
             lc.inputs = obj_files;
@@ -580,8 +621,8 @@ export BuildPlan create_convention_plan(
             link_action.command = make_archive_command(tc, lc);
         } else {
             link_action.type = BuildAction::Type::Link;
-            link_action.id = "link:" + pkg.name;
-            link_action.description = "Linking " + out_name;
+            link_action.id = "link:" + pkg.name + ":" + pkg.name;
+            link_action.description = pkg.name + ": link " + out_name;
 
             LinkConfig lc;
             lc.inputs = obj_files;
@@ -691,8 +732,14 @@ std::map<std::string, std::string> load_action_fingerprints(const Path& path) {
 // ===== Executor =====
 
 export int execute_plan(BuildPlan& plan, int jobs) {
+    const std::string package_label = [&] {
+        if (plan.package_name.empty()) return std::string("build");
+        if (plan.package_version.empty()) return plan.package_name;
+        return plan.package_name + " v" + plan.package_version;
+    }();
+
     if (plan.actions.empty()) {
-        std::println("bake: nothing to build");
+        std::println("    Finished {} (nothing to build)", package_label);
         return 0;
     }
 
@@ -700,10 +747,6 @@ export int execute_plan(BuildPlan& plan, int jobs) {
         jobs = static_cast<int>(std::thread::hardware_concurrency());
         if (jobs == 0) jobs = 4;
     }
-
-    int total = 0;
-    int skipped = 0;
-    int failed = 0;
 
     const Path state_path = plan.state_dir / "action-state.json";
     const auto previous_fingerprints = load_action_fingerprints(state_path);
@@ -720,9 +763,42 @@ export int execute_plan(BuildPlan& plan, int jobs) {
                needs_rebuild(action);
     };
 
+    // Decide the complete dirty set before execution. Propagating dirtiness
+    // through dependencies is important: a link action can look current until
+    // one of its object inputs is rebuilt later in this invocation.
+    std::vector<bool> rebuild(plan.actions.size(), false);
+    for (size_t i = 0; i < plan.actions.size(); ++i)
+        rebuild[i] = action_needs_rebuild(i);
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t i = 0; i < plan.actions.size(); ++i) {
+            if (rebuild[i]) continue;
+            for (size_t dependency : plan.actions[i].depends_on) {
+                if (dependency < rebuild.size() && rebuild[dependency]) {
+                    rebuild[i] = true;
+                    changed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    const int pending_total = static_cast<int>(
+        std::count(rebuild.begin(), rebuild.end(), true));
+    const int skipped = static_cast<int>(plan.actions.size()) - pending_total;
+    std::atomic<int> completed_actions{0};
+
     // Track completion
     std::vector<int> status(plan.actions.size(), 0);  // 0=pending, 1=done, -1=failed
-    std::atomic<int> actions_done{0};
+    std::mutex output_mutex;
+    int actions_started = 0;
+    auto announce = [&](const BuildAction& action) {
+        std::lock_guard<std::mutex> lock(output_mutex);
+        ++actions_started;
+        std::println("    [{}/{}] {}", actions_started, pending_total,
+                     action.description);
+    };
 
     // Execute module interfaces and compiles
     // For simplicity: module interfaces sequential, regular compiles parallel
@@ -731,29 +807,25 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     for (size_t i = 0; i < plan.actions.size(); ++i) {
         if (plan.actions[i].type == BuildAction::Type::CompileModule) {
             auto& action = plan.actions[i];
-            if (!action_needs_rebuild(i)) {
+            if (!rebuild[i]) {
                 status[i] = 1;
-                actions_done++;
-                skipped++;
                 continue;
             }
 
-            std::println("[{}/{}] {}", actions_done.load() + 1, plan.actions.size(),
-                         action.description);
+            announce(action);
 
             auto result = run_process(action.command, plan.project_root);
             if (!result.success()) {
+                std::lock_guard<std::mutex> lock(output_mutex);
                 if (!result.stderr_output.empty()) {
                     std::print(std::cerr, "{}", result.stderr_output);
                 }
                 std::println(std::cerr, "bake: failed to compile module");
                 status[i] = -1;
-                failed++;
                 return 1;
             }
             status[i] = 1;
-            actions_done++;
-            total++;
+            completed_actions++;
         }
     }
 
@@ -766,7 +838,6 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     }
 
     if (!compile_indices.empty()) {
-        std::mutex mtx;
         std::vector<std::thread> threads;
         std::atomic<int> compile_failed{0};
 
@@ -779,37 +850,27 @@ export int execute_plan(BuildPlan& plan, int jobs) {
                 size_t i = compile_indices[k];
                 auto& action = plan.actions[i];
 
-                {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    if (!action_needs_rebuild(i)) {
-                        status[i] = 1;
-                        actions_done++;
-                        skipped++;
-                        continue;
-                    }
+                if (!rebuild[i]) {
+                    status[i] = 1;
+                    continue;
                 }
 
-                {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    std::println("[{}/{}] {}", actions_done.load() + 1,
-                                 plan.actions.size(), action.description);
-                }
+                announce(action);
 
                 auto result = run_process(action.command, plan.project_root);
-                {
-                    std::lock_guard<std::mutex> lock(mtx);
-                    if (!result.success()) {
+                if (!result.success()) {
+                    {
+                        std::lock_guard<std::mutex> lock(output_mutex);
                         if (!result.stderr_output.empty()) {
                             std::print(std::cerr, "{}", result.stderr_output);
                         }
-                        compile_failed++;
-                        status[i] = -1;
-                        return;
                     }
-                    status[i] = 1;
-                    actions_done++;
-                    total++;
+                    compile_failed++;
+                    status[i] = -1;
+                    return;
                 }
+                status[i] = 1;
+                completed_actions++;
             }
         };
 
@@ -830,17 +891,16 @@ export int execute_plan(BuildPlan& plan, int jobs) {
             plan.actions[i].type == BuildAction::Type::Archive) {
             auto& action = plan.actions[i];
 
-            if (!action_needs_rebuild(i)) {
+            if (!rebuild[i]) {
                 status[i] = 1;
-                skipped++;
                 continue;
             }
 
-            std::println("[{}/{}] {}", actions_done.load() + 1, plan.actions.size(),
-                         action.description);
+            announce(action);
 
             auto result = run_process(action.command, plan.project_root);
             if (!result.success()) {
+                std::lock_guard<std::mutex> lock(output_mutex);
                 if (!result.stderr_output.empty()) {
                     std::print(std::cerr, "{}", result.stderr_output);
                 }
@@ -849,14 +909,17 @@ export int execute_plan(BuildPlan& plan, int jobs) {
                 return 1;
             }
             status[i] = 1;
-            total++;
+            completed_actions++;
         }
     }
 
-    if (total == 0 && skipped > 0) {
-        std::println("bake: up to date ({} actions skipped)", skipped);
-    } else if (total > 0) {
-        std::println("bake: build complete ({} compiled, {} skipped)", total, skipped);
+    const int completed = completed_actions.load();
+    if (completed == 0 && skipped > 0) {
+        std::println("    Finished {} (up to date, {} actions cached)",
+                     package_label, skipped);
+    } else if (completed > 0) {
+        std::println("    Finished {} ({} actions, {} cached)",
+                     package_label, completed, skipped);
     }
 
     nlohmann::json state;
@@ -891,6 +954,11 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
         return plan;
     }
 
+    if (doc.contains("package") && doc["package"].is_object()) {
+        plan.package_name = doc["package"].value("name", "");
+        plan.package_version = doc["package"].value("version", "");
+    }
+
     if (!doc.contains("actions")) return plan;
 
     auto action_path = [&](const std::string& value) {
@@ -905,7 +973,7 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
     for (auto& jaction : doc["actions"]) {
         BuildAction action;
         action.id = jaction.value("id", "");
-        action.description = action.id;
+        action.description = jaction.value("description", action.id);
 
         std::string type_str = jaction.value("type", "compile");
         if (type_str == "compile") action.type = BuildAction::Type::Compile;

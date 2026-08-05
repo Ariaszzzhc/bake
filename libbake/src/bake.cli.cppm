@@ -700,7 +700,7 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     // libc++ include directory: <prefix>/include/c++/v1
     Path libcxx_inc = prefix / "include" / "c++" / "v1";
 
-    std::println("bake: building std module (one-time)...");
+    std::println("   Preparing standard library module");
 
     std::vector<std::string> cmd;
     cmd.push_back(tc.cxx_path);
@@ -767,8 +767,6 @@ export int build_with_build_cpp(
     // Step 1: Compile wrapper module → BMI + .o
     Path pcm = bake_dir / "bake.build.pcm";
     Path wrapper_o = bake_dir / "bake.build.o";
-
-    std::println("bake: compiling build script...");
 
     {
         std::vector<std::string> cmd;
@@ -1037,6 +1035,12 @@ std::string manifest_package_name(const Manifest& manifest) {
     return filename.empty() ? manifest.project_dir.string() : filename;
 }
 
+std::string manifest_package_label(const Manifest& manifest) {
+    const std::string name = manifest_package_name(manifest);
+    if (!manifest.package || manifest.package->version.empty()) return name;
+    return name + " v" + manifest.package->version;
+}
+
 bool valid_package_output_name(std::string_view name) {
     if (name.empty() || name == "." || name == "..") return false;
     for (const unsigned char c : name) {
@@ -1173,7 +1177,8 @@ int build_path_meta_dependencies(
             return rc;
         }
 
-        std::println("bake: building dependency '{}'", package.name);
+        std::println("  Compiling {} (dependency)",
+                     manifest_package_label(package.manifest));
         if (int rc = build_with_build_cpp(layout, args, configured,
                                           /*apply_cli_options=*/false);
             rc != 0) {
@@ -1436,6 +1441,15 @@ export int cmd_build(const ParsedArgs& args) {
     // ===== Lock enforcement (before build.cpp so --locked/--frozen work universally)
     if (int rc = enforce_lock(*root, *manifest, args); rc != 0) return rc;
 
+    if (manifest->has_package()) {
+        std::println("   Building {}", manifest_package_label(*manifest));
+    } else if (manifest->is_workspace()) {
+        const std::string workspace_name = root->filename_string().empty()
+            ? root->string()
+            : root->filename_string();
+        std::println("   Building workspace {}", workspace_name);
+    }
+
     // Check for build.cpp (escape hatch mode)
     Path build_cpp = *root / "build.cpp";
     if (build_cpp.is_regular_file()) {
@@ -1558,7 +1572,8 @@ export int cmd_build(const ParsedArgs& args) {
                     *member_manifest, project_out);
             if (!member_package_requirements) return 1;
 
-            std::println("bake: building '{}'", member_manifest->package->name);
+            std::println("  Compiling {}",
+                         manifest_package_label(*member_manifest));
             auto layout = Layout::detect(member_dir, *root);
             auto tc = Toolchain::detect();
             Path member_std_pcm;
@@ -1644,6 +1659,12 @@ export int cmd_build(const ParsedArgs& args) {
             }
             built.push_back(std::move(bm));
         }
+        if (result == 0) {
+            const std::string workspace_name = root->filename_string().empty()
+                ? root->string()
+                : root->filename_string();
+            std::println("    Finished workspace {}", workspace_name);
+        }
         return result;
     }
 
@@ -1664,7 +1685,7 @@ export int cmd_build(const ParsedArgs& args) {
     auto tc = Toolchain::detect();
 
     const bool package_uses_c = is_c_standard(manifest->package->std_version);
-    std::println("bake: detected {} ({})", tc.kind_name(),
+    std::println("   Toolchain {} ({})", tc.kind_name(),
                  package_uses_c ? tc.cc_path : tc.cxx_path);
 
     // A pure C package must not depend on libc++'s std module.
