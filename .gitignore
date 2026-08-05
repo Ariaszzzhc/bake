@@ -8,6 +8,8 @@
 /bake/out/
 /bake/build/
 /lib/
+/external/llvm-build/
 /.codegraph/
 /__cmake_systeminformation/
 /zig_native_cpp.o
+/external/llvm-install/

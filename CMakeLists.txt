@@ -5,9 +5,8 @@ cmake_minimum_required(VERSION 3.30)
 set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD
     "f35a9ac6-8463-4d38-8eec-5d6008153e7d")
 
-# ---- Locate libc++.modules.json (Homebrew Clang layout) ----
-# CMake needs this to discover std.cppm for import std.  On a standard
-# Clang install it's found automatically; Homebrew puts it in lib/c++/.
+# ---- Locate libc++.modules.json (system Clang layout) ----
+# CMake needs this to discover std.cppm for import std.
 if(DEFINED CMAKE_CXX_COMPILER AND EXISTS "${CMAKE_CXX_COMPILER}")
     get_filename_component(_cxx_bindir "${CMAKE_CXX_COMPILER}" DIRECTORY)
     get_filename_component(_cxx_prefix "${_cxx_bindir}" DIRECTORY)
@@ -21,21 +20,28 @@ project(bake
     LANGUAGES C CXX
 )
 
-# ── LLVM/Clang/LLD (Phase 5: compiler integration) ──
+# ── LLVM/Clang/LLD ──
+# Default: use self-built LLVM from submodule (scripts/build-llvm.sh).
+# Override: -DLLVM_DIR=/path/to/lib/cmake/llvm  (e.g. Homebrew for dev)
+if(NOT DEFINED LLVM_DIR)
+    set(LLVM_DIR "${CMAKE_SOURCE_DIR}/external/llvm-install/lib/cmake/llvm" CACHE PATH "LLVM CMake config dir")
+endif()
+if(NOT DEFINED Clang_DIR)
+    set(Clang_DIR "${CMAKE_SOURCE_DIR}/external/llvm-install/lib/cmake/clang" CACHE PATH "Clang CMake config dir")
+endif()
+if(NOT DEFINED LLD_DIR)
+    set(LLD_DIR "${CMAKE_SOURCE_DIR}/external/llvm-install/lib/cmake/lld" CACHE PATH "LLD CMake config dir")
+endif()
+
 find_package(LLVM REQUIRED CONFIG)
 find_package(Clang REQUIRED CONFIG)
 find_package(LLD REQUIRED CONFIG)
 
-message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
-message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION} at ${LLVM_DIR}")
 
-# Derive LLVM installation prefix for runtime header/library lookup.
-# llvm-config --prefix gives the canonical prefix (e.g. /opt/homebrew/Cellar/llvm/22.1.8).
-execute_process(
-    COMMAND ${LLVM_TOOLS_BINARY_DIR}/llvm-config --prefix
-    OUTPUT_VARIABLE LLVM_PREFIX
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+# Derive LLVM installation prefix from LLVM_DIR (always <prefix>/lib/cmake/llvm).
+# More robust than calling llvm-config, which may not be built (LLVM_BUILD_TOOLS=OFF).
+get_filename_component(LLVM_PREFIX "${LLVM_DIR}/../../.." ABSOLUTE)
 message(STATUS "LLVM prefix: ${LLVM_PREFIX}")
 
 set(CMAKE_CXX_STANDARD 23)
@@ -63,7 +69,6 @@ target_include_directories(nlohmann_json INTERFACE
 
 add_library(libbake SHARED
     libbake/src/cabi/api.cpp
-    # Phase 5: LLVM/Clang/LLD compiler integration
     libbake/src/compiler/bake_llvm.cpp
     libbake/src/compiler/bake_clang_driver.cpp
     libbake/src/compiler/bake_clang_cc1_main.cpp
@@ -85,7 +90,6 @@ set_target_properties(libbake PROPERTIES OUTPUT_NAME "bake")
 
 target_link_libraries(libbake PRIVATE
     tomlplusplus nlohmann_json
-    # Phase 5: LLVM/Clang/LLD
     clang-cpp
     lldELF lldCOFF lldMachO lldWasm lldCommon
     LLVM
@@ -103,6 +107,7 @@ target_compile_definitions(libbake PRIVATE
     BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
     BAKE_LIB_DIR="${CMAKE_BINARY_DIR}"
     BAKE_LLVM_PREFIX="${LLVM_PREFIX}"
+    BAKE_RESOURCE_DIR="${LLVM_PREFIX}/lib/clang/${LLVM_VERSION_MAJOR}"
 )
 
 # On Windows, libbake exports symbols; consumers import them.
@@ -112,20 +117,29 @@ endif()
 
 target_compile_features(libbake PRIVATE cxx_std_23)
 
+# LLVM headers expect -fno-rtti (LLVM is built with RTTI disabled).
+# Apply only to the LLVM-interfacing C++ source files (which use #include, not import std).
+set_property(SOURCE
+    libbake/src/compiler/bake_llvm.cpp
+    libbake/src/compiler/bake_clang_driver.cpp
+    libbake/src/compiler/bake_clang_cc1_main.cpp
+    APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
+
 # ---- bake (executable) ----
 
 add_executable(bake bake/src/main.cpp)
 target_link_libraries(bake PRIVATE libbake)
 
 # Platform-specific runtime library search path
+# Include both bake's build dir and the self-built LLVM lib dir.
 if(APPLE)
     set_target_properties(bake PROPERTIES
-        BUILD_RPATH "${CMAKE_BINARY_DIR}"
+        BUILD_RPATH "${CMAKE_BINARY_DIR};${LLVM_PREFIX}/lib"
         INSTALL_RPATH "@loader_path/../lib"
     )
 elseif(UNIX)
     set_target_properties(bake PROPERTIES
-        BUILD_RPATH "${CMAKE_BINARY_DIR}"
+        BUILD_RPATH "${CMAKE_BINARY_DIR};${LLVM_PREFIX}/lib"
         INSTALL_RPATH "$ORIGIN/../lib"
     )
 endif()

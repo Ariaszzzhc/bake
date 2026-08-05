@@ -531,6 +531,14 @@ static int clang_main(int Argc, const char **Argv,
   }
 #endif
 
+  // Inject -resource-dir so Clang finds its builtin headers (stdarg.h,
+  // stddef.h, etc.) from the vendored LLVM build tree, not a system Clang.
+  // This replaces the old lib/clang symlink hack.
+#ifdef BAKE_RESOURCE_DIR
+  Args.push_back(Saver.save("-resource-dir").data());
+  Args.push_back(Saver.save(BAKE_RESOURCE_DIR).data());
+#endif
+
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));
 
   Driver::ReproLevel ReproLevel = Driver::ReproLevel::OnCrash;
