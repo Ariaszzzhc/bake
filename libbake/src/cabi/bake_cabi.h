@@ -28,7 +28,6 @@ typedef struct bake_builder bake_builder;
 typedef struct bake_target bake_target;
 typedef struct bake_step bake_step;
 typedef struct bake_dependency bake_dependency;
-typedef struct bake_usage bake_usage;
 
 // Builder
 BAKE_API bake_builder* bake_builder_new(void) BAKE_NOEXCEPT;
@@ -63,15 +62,6 @@ BAKE_API bake_step* bake_step_run(bake_step*, const char*, const char* const*, i
 // Dependency
 BAKE_API const char* bake_dep_src_dir(const bake_dependency*) BAKE_NOEXCEPT;
 BAKE_API void        bake_dep_link_to(bake_dependency*, bake_target*) BAKE_NOEXCEPT;
-BAKE_API bake_usage* bake_dep_cmake_build(bake_dependency*, bake_target* consumer,
-                                          const char* const* keys,
-                                          const char* const* vals, int ndefines) BAKE_NOEXCEPT;
-
-// UsageRequirements
-BAKE_API const char* const* bake_usage_includes(bake_usage*) BAKE_NOEXCEPT;
-BAKE_API const char* const* bake_usage_defines(bake_usage*) BAKE_NOEXCEPT;
-BAKE_API const char* const* bake_usage_links(bake_usage*) BAKE_NOEXCEPT;
-BAKE_API void        bake_usage_free(bake_usage*) BAKE_NOEXCEPT;
 
 // Error (thread-local)
 BAKE_API const char* bake_last_error(void) BAKE_NOEXCEPT;

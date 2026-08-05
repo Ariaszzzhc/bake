@@ -266,8 +266,7 @@ export BuildPlan create_convention_plan(
         const std::vector<DepSourceEntry>& dep_sources = {},
         const std::vector<Path>& dep_include_dirs = {},
         bool compile_path_deps = true,
-        const Path& std_module_pcm = {},
-        const std::vector<Path>& external_libs = {}) {
+        const Path& std_module_pcm = {}) {
 
     BuildPlan plan;
     plan.project_root = layout.root;
@@ -299,12 +298,6 @@ export BuildPlan create_convention_plan(
     for (auto& [name, dep] : manifest.dependencies) {
         if (dep.is_path_dep) {
             Path dep_dir = manifest.project_dir / dep.path;
-
-            // Skip path deps with CMakeLists.txt — handled by CMake bridge
-            // in the CLI layer. Their includes + libs are injected via
-            // dep_include_dirs and external_libs parameters.
-            if ((dep_dir / "CMakeLists.txt").is_regular_file()) continue;
-
             Path dep_public = dep_dir / "public";
             if (dep_public.is_directory()) {
                 include_dirs.push_back(dep_public);
@@ -513,11 +506,6 @@ export BuildPlan create_convention_plan(
             if (a.is_compile() && !a.outputs.empty()) {
                 obj_files.push_back(a.outputs[0]);
             }
-        }
-
-        // Add external libraries (from CMake deps) as additional link inputs
-        for (auto& elib : external_libs) {
-            obj_files.push_back(elib);
         }
 
         std::string out_name = library_name(pkg.name, pkg.type);

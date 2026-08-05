@@ -1,8 +1,0 @@
-[package]
-name = "cmake-sandbox-test"
-version = "0.1.0"
-type = "executable"
-std = "c++17"
-
-[dependencies]
-badlib = { path = "badlib" }

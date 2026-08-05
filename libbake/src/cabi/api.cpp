@@ -15,7 +15,6 @@ import std;
 import bake.util;
 import bake.project;
 import bake.compiler;
-import bake.foreign;
 
 #include "bake_cabi.h"
 
@@ -73,7 +72,6 @@ struct bake_target {
 
     std::vector<bake_target*> linked_targets;     // other bake targets
     std::vector<std::string> system_libs;          // -l flags
-    std::vector<std::string> external_libs;        // full paths to .a/.so files
 
     std::vector<bake_step*> depends_on_steps;
 };
@@ -92,22 +90,9 @@ struct bake_step {
 struct bake_dependency {
     std::string name;
     bake_builder* builder = nullptr;   // back-pointer for manifest/lockfile lookup
-    std::vector<std::pair<std::string, std::string>> cmake_defines;  // accumulated via .define()
     // Cached source directory (populated lazily)
     mutable std::string cached_src_dir;
     mutable bool src_dir_resolved = false;
-};
-
-// ---- struct bake_usage (opaque handle) ----
-
-struct bake_usage {
-    std::vector<std::string> includes;
-    std::vector<std::string> defines;
-    std::vector<std::string> links;
-    // Null-terminated C string arrays for the C API returns
-    std::vector<const char*> includes_c;
-    std::vector<const char*> defines_c;
-    std::vector<const char*> links_c;
 };
 
 // ============================================================
@@ -304,14 +289,6 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
 
                 for (const auto& lib : target->system_libs)
                     lc.link_libs.push_back(lib);
-
-                // External library files (e.g. from CMake deps) are added
-                // as additional link inputs — full paths to .a/.so files.
-                for (const auto& elib : target->external_libs) {
-                    std::string elib_rel = rel_to_root(
-                        bake::Path(elib).fs(), b->layout.root.fs());
-                    lc.inputs.push_back(bake::Path(elib_rel));
-                }
 
                 std::vector<std::string> cmd;
                 if (target->type == TargetType::StaticLib)
@@ -590,7 +567,7 @@ BAKE_API bake_step* bake_step_run(bake_step* s, const char* command,
 }
 
 // ============================================================
-// Dependency — Phase 4 CMake bridge
+// Dependency
 // ============================================================
 
 // Resolve a dependency's source directory.
@@ -632,7 +609,7 @@ BAKE_API const char* bake_dep_src_dir(const bake_dependency* d) noexcept {
 }
 
 // Link a dependency's build output to a target.
-// For now this is a no-op — usage requirements are applied via bake_dep_cmake_build.
+// Bake-native dependency linking is not implemented in build.cpp mode yet.
 BAKE_API void bake_dep_link_to(bake_dependency* d, bake_target* t) noexcept {
     if (!d || !t) return;
     try {
@@ -640,119 +617,8 @@ BAKE_API void bake_dep_link_to(bake_dependency* d, bake_target* t) noexcept {
         const char* src = bake_dep_src_dir(d);
         if (!src) return;
 
-        // Check if this is a bake-native dep with build output
-        // (For Phase 4, link_to is primarily for bake-native deps.
-        // CMake deps use build_with_cmake().expose_to() instead.)
         // TODO: implement bake-native dep linking in a future iteration.
     } catch (const std::exception& e) {
         set_error(std::string("bake_dep_link_to: ") + e.what());
     }
-}
-
-// Run the CMake bridge: configure → build → install → extract usage requirements.
-// Results are applied directly to the consumer target.
-BAKE_API bake_usage* bake_dep_cmake_build(bake_dependency* d, bake_target* consumer,
-                                          const char* const* keys,
-                                          const char* const* vals,
-                                          int ndefines) noexcept {
-    if (!d || !consumer) {
-        set_error("bake_dep_cmake_build: null argument");
-        return nullptr;
-    }
-    try {
-        // Resolve source directory
-        const char* src = bake_dep_src_dir(d);
-        if (!src || src[0] == '\0') {
-            set_error(std::string("bake_dep_cmake_build: cannot resolve source dir for '") +
-                      d->name + "'");
-            return nullptr;
-        }
-
-        // Determine staging directory: <project_root>/.bake/staging/<dep_name>/
-        bake::Path staging = d->builder->layout.bake_dir / "staging" / d->name;
-        staging.mkdir_recursive();
-
-        // Build CMakeConfig
-        bake::CMakeConfig config;
-        config.source_dir = bake::Path(src);
-        config.staging_dir = staging;
-        config.toolchain = &d->builder->toolchain;
-
-        // Merge defines from the wrapper's .define() calls
-        for (int i = 0; i < ndefines; ++i) {
-            if (keys[i] && vals[i]) {
-                config.defines.push_back({keys[i], vals[i]});
-            }
-        }
-
-        // Run the CMake bridge
-        std::println("bake: building CMake dependency '{}'...", d->name);
-        auto usage = bake::run_cmake_bridge(config);
-        if (!usage) {
-            set_error(std::string("bake_dep_cmake_build: CMake bridge failed for '") +
-                      d->name + "'");
-            return nullptr;
-        }
-
-        // Apply usage requirements to the consumer target
-        for (const auto& inc : usage->includes) {
-            consumer->include_dirs.push_back(inc);
-        }
-        for (const auto& def : usage->defines) {
-            // Defines come as "KEY=VALUE" strings
-            auto eq = def.find('=');
-            if (eq != std::string::npos) {
-                consumer->defines.push_back({def.substr(0, eq), def.substr(eq + 1)});
-            } else {
-                consumer->defines.push_back({def, ""});
-            }
-        }
-        for (const auto& lib : usage->libraries) {
-            consumer->external_libs.push_back(lib.string());
-        }
-
-        // Build the bake_usage return struct
-        auto u = std::make_unique<bake_usage>();
-        u->includes = usage->includes;
-        u->defines = usage->defines;
-        for (const auto& lib : usage->libraries) {
-            u->links.push_back(lib.string());
-        }
-
-        // Populate null-terminated C string arrays
-        for (const auto& s : u->includes) u->includes_c.push_back(s.c_str());
-        u->includes_c.push_back(nullptr);
-        for (const auto& s : u->defines) u->defines_c.push_back(s.c_str());
-        u->defines_c.push_back(nullptr);
-        for (const auto& s : u->links) u->links_c.push_back(s.c_str());
-        u->links_c.push_back(nullptr);
-
-        return u.release();
-    } catch (const std::exception& e) {
-        set_error(std::string("bake_dep_cmake_build: ") + e.what());
-        return nullptr;
-    }
-}
-
-// ============================================================
-// Usage requirements
-// ============================================================
-
-BAKE_API const char* const* bake_usage_includes(bake_usage* u) noexcept {
-    if (!u) return nullptr;
-    return u->includes_c.data();
-}
-
-BAKE_API const char* const* bake_usage_defines(bake_usage* u) noexcept {
-    if (!u) return nullptr;
-    return u->defines_c.data();
-}
-
-BAKE_API const char* const* bake_usage_links(bake_usage* u) noexcept {
-    if (!u) return nullptr;
-    return u->links_c.data();
-}
-
-BAKE_API void bake_usage_free(bake_usage* u) noexcept {
-    delete u;
 }

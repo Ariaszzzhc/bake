@@ -57,7 +57,6 @@ target_sources(libbake
             libbake/src/bake.compiler.cppm
             libbake/src/bake.engine.cppm
             libbake/src/bake.package.cppm
-            libbake/src/bake.foreign.cppm
             libbake/src/bake.cli.cppm
 )
 

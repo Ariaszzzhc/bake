@@ -10,7 +10,6 @@ import bake.project;
 import bake.compiler;
 import bake.engine;
 import bake.package;
-import bake.foreign;
 
 // ============================================================
 // bake.cli — multicall dispatch, argument parsing, commands
@@ -595,18 +594,13 @@ export int enforce_lock(const Path& root, const Manifest& manifest, const Parsed
 // ===== Dep source extraction (bridges bake.package types to bake.engine types) =====
 
 // Extract bake-native dep sources and include dirs from a lockfile.
-// Also runs the CMake bridge for non-native deps (native=false) that
-// have a CMakeLists.txt, collecting usage requirements.
 // Walks ALL lock nodes (root + transitive) in topological order so that
 // dependencies are compiled before dependents.
 static void extract_dep_info(
-        const Path& project_root,
         const Lockfile& lockfile,
         const Path& cache_dir,
-        const Toolchain& tc,
         std::vector<DepSourceEntry>& dep_sources,
-        std::vector<Path>& dep_include_dirs,
-        std::vector<Path>& external_libs) {
+        std::vector<Path>& dep_include_dirs) {
 
     // Topological sort of lock nodes by their dependency edges.
     // Nodes with no dependencies come first.
@@ -660,6 +654,7 @@ static void extract_dep_info(
         auto node_it = lockfile.nodes.find(node_id);
         if (node_it == lockfile.nodes.end()) continue;
         const auto& node = node_it->second;
+        if (!node.native) continue;
         if (node.tree_sha256.empty()) continue;
 
         Path dep_cache = cache_dir / node.tree_sha256;
@@ -669,54 +664,19 @@ static void extract_dep_info(
             continue;
         }
 
-        if (node.native) {
-            // bake-native dep: add public/ to include dirs, compile its sources
-            Path dep_public = dep_cache / "public";
-            if (dep_public.is_directory()) {
-                dep_include_dirs.push_back(dep_public);
+        Path dep_public = dep_cache / "public";
+        if (dep_public.is_directory()) {
+            dep_include_dirs.push_back(dep_public);
+        }
+
+        Path dep_src = dep_cache / "src";
+        if (dep_src.is_directory()) {
+            auto dep_disc = discover_sources(dep_src, dep_public);
+            for (auto& cpp : dep_disc.cpp_files) {
+                dep_sources.push_back({node_id, cpp});
             }
-
-            Path dep_src = dep_cache / "src";
-            if (dep_src.is_directory()) {
-                auto dep_disc = discover_sources(dep_src, dep_public);
-                for (auto& cpp : dep_disc.cpp_files) {
-                    dep_sources.push_back({node_id, cpp});
-                }
-                for (auto& c : dep_disc.c_files) {
-                    dep_sources.push_back({node_id, c});
-                }
-            }
-        } else {
-            // Non-native dep: try CMake bridge if CMakeLists.txt exists
-            Path cmake_lists = dep_cache / "CMakeLists.txt";
-            if (cmake_lists.is_regular_file()) {
-                std::println("bake: building CMake dependency '{}'...", node_id);
-                Path staging = project_root / ".bake" / "staging" / node_id;
-
-                CMakeConfig config;
-                config.source_dir = dep_cache;
-                config.staging_dir = staging;
-                config.toolchain = &tc;
-
-                auto usage = run_cmake_bridge(config);
-                if (!usage) {
-                    std::println(std::cerr,
-                        "bake: CMake bridge failed for '{}'", node_id);
-                    external_libs.clear();
-                    return;
-                }
-                for (const auto& inc : usage->includes) {
-                    dep_include_dirs.push_back(Path(inc));
-                }
-                for (const auto& lib : usage->libraries) {
-                    external_libs.push_back(lib);
-                }
-            } else {
-                // No build system detected — just add public/ if it exists
-                Path dep_public = dep_cache / "public";
-                if (dep_public.is_directory()) {
-                    dep_include_dirs.push_back(dep_public);
-                }
+            for (auto& c : dep_disc.c_files) {
+                dep_sources.push_back({node_id, c});
             }
         }
     }
@@ -801,11 +761,9 @@ export int cmd_build(const ParsedArgs& args) {
         // Extract dep sources + include dirs from lockfile
         std::vector<DepSourceEntry> dep_sources;
         std::vector<Path> dep_include_dirs;
-        std::vector<Path> external_libs;
         if (lockfile && !lockfile->empty()) {
-            extract_dep_info(*root, *lockfile, get_cache_dir(),
-                             Toolchain::detect(),
-                             dep_sources, dep_include_dirs, external_libs);
+            extract_dep_info(*lockfile, get_cache_dir(),
+                             dep_sources, dep_include_dirs);
         }
 
         // Track built members for inter-member dependency resolution
@@ -841,7 +799,7 @@ export int cmd_build(const ParsedArgs& args) {
                                                 member_manifest->options,
                                                 dep_sources, dep_include_dirs,
                                                 /*compile_path_deps=*/false,
-                                                std_pcm, external_libs);
+                                                std_pcm);
 
             // Inject external modules from built dependencies
             for (auto& action : plan.actions) {
@@ -932,34 +890,10 @@ export int cmd_build(const ParsedArgs& args) {
     // Extract dep sources + include dirs from lockfile
     std::vector<DepSourceEntry> dep_sources;
     std::vector<Path> dep_include_dirs;
-    std::vector<Path> external_libs;
     auto lockfile = Lockfile::load(*root / "bake.lock");
     if (lockfile && !lockfile->empty()) {
-        extract_dep_info(*root, *lockfile, get_cache_dir(), tc,
-                         dep_sources, dep_include_dirs, external_libs);
-    }
-
-    // Scan path deps for CMakeLists.txt — run CMake bridge for those
-    for (auto& [name, dep] : manifest->dependencies) {
-        if (!dep.is_path_dep) continue;
-        Path dep_dir = manifest->project_dir / dep.path;
-        if ((dep_dir / "CMakeLists.txt").is_regular_file()) {
-            std::println("bake: building CMake dependency '{}'...", name);
-            Path staging = *root / ".bake" / "staging" / name;
-            CMakeConfig config;
-            config.source_dir = dep_dir;
-            config.staging_dir = staging;
-            config.toolchain = &tc;
-            auto usage = run_cmake_bridge(config);
-            if (!usage) {
-                std::println(std::cerr, "bake: CMake bridge failed for '{}'", name);
-                return 1;
-            }
-            for (auto& inc : usage->includes)
-                dep_include_dirs.push_back(Path(inc));
-            for (auto& lib : usage->libraries)
-                external_libs.push_back(lib);
-        }
+        extract_dep_info(*lockfile, get_cache_dir(),
+                         dep_sources, dep_include_dirs);
     }
 
     // Apply option overrides
@@ -982,7 +916,7 @@ export int cmd_build(const ParsedArgs& args) {
     auto plan = create_convention_plan(*manifest, layout, tc, options,
                                         dep_sources, dep_include_dirs,
                                         /*compile_path_deps=*/true,
-                                        std_pcm, external_libs);
+                                        std_pcm);
 
     // Write compile_commands.json
     write_compile_commands(plan, *root / "compile_commands.json");

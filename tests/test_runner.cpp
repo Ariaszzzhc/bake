@@ -556,68 +556,22 @@ TestResult test_workspace_member_filter() {
     return {};
 }
 
-// ----------------------------------------------------------------
-// Phase 4: CMake bridge tests
-// ----------------------------------------------------------------
-
-// build.cpp mode: CMake dep is built via the bridge, usage requirements
-// (includes + lib) are applied to the target.
-TestResult test_cmake_dep_build() {
-    auto dir = make_temp_dir("cmake_dep");
-    copy_fixture("cmake_dep", dir);
+// build.cpp can resolve a declared source dependency without knowing or
+// invoking any foreign build system.
+TestResult test_build_cpp_dependency_src_dir() {
+    auto dir = make_temp_dir("build_cpp_dep_src");
+    copy_fixture("build_cpp_dep_src", dir);
 
     auto r = run_bake("build", dir);
-    CHECK(r.success(), "bake build failed for cmake_dep:\n" + r.stdout);
+    CHECK(r.success(), "build.cpp dependency source build failed: " + r.stdout);
 
-    // Verify the executable exists and runs correctly
-    fs::path exe = dir / "out" / "bin" / "cmake-test";
-    CHECK(fs::exists(exe), "executable not found at out/bin/cmake-test");
+    fs::path exe = dir / "out" / "bin" / "build-cpp-dep-src";
+    CHECK(fs::exists(exe), "build.cpp dependency executable not found");
 
     auto run = run_cmd(exe.string(), dir);
     CHECK_EQ(run.exit_code, 0,
-             "cmake-test returned non-zero: " + std::to_string(run.exit_code) + "\n" + run.stdout);
-
-    return {};
-}
-
-// Convention mode: no build.cpp — bake auto-detects CMakeLists.txt in
-// path dep and runs the bridge.
-TestResult test_cmake_dep_convention() {
-    auto dir = make_temp_dir("cmake_dep_conv");
-    copy_fixture("cmake_dep_convention", dir);
-
-    auto r = run_bake("build", dir);
-    CHECK(r.success(), "bake build failed for cmake_dep_convention:\n" + r.stdout);
-
-    // Verify the executable exists and runs correctly
-    fs::path exe = dir / "out" / "bin" / "cmake-conv-test";
-    CHECK(fs::exists(exe), "executable not found at out/bin/cmake-conv-test");
-
-    auto run = run_cmd(exe.string(), dir);
-    CHECK_EQ(run.exit_code, 0,
-             "cmake-conv-test returned non-zero: " + std::to_string(run.exit_code) + "\n" + run.stdout);
-
-    return {};
-}
-
-// Sandbox test: CMake project attempts find_package(ZLIB) but ZLIB is not
-// in the lock. bake's sandbox injects CMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON,
-// causing the configure step to fail.
-TestResult test_cmake_sandbox() {
-    auto dir = make_temp_dir("cmake_sandbox");
-    copy_fixture("cmake_sandbox", dir);
-
-    auto r = run_bake("build", dir);
-    CHECK(!r.success(),
-          "bake build should have failed — sandbox should block find_package(ZLIB)");
-
-    // The error output should mention ZLIB or "disabled" or "not found"
-    bool has_relevant_error =
-        r.stdout.find("ZLIB") != std::string::npos ||
-        r.stdout.find("Could NOT find") != std::string::npos ||
-        r.stdout.find("CMake configure failed") != std::string::npos;
-    CHECK(has_relevant_error,
-          "expected ZLIB/CMake failure in output: " + r.stdout);
+             "build.cpp dependency executable returned non-zero: " +
+             std::to_string(run.exit_code));
 
     return {};
 }
@@ -647,9 +601,7 @@ static std::vector<TestCase> all_tests = {
     {"standalone_path_dep_locked",    test_standalone_path_dep_locked},
     {"workspace_unified_output",      test_workspace_unified_output},
     {"workspace_member_filter",       test_workspace_member_filter},
-    {"cmake_dep_build",               test_cmake_dep_build},
-    {"cmake_dep_convention",          test_cmake_dep_convention},
-    {"cmake_sandbox",                 test_cmake_sandbox},
+    {"build_cpp_dependency_src_dir",  test_build_cpp_dependency_src_dir},
 };
 
 // ----------------------------------------------------------------

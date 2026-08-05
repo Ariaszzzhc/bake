@@ -17,7 +17,6 @@ export namespace bake {
 
 class Builder;
 class Step;
-class CMakeBuild;
 
 class Target {
     friend class Builder;
@@ -64,7 +63,6 @@ inline Target& Target::depends_on(Step& step) {
 
 class Dependency {
     friend class Builder;
-    friend class CMakeBuild;
     bake_dependency* handle_ = nullptr;
 public:
     Dependency() = default;
@@ -72,10 +70,6 @@ public:
 
     const char* src_dir() const { return bake_dep_src_dir(handle_); }
     void link_to(Target& t) { bake_dep_link_to(handle_, t.raw()); }
-
-    // CMake bridge: configure + build + install + extract usage requirements.
-    // Returns a CMakeBuild builder for fluent .define().expose_to() calls.
-    CMakeBuild build_with_cmake();
 
     bake_dependency* raw() const { return handle_; }
 };
@@ -141,42 +135,5 @@ public:
 
     bake_builder* raw() const { return handle_; }
 };
-
-// ============================================================
-// CMakeBuild — fluent builder for CMake bridge configuration
-// ============================================================
-
-class CMakeBuild {
-    friend class Dependency;
-    bake_dependency* dep_;
-    std::vector<std::pair<std::string, std::string>> defines_;
-    explicit CMakeBuild(bake_dependency* d) : dep_(d) {}
-public:
-    CMakeBuild& define(const char* key, const char* value = "") {
-        defines_.emplace_back(key, value);
-        return *this;
-    }
-
-    void expose_to(Target& consumer) {
-        // Flatten defines into parallel arrays for the C API
-        std::vector<const char*> keys, vals;
-        for (auto& [k, v] : defines_) {
-            keys.push_back(k.c_str());
-            vals.push_back(v.c_str());
-        }
-        bake_usage* usage = bake_dep_cmake_build(
-            dep_, consumer.raw(),
-            keys.data(), vals.data(),
-            static_cast<int>(defines_.size()));
-        if (usage) bake_usage_free(usage);
-        // On failure, bake_dep_cmake_build sets bake_last_error.
-        // The wrapper layer can't throw across the C ABI boundary,
-        // so the error is stored for the next bake_last_error() call.
-    }
-};
-
-inline CMakeBuild Dependency::build_with_cmake() {
-    return CMakeBuild(handle_);
-}
 
 } // namespace bake

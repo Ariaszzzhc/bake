@@ -33,7 +33,7 @@ Requires: CMake ≥ 3.30, Ninja, Clang ≥ 19 with libc++ (Homebrew `llvm` formu
 - **`import std;`** — all standard library access is via `import std;`, not `#include`. The only `#include` directives in module files are for third-party headers (`<toml.hpp>`, `<nlohmann/json.hpp>`) and platform/OS headers (`<errno.h>`, `<sys/wait.h>`, `<windows.h>`), which go in the **global module fragment** (`module;` before `export module`).
 - **I/O**: use `std::println(...)` for stdout, `std::println(std::cerr, ...)` for stderr, `std::print(...)` without trailing newline. Use `{}` format placeholders, not printf `%s`. Drop `.c_str()` — `std::format` handles `std::string` natively. Do NOT use `fprintf`, `printf`, or the bare `stderr`/`stdout` macros.
 - **Module naming**: `bake.<subsystem>` (e.g. `bake.util`, `bake.engine`). File name mirrors module name: `bake.<name>.cppm`.
-- **Module dependency chain**: `bake.util` → `bake.project` → `bake.compiler` → `bake.engine` / `bake.package` / `bake.foreign` → `bake.cli`.
+- **Module dependency chain**: `bake.util` → `bake.project` → `bake.compiler` → `bake.engine` / `bake.package` → `bake.cli`.
 
 ## Directory Layout
 
@@ -50,7 +50,6 @@ bake/                     workspace root
 │       ├── bake.compiler.cppm Toolchain detection, compile/link command gen
 │       ├── bake.engine.cppm   source discovery, module scanning (P1689), DAG, executor
 │       ├── bake.package.cppm  Resolver, Fetcher, Cache, lockfile
-│       ├── bake.foreign.cppm  CMake bridge (configure + build + install + usage extraction)
 │       ├── bake.cli.cppm      CLI dispatch, all commands (init/build/add/update/run/clean)
 │       └── cabi/
 │           ├── bake_cabi.h    C ABI header (opaque handles, extern "C")
@@ -70,7 +69,7 @@ bake/                     workspace root
 - **Engine build flow**: discover sources → scan with `clang-scan-deps` (P1689) → build module DAG → topological sort → compile module interfaces → compile sources → link.
 - **import std support**: the engine pre-builds `std.pcm` from libc++ (`ensure_std_pcm()`), caches it in `~/.cache/bake/`, and injects `-fmodule-file=std=<path>` into all C++ compile actions.
 - **Workspace**: multi-package projects like Cargo. Each member is a separate package with its own `bake.toml`. The root `bake.toml` declares `[workspace] members = [...]`.
-- **CMake bridge** (Phase 4): `bake.foreign` module provides `run_cmake_bridge()` — runs `cmake` configure + build + install to a staging dir, then scans the install tree for include dirs and library files. Available in both convention mode (auto-detected for path deps with `CMakeLists.txt`) and build.cpp mode (`dep.build_with_cmake().define("K","V").expose_to(target)`). Best-effort sandbox injects `FETCHCONTENT_FULLY_DISCONNECTED=ON` and `CMAKE_DISABLE_FIND_PACKAGE_<pkg>=ON` for common packages.
+- **External source builds**: bake has no built-in CMake/Meson integration and never infers a foreign build graph. `bake add` resolves source; `build.cpp` explicitly describes how that source is compiled.
 
 ## Manifest Format (bake.toml)
 
