@@ -1,0 +1,11 @@
+[package]
+name = "base"
+version = "1.0.0"
+type = "static-lib"
+std = "c++23"
+
+[dependencies]
+upstream = { path = "upstream" }
+
+[options]
+tls = "mbedtls"

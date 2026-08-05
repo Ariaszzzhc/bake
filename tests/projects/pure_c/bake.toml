@@ -1,0 +1,5 @@
+[package]
+name = "pure-c"
+version = "0.1.0"
+type = "executable"
+std = "c17"

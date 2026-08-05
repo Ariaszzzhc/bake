@@ -1,6 +1,20 @@
 module;
 
 #include <toml.hpp>
+#include <nlohmann/json.hpp>
+#include <cerrno>
+#include <cstdlib>
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#elif defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#elif defined(__linux__)
+#include <unistd.h>
+#endif
 
 export module bake.cli;
 
@@ -28,6 +42,129 @@ import bake.package;
 #endif
 
 namespace bake::cli {
+
+namespace {
+
+Path running_executable() {
+#ifdef __APPLE__
+    uint32_t size = 0;
+    (void)_NSGetExecutablePath(nullptr, &size);
+    if (size == 0) return {};
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
+    std::error_code ec;
+    auto canonical = std::filesystem::weakly_canonical(buffer.data(), ec);
+    return ec ? Path(buffer.data()) : Path(canonical);
+#elif defined(_WIN32)
+    std::vector<wchar_t> buffer(32768);
+    DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
+                                      static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length == buffer.size()) return {};
+    return Path(std::filesystem::path(buffer.data(), buffer.data() + length));
+#elif defined(__linux__)
+    std::vector<char> buffer(4096);
+    ssize_t length = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
+    if (length <= 0) return {};
+    buffer[static_cast<size_t>(length)] = '\0';
+    return Path(buffer.data());
+#else
+    return {};
+#endif
+}
+
+struct BuildScriptRuntime {
+    Path wrapper;
+    Path cabi_header;
+    Path library_dir;
+};
+
+BuildScriptRuntime find_build_script_runtime() {
+    const Path fallback_source(BAKE_SRC_DIR);
+    BuildScriptRuntime runtime{
+        fallback_source / "libbake" / "public" / "bake.build.cppm",
+        fallback_source / "libbake" / "src" / "cabi" / "bake_cabi.h",
+        Path(BAKE_LIB_DIR)};
+
+    Path executable = running_executable();
+    if (executable.string().empty()) return runtime;
+
+    Path prefix = executable.parent().parent();
+    Path share = prefix / "share" / "bake";
+    Path installed_wrapper = share / "bake.build.cppm";
+    Path installed_header = share / "bake_cabi.h";
+    Path installed_lib_dir = prefix / "lib";
+
+    bool has_library =
+        (installed_lib_dir / "libbake.dylib").is_regular_file() ||
+        (installed_lib_dir / "libbake.so").is_regular_file() ||
+        (installed_lib_dir / "bake.lib").is_regular_file();
+    if (installed_wrapper.is_regular_file() &&
+        installed_header.is_regular_file() && has_library) {
+        runtime.wrapper = installed_wrapper;
+        runtime.cabi_header = installed_header;
+        runtime.library_dir = installed_lib_dir;
+    }
+    return runtime;
+}
+
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(std::string name, const std::string& value)
+        : name_(std::move(name)) {
+        if (const char* previous = std::getenv(name_.c_str()))
+            previous_ = previous;
+#ifdef _WIN32
+        active_ = _putenv_s(name_.c_str(), value.c_str()) == 0;
+#else
+        active_ = ::setenv(name_.c_str(), value.c_str(), 1) == 0;
+#endif
+    }
+
+    ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
+    ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) = delete;
+
+    ~ScopedEnvironmentVariable() {
+        if (!active_) return;
+#ifdef _WIN32
+        (void)_putenv_s(name_.c_str(), previous_ ? previous_->c_str() : "");
+#else
+        if (previous_)
+            (void)::setenv(name_.c_str(), previous_->c_str(), 1);
+        else
+            (void)::unsetenv(name_.c_str());
+#endif
+    }
+
+    bool active() const { return active_; }
+
+private:
+    std::string name_;
+    std::optional<std::string> previous_;
+    bool active_ = false;
+};
+
+class ScopedBuildContext {
+public:
+    explicit ScopedBuildContext(const Layout& layout)
+        : source_root_("BAKE_INTERNAL_SOURCE_ROOT",
+                       layout.root.absolute().string()),
+          project_out_("BAKE_INTERNAL_PROJECT_OUT",
+                       layout.out_dir.absolute().string()),
+          package_name_("BAKE_INTERNAL_PACKAGE_NAME",
+                        layout.dependency_layout ? layout.package_name : "") {}
+
+    bool active() const {
+        return source_root_.active() && project_out_.active() &&
+               package_name_.active();
+    }
+
+private:
+    ScopedEnvironmentVariable source_root_;
+    ScopedEnvironmentVariable project_out_;
+    ScopedEnvironmentVariable package_name_;
+};
+
+} // namespace
 
 // ===== Argument parsing =====
 
@@ -114,6 +251,225 @@ export ParsedArgs parse_args(int argc, char* argv[]) {
     return args;
 }
 
+namespace {
+
+struct OptionOverride {
+    std::string name;
+    std::optional<std::string> value;
+};
+
+std::optional<std::vector<OptionOverride>> parse_option_overrides(
+        const ParsedArgs& args) {
+    std::vector<OptionOverride> overrides;
+    for (const auto& option : args.options) {
+        if (!starts_with(option, "--option=")) continue;
+
+        const std::string declaration = option.substr(9);
+        if (declaration.empty()) {
+            std::println(std::cerr,
+                         "bake: --option requires <name> or <name>=<value>");
+            return std::nullopt;
+        }
+
+        const size_t equals = declaration.find('=');
+        OptionOverride override;
+        override.name = declaration.substr(0, equals);
+        if (override.name.empty()) {
+            std::println(std::cerr, "bake: build option name cannot be empty");
+            return std::nullopt;
+        }
+        if (equals != std::string::npos) {
+            override.value = declaration.substr(equals + 1);
+        }
+        overrides.push_back(std::move(override));
+    }
+    return overrides;
+}
+
+std::optional<bool> parse_bool_option(std::string_view value) {
+    if (value == "true" || value == "1" || value == "on" || value == "yes")
+        return true;
+    if (value == "false" || value == "0" || value == "off" || value == "no")
+        return false;
+    return std::nullopt;
+}
+
+std::string_view build_option_type_name(BuildOption::Type type) {
+    switch (type) {
+        case BuildOption::Type::Bool: return "boolean";
+        case BuildOption::Type::Int: return "integer";
+        case BuildOption::Type::String: return "string";
+    }
+    return "unknown";
+}
+
+std::string build_option_value(const BuildOption& option) {
+    switch (option.type) {
+        case BuildOption::Type::Bool:
+            return option.bool_value ? "true" : "false";
+        case BuildOption::Type::Int:
+            return std::to_string(option.int_value);
+        case BuildOption::Type::String:
+            return nlohmann::json(option.str_value).dump();
+    }
+    return "<unknown>";
+}
+
+bool validate_dependency_options(
+        const Manifest& manifest,
+        const std::map<std::string, BuildOption>& dependency_options) {
+    const std::string package_name =
+        manifest.package && !manifest.package->name.empty()
+            ? manifest.package->name
+            : manifest.project_dir.string();
+
+    for (const auto& [name, configured] : dependency_options) {
+        auto declared = manifest.options.find(name);
+        if (declared == manifest.options.end()) {
+            std::println(
+                std::cerr,
+                "bake: dependency option '{}' is not declared by package '{}'",
+                name, package_name);
+            return false;
+        }
+        if (declared->second.type != configured.type) {
+            std::println(
+                std::cerr,
+                "bake: dependency option '{}' for package '{}' expects {}, got {}",
+                name, package_name,
+                build_option_type_name(declared->second.type),
+                build_option_type_name(configured.type));
+            return false;
+        }
+    }
+    return true;
+}
+
+std::optional<std::map<std::string, BuildOption>> effective_build_options(
+        const Manifest& manifest,
+        const std::map<std::string, BuildOption>& dependency_options,
+        const ParsedArgs* cli_args) {
+    auto options = manifest.options;
+
+    // A parent configures this package only through the options nested in its
+    // dependency declaration. Validate those values against this package's
+    // own [options] schema before evaluating its recipe.
+    if (!validate_dependency_options(manifest, dependency_options))
+        return std::nullopt;
+    for (const auto& [name, configured] : dependency_options) {
+        auto it = options.find(name);
+        it->second = configured;
+    }
+
+    if (!cli_args) return options;
+
+    auto overrides = parse_option_overrides(*cli_args);
+    if (!overrides) return std::nullopt;
+    for (const auto& override : *overrides) {
+        auto it = options.find(override.name);
+        if (it == options.end()) {
+            std::println(std::cerr,
+                         "bake: unknown build option '{}' (declare it in [options])",
+                         override.name);
+            return std::nullopt;
+        }
+
+        const auto type = it->second.type;
+        if (type == BuildOption::Type::Bool) {
+            if (!override.value) {
+                it->second = BuildOption::from_bool(true);
+                continue;
+            }
+            auto value = parse_bool_option(*override.value);
+            if (!value) {
+                std::println(std::cerr,
+                             "bake: option '{}' expects a boolean, got '{}'",
+                             override.name, *override.value);
+                return std::nullopt;
+            }
+            it->second = BuildOption::from_bool(*value);
+        } else if (type == BuildOption::Type::Int) {
+            if (!override.value || override.value->empty()) {
+                std::println(std::cerr,
+                             "bake: option '{}' expects an integer value",
+                             override.name);
+                return std::nullopt;
+            }
+            int64_t value = 0;
+            const char* first = override.value->data();
+            const char* last = first + override.value->size();
+            auto [end, error] = std::from_chars(first, last, value);
+            if (error != std::errc{} || end != last) {
+                std::println(std::cerr,
+                             "bake: option '{}' expects an integer, got '{}'",
+                             override.name, *override.value);
+                return std::nullopt;
+            }
+            it->second = BuildOption::from_int(value);
+        } else {
+            if (!override.value) {
+                std::println(std::cerr,
+                             "bake: option '{}' expects a string value",
+                             override.name);
+                return std::nullopt;
+            }
+            it->second = BuildOption::from_string(*override.value);
+        }
+    }
+    return options;
+}
+
+bool validate_option_names(const Manifest& manifest, const ParsedArgs& args) {
+    auto overrides = parse_option_overrides(args);
+    if (!overrides) return false;
+
+    for (const auto& override : *overrides) {
+        if (!manifest.options.contains(override.name)) {
+            std::println(std::cerr,
+                         "bake: unknown build option '{}' (declare it in [options])",
+                         override.name);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool write_effective_options(const Layout& layout, const Manifest& manifest,
+                             const ParsedArgs& args,
+                             const std::map<std::string, BuildOption>&
+                                 dependency_options,
+                             bool apply_cli_options) {
+    auto options = effective_build_options(
+        manifest, dependency_options, apply_cli_options ? &args : nullptr);
+    if (!options) return false;
+
+    nlohmann::json document;
+    document["schema"] = 1;
+    document["options"] = nlohmann::json::object();
+    for (const auto& [name, option] : *options) {
+        switch (option.type) {
+            case BuildOption::Type::Bool:
+                document["options"][name] = option.bool_value;
+                break;
+            case BuildOption::Type::Int:
+                document["options"][name] = option.int_value;
+                break;
+            case BuildOption::Type::String:
+                document["options"][name] = option.str_value;
+                break;
+        }
+    }
+
+    const Path path = layout.bake_dir / "options.json";
+    if (!atomic_write_file(path, document.dump(2))) {
+        std::println(std::cerr, "bake: failed to write {}", path.string());
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 // ===== Help text =====
 
 export void print_version() {
@@ -165,7 +521,7 @@ export void print_command_help(std::string_view cmd) {
             "\n"
             "OPTIONS:\n"
             "    --type <executable|static-lib|shared-lib>  Package type (default: executable)\n"
-            "    --std <c++17|c++20|c++23>                  C++ standard (default: c++20)\n"
+            "    --std <c11|c17|c23|c++17|c++20|c++23>      Language standard (default: c++20)\n"
             "\n"
             "If [name] is omitted, scaffolds in the current directory."
         );
@@ -258,23 +614,34 @@ export int cmd_init(const ParsedArgs& args) {
 
     write_file(target_dir / "bake.toml", toml_content);
 
-    // Write source file
+    // Write source file. A C standard requests a genuine C scaffold.
+    const bool use_c = is_c_standard(std_ver);
     if (pkg_type == PackageType::Executable) {
-        std::string main_cpp = std::string(
-            "#include <iostream>\n\n"
-            "int main() {\n"
-            "    std::cout << \"Hello from " + project_name + "!\\n\";\n"
-            "    return 0;\n"
-            "}\n"
-        );
-        write_file(target_dir / "src" / "main.cpp", main_cpp);
+        if (use_c) {
+            std::string main_c = std::string(
+                "#include <stdio.h>\n\n"
+                "int main(void) {\n"
+                "    puts(\"Hello from " + project_name + "!\");\n"
+                "    return 0;\n"
+                "}\n"
+            );
+            write_file(target_dir / "src" / "main.c", main_c);
+        } else {
+            std::string main_cpp = std::string(
+                "#include <iostream>\n\n"
+                "int main() {\n"
+                "    std::cout << \"Hello from " + project_name + "!\\n\";\n"
+                "    return 0;\n"
+                "}\n"
+            );
+            write_file(target_dir / "src" / "main.cpp", main_cpp);
+        }
     } else {
-        std::string lib_cpp = std::string(
+        std::string lib_source = std::string(
             "// " + project_name + " library\n\n"
             "// Define your library functions here\n"
         );
-        std::string filename = (pkg_type == PackageType::StaticLib) ? "lib.cpp" : "lib.cpp";
-        write_file(target_dir / "src" / filename, lib_cpp);
+        write_file(target_dir / "src" / (use_c ? "lib.c" : "lib.cpp"), lib_source);
 
         // Public header
         std::string public_dir = "public/" + project_name;
@@ -283,14 +650,12 @@ export int cmd_init(const ParsedArgs& args) {
             "#pragma once\n\n"
             "// " + project_name + " public API\n"
         );
-        write_file(target_dir / public_dir / (project_name + ".hpp"), header);
+        write_file(target_dir / public_dir / (project_name + (use_c ? ".h" : ".hpp")), header);
     }
 
     // Write .gitignore
     write_file(target_dir / ".gitignore",
-        "/.bake/\n"
-        "/build/\n"
-        "/artifacts/\n"
+        "/out/\n"
         "compile_commands.json\n"
     );
 
@@ -308,23 +673,14 @@ export int cmd_init(const ParsedArgs& args) {
 
 // ===== build.cpp compilation + execution =====
 
-// Ensure the libc++ std module PCM is built and cached.
-// Returns the path to the cached std.pcm, or an empty Path on failure.
+// Ensure the libc++ std module PCM is built in this project's output tree.
+// Returns the path to std.pcm, or an empty Path on failure.
 // For Clang only — GCC handles import std via its gcm cache.
-export Path ensure_std_pcm(const Toolchain& tc) {
+export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     if (!tc.is_clang()) return Path();
 
-    // Cache dir: ~/.cache/bake/ (parent of src/, which holds package sources)
-    Path pcm_cache;
-#ifdef _WIN32
-    const char* home = std::getenv("LOCALAPPDATA");
-    if (!home) home = "C:\\";
-    pcm_cache = Path(home) / "bake";
-#else
-    const char* home = std::getenv("HOME");
-    if (!home) home = "/tmp";
-    pcm_cache = Path(home) / ".cache" / "bake";
-#endif
+    // The global Bake cache is reserved for immutable downloaded sources.
+    Path pcm_cache = project_out / ".bmi" / ".std";
     pcm_cache.mkdir_recursive();
 
     // Cache key: hash of compiler path + version output
@@ -370,14 +726,28 @@ export Path ensure_std_pcm(const Toolchain& tc) {
 }
 
 
-export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
+export int build_with_build_cpp(
+        const Layout& layout, const ParsedArgs& args,
+        const std::map<std::string, BuildOption>& dependency_options = {},
+        bool apply_cli_options = true) {
+    const Path& root = layout.root;
     auto tc = Toolchain::detect();
-    Path bake_dir = root / ".bake";
+    auto runtime = find_build_script_runtime();
+    Path bake_dir = layout.bake_dir;
     bake_dir.mkdir_recursive();
 
+    auto manifest = Manifest::load(root);
+    if (!manifest) {
+        std::println(std::cerr, "bake: failed to load {}", (root / "bake.toml").string());
+        return 1;
+    }
+    if (!write_effective_options(layout, *manifest, args, dependency_options,
+                                 apply_cli_options))
+        return 1;
+
     Path build_cpp = root / "build.cpp";
-    Path wrapper_src = Path(BAKE_SRC_DIR) / "libbake" / "public" / "bake.build.cppm";
-    Path cabi_header = Path(BAKE_SRC_DIR) / "libbake" / "src" / "cabi" / "bake_cabi.h";
+    Path wrapper_src = runtime.wrapper;
+    Path cabi_header = runtime.cabi_header;
 
     // Copy wrapper + header to .bake/
     Path wrapper_dst = bake_dir / "bake.build.cppm";
@@ -391,8 +761,8 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     write_file(wrapper_dst, *wrapper_content);
     write_file(cabi_dst, *cabi_content);
 
-    // Pre-build the libc++ std module PCM (cached, one-time per compiler).
-    auto std_pcm = ensure_std_pcm(tc);
+    // Pre-build the libc++ std module PCM (one-time per project/compiler).
+    auto std_pcm = ensure_std_pcm(tc, layout.out_dir);
 
     // Step 1: Compile wrapper module → BMI + .o
     Path pcm = bake_dir / "bake.build.pcm";
@@ -473,11 +843,11 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
         cmd.push_back(build_o.string());
 #ifdef _WIN32
         // Windows: link against the import library directly
-        cmd.push_back(std::string(BAKE_LIB_DIR) + "/bake.lib");
+        cmd.push_back((runtime.library_dir / "bake.lib").string());
 #else
-        cmd.push_back("-L" + std::string(BAKE_LIB_DIR));
+        cmd.push_back("-L" + runtime.library_dir.string());
         cmd.push_back("-lbake");
-        cmd.push_back("-Wl,-rpath," + std::string(BAKE_LIB_DIR));
+        cmd.push_back("-Wl,-rpath," + runtime.library_dir.string());
 #endif
         cmd.push_back("-o");
         cmd.push_back(build_app.string());
@@ -492,6 +862,12 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
 
     // Step 4: Run build_app → .bake/build.json
     {
+        ScopedBuildContext context(layout);
+        if (!context.active()) {
+            std::println(std::cerr,
+                         "bake: failed to establish build script context");
+            return 1;
+        }
         auto result = run_process({build_app.string()}, root, true);
         if (!result.success()) {
             std::print(std::cerr, "{}", result.stderr_output);
@@ -510,7 +886,11 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
     auto plan = read_build_json(build_json, root);
 
     // Write compile_commands.json
-    write_compile_commands(plan, root / "compile_commands.json");
+    write_compile_commands(
+        plan,
+        layout.dependency_layout
+            ? layout.package_dir / "compile_commands.json"
+            : root / "compile_commands.json");
 
     // Get job count
     int jobs = 0;
@@ -527,14 +907,37 @@ export int build_with_build_cpp(const Path& root, const ParsedArgs& args) {
 // or was successfully (re)resolved. Returns non-zero on failure.
 // On success, root/bake.lock is guaranteed to exist and be consistent.
 // Cache integrity is verified on ALL builds to detect tampering.
-export int enforce_lock(const Path& root, const Manifest& manifest, const ParsedArgs& args) {
+export int enforce_lock(const Path& root, const Manifest& manifest,
+                        const ParsedArgs& args,
+                        const Path& package_lock_path = {}) {
     if (Lockfile::has_only_path_deps(manifest)) return 0;
 
     bool offline = args.has_option("offline") || args.has_option("frozen");
     bool locked = args.has_option("locked") || args.has_option("frozen");
 
-    Path lock_path = root / "bake.lock";
-    auto lockfile = Lockfile::load(lock_path);
+    const bool isolated_package_lock =
+        !package_lock_path.string().empty();
+    Path lock_path = isolated_package_lock
+        ? package_lock_path
+        : root / "bake.lock";
+
+    std::optional<Lockfile> lockfile;
+    bool save_selected_lock = false;
+    if (isolated_package_lock) {
+        // A versioned lock beside a path package is immutable input. Copy its
+        // resolved graph into this consumer's out tree; never update the
+        // dependency source directory. If it is absent/stale, reuse a valid
+        // consumer-local resolution before going to the network.
+        auto source_lock = Lockfile::load(root / "bake.lock");
+        if (source_lock && source_lock->is_consistent(manifest)) {
+            lockfile = std::move(source_lock);
+            save_selected_lock = true;
+        } else {
+            lockfile = Lockfile::load(lock_path);
+        }
+    } else {
+        lockfile = Lockfile::load(lock_path);
+    }
 
     bool needs_resolve = false;
     if (!lockfile) {
@@ -566,7 +969,15 @@ export int enforce_lock(const Path& root, const Manifest& manifest, const Parsed
         }
     }
 
-    if (!needs_resolve) return 0;
+    if (!needs_resolve) {
+        if (save_selected_lock && lockfile && !lockfile->save(lock_path)) {
+            std::println(std::cerr,
+                         "bake: failed to write package lock state at {}",
+                         lock_path.string());
+            return 1;
+        }
+        return 0;
+    }
 
     if (locked) {
         std::println(std::cerr, "bake: lock file missing or stale (--locked)");
@@ -589,6 +1000,327 @@ export int enforce_lock(const Path& root, const Manifest& manifest, const Parsed
     }
     std::println("bake: dependencies resolved and locked");
     return 0;
+}
+
+struct PathMetaOptionRequest {
+    BuildOption value;
+    std::string dependency_path;
+};
+
+struct PathMetaPackage {
+    Path root;
+    Manifest manifest;
+    std::string name;
+    std::map<std::string, PathMetaOptionRequest> option_requests;
+};
+
+struct PathMetaGraph {
+    std::map<std::string, PathMetaPackage> packages;
+    std::map<std::string, std::string> package_sources;
+    std::map<std::string, int> visit_state; // 0=unseen, 1=visiting, 2=done
+    std::vector<std::string> build_order;
+};
+
+std::string format_dependency_path(const std::vector<std::string>& path) {
+    std::string result;
+    for (const auto& component : path) {
+        if (!result.empty()) result += " -> ";
+        result += component;
+    }
+    return result;
+}
+
+std::string manifest_package_name(const Manifest& manifest) {
+    if (manifest.package && !manifest.package->name.empty())
+        return manifest.package->name;
+    auto filename = manifest.project_dir.filename_string();
+    return filename.empty() ? manifest.project_dir.string() : filename;
+}
+
+bool valid_package_output_name(std::string_view name) {
+    if (name.empty() || name == "." || name == "..") return false;
+    for (const unsigned char c : name) {
+        const bool ascii_alnum = (c >= 'a' && c <= 'z') ||
+                                 (c >= 'A' && c <= 'Z') ||
+                                 (c >= '0' && c <= '9');
+        if (!ascii_alnum && c != '-' && c != '_' && c != '.') return false;
+    }
+    return true;
+}
+
+// First collect the complete path-package graph and unify every explicit
+// option request. Defaults are deliberately not constraints: they are applied
+// only after all incoming dependency edges have been considered.
+int collect_path_meta_dependencies(
+    const Manifest& manifest,
+    const std::vector<std::string>& parent_path,
+    PathMetaGraph& graph) {
+    for (const auto& [name, dep] : manifest.dependencies) {
+        if (!dep.is_path_dep) continue;
+
+        Path dep_root = manifest.project_dir / dep.path;
+        auto dep_manifest = Manifest::load(dep_root);
+        if (!dep_manifest) continue; // raw path source, not a Bake package
+
+        Path dep_build_cpp = dep_root / "build.cpp";
+        if (!dep_build_cpp.is_regular_file()) continue;
+
+        std::error_code ec;
+        auto canonical = std::filesystem::weakly_canonical(dep_root.fs(), ec);
+        const std::string key = ec
+            ? std::filesystem::absolute(dep_root.fs()).lexically_normal().string()
+            : canonical.string();
+
+        if (!validate_dependency_options(*dep_manifest, dep.options)) return 1;
+
+        auto [package_it, inserted] = graph.packages.try_emplace(key);
+        auto& package = package_it->second;
+        if (inserted) {
+            package.root = dep_root;
+            package.manifest = *dep_manifest;
+            package.name = manifest_package_name(*dep_manifest);
+            if (!valid_package_output_name(package.name)) {
+                std::println(
+                    std::cerr,
+                    "bake: package name '{}' cannot be used as an output directory",
+                    package.name);
+                return 1;
+            }
+            auto [source_it, source_inserted] =
+                graph.package_sources.try_emplace(package.name, key);
+            if (!source_inserted && source_it->second != key) {
+                std::println(
+                    std::cerr,
+                    "bake: package name conflict: '{}' refers to both {} and {}",
+                    package.name, source_it->second, key);
+                return 1;
+            }
+        }
+
+        auto request_path = parent_path;
+        request_path.push_back(name);
+        const std::string formatted_path =
+            format_dependency_path(request_path);
+
+        for (const auto& [option_name, requested_value] : dep.options) {
+            auto [request_it, request_inserted] =
+                package.option_requests.try_emplace(
+                    option_name,
+                    PathMetaOptionRequest{requested_value, formatted_path});
+            if (!request_inserted &&
+                request_it->second.value != requested_value) {
+                std::println(
+                    std::cerr,
+                    "bake: option conflict for package '{}':\n"
+                    "  option '{}' requested as {} by {}\n"
+                    "  option '{}' requested as {} by {}\n"
+                    "  one project builds one option configuration per package",
+                    package.name,
+                    option_name,
+                    build_option_value(request_it->second.value),
+                    request_it->second.dependency_path,
+                    option_name,
+                    build_option_value(requested_value),
+                    formatted_path);
+                return 1;
+            }
+        }
+
+        int& state = graph.visit_state[key];
+        if (state == 2) continue;
+        if (state == 1) {
+            std::println(std::cerr,
+                         "bake: cycle in path meta packages: {}",
+                         formatted_path);
+            return 1;
+        }
+        state = 1;
+
+        if (int rc = collect_path_meta_dependencies(
+                package.manifest, request_path, graph); rc != 0) {
+            return rc;
+        }
+        state = 2;
+        graph.build_order.push_back(key);
+    }
+    return 0;
+}
+
+int build_path_meta_dependencies(
+        const std::vector<const Manifest*>& manifests,
+        const ParsedArgs& args,
+        const Path& project_out) {
+    PathMetaGraph graph;
+    for (const Manifest* manifest : manifests) {
+        if (!manifest) continue;
+        if (int rc = collect_path_meta_dependencies(
+                *manifest, {manifest_package_name(*manifest)}, graph); rc != 0) {
+            return rc;
+        }
+    }
+
+    for (const auto& key : graph.build_order) {
+        auto& package = graph.packages.at(key);
+        std::map<std::string, BuildOption> configured;
+        for (const auto& [name, request] : package.option_requests)
+            configured.emplace(name, request.value);
+
+        auto layout = Layout::for_dependency(
+            package.root, project_out, package.name);
+        if (int rc = enforce_lock(
+                package.root, package.manifest, args,
+                layout.bake_dir / "bake.lock"); rc != 0) {
+            return rc;
+        }
+
+        std::println("bake: building dependency '{}'", package.name);
+        if (int rc = build_with_build_cpp(layout, args, configured,
+                                          /*apply_cli_options=*/false);
+            rc != 0) {
+            std::println(std::cerr,
+                         "bake: failed to build dependency '{}'",
+                         package.name);
+            return rc;
+        }
+    }
+    return 0;
+}
+
+int build_path_meta_dependencies(const Manifest& manifest,
+                                 const ParsedArgs& args,
+                                 const Path& project_out) {
+    return build_path_meta_dependencies(
+        std::vector<const Manifest*>{&manifest}, args, project_out);
+}
+
+std::optional<std::vector<PackageUsageRequirements>>
+load_path_meta_package_requirements(const Manifest& manifest,
+                                    const Path& project_out) {
+    std::vector<PackageUsageRequirements> result;
+
+    for (const auto& [name, dependency] : manifest.dependencies) {
+        if (!dependency.is_path_dep) continue;
+
+        const Path dependency_root = manifest.project_dir / dependency.path;
+        auto dependency_manifest = Manifest::load(dependency_root);
+        if (!dependency_manifest) continue; // raw path source
+
+        // Convention-only path packages in a workspace are linked by the
+        // workspace builder today. A package with build.cpp, however, must be
+        // consumed through its exported metadata and never recompiled here.
+        if (!(dependency_root / "build.cpp").is_regular_file()) continue;
+
+        const std::string package_name =
+            manifest_package_name(*dependency_manifest);
+        const Path metadata_path =
+            project_out / ".pkgs" / package_name / "package.json";
+        auto content = read_file(metadata_path);
+        if (!content) {
+            std::println(
+                std::cerr,
+                "bake: dependency '{}' did not produce package metadata at {}",
+                name, metadata_path.string());
+            return std::nullopt;
+        }
+
+        try {
+            auto metadata = nlohmann::json::parse(*content);
+            if (!metadata.is_object() || metadata.value("schema", 0) != 1) {
+                std::println(
+                    std::cerr,
+                    "bake: dependency '{}' has unsupported package metadata at {}",
+                    name, metadata_path.string());
+                return std::nullopt;
+            }
+
+            PackageUsageRequirements requirements;
+            requirements.dependency_name = name;
+
+            auto read_paths = [&](std::string_view field,
+                                  std::vector<Path>& destination) -> bool {
+                const std::string key(field);
+                if (!metadata.contains(key)) return true;
+                const auto& values = metadata.at(key);
+                if (!values.is_array()) return false;
+                for (const auto& value : values) {
+                    if (!value.is_string()) return false;
+                    destination.emplace_back(value.get<std::string>());
+                }
+                return true;
+            };
+
+            auto read_strings = [&](std::string_view field,
+                                    std::vector<std::string>& destination)
+                    -> bool {
+                const std::string key(field);
+                if (!metadata.contains(key)) return true;
+                const auto& values = metadata.at(key);
+                if (!values.is_array()) return false;
+                for (const auto& value : values) {
+                    if (!value.is_string()) return false;
+                    destination.push_back(value.get<std::string>());
+                }
+                return true;
+            };
+
+            if (!read_paths("include_dirs", requirements.include_dirs) ||
+                !read_paths("link_inputs", requirements.link_inputs) ||
+                !read_strings("system_libs", requirements.system_libs) ||
+                !read_strings("frameworks", requirements.frameworks)) {
+                std::println(
+                    std::cerr,
+                    "bake: dependency '{}' has malformed package metadata at {}",
+                    name, metadata_path.string());
+                return std::nullopt;
+            }
+
+            if (metadata.contains("defines")) {
+                const auto& defines = metadata.at("defines");
+                if (!defines.is_array()) {
+                    std::println(
+                        std::cerr,
+                        "bake: dependency '{}' has malformed package metadata at {}",
+                        name, metadata_path.string());
+                    return std::nullopt;
+                }
+                for (const auto& define : defines) {
+                    if (!define.is_object() ||
+                        !define.contains("name") ||
+                        !define.at("name").is_string() ||
+                        (define.contains("value") &&
+                         !define.at("value").is_string())) {
+                        std::println(
+                            std::cerr,
+                            "bake: dependency '{}' has malformed package metadata at {}",
+                            name, metadata_path.string());
+                        return std::nullopt;
+                    }
+                    requirements.defines.push_back({
+                        define.at("name").get<std::string>(),
+                        define.value("value", std::string{})});
+                }
+            }
+
+            if (metadata.contains("uses_cxx") &&
+                !metadata.at("uses_cxx").is_boolean()) {
+                std::println(
+                    std::cerr,
+                    "bake: dependency '{}' has malformed package metadata at {}",
+                    name, metadata_path.string());
+                return std::nullopt;
+            }
+            requirements.uses_cxx = metadata.value("uses_cxx", false);
+            result.push_back(std::move(requirements));
+        } catch (const std::exception& error) {
+            std::println(
+                std::cerr,
+                "bake: cannot read package metadata for dependency '{}': {}",
+                name, error.what());
+            return std::nullopt;
+        }
+    }
+
+    return result;
 }
 
 // ===== Dep source extraction (bridges bake.package types to bake.engine types) =====
@@ -699,18 +1431,25 @@ export int cmd_build(const ParsedArgs& args) {
         return 1;
     }
 
+    if (!validate_option_names(*manifest, args)) return 1;
+
     // ===== Lock enforcement (before build.cpp so --locked/--frozen work universally)
     if (int rc = enforce_lock(*root, *manifest, args); rc != 0) return rc;
 
     // Check for build.cpp (escape hatch mode)
     Path build_cpp = *root / "build.cpp";
     if (build_cpp.is_regular_file()) {
-        return build_with_build_cpp(*root, args);
+        auto layout = Layout::detect(*root);
+        if (int rc = build_path_meta_dependencies(
+                *manifest, args, layout.out_dir); rc != 0)
+            return rc;
+        return build_with_build_cpp(layout, args);
     }
 
     // Handle workspace: build all members with inter-member deps
     if (manifest->is_workspace()) {
         int result = 0;
+        const Path project_out = Layout::detect(*root).out_dir;
         int jobs = 0;
         if (auto j = args.get_option("j")) {
             jobs = std::atoi(j->c_str());
@@ -775,8 +1514,31 @@ export int cmd_build(const ParsedArgs& args) {
         };
         std::vector<BuiltMember> built;
 
-        // Pre-build std module PCM once for all members (cached, one-time)
-        auto std_pcm = ensure_std_pcm(Toolchain::detect());
+        // Build the std module lazily: an all-C workspace must not require a
+        // C++ standard library module at all.
+        Path std_pcm;
+
+        // A workspace owns one dependency package graph. Collect every
+        // selected member's requests before building any path meta package so
+        // one package cannot be overwritten by a later member's options.
+        std::vector<Manifest> selected_member_manifests;
+        for (const auto& member : manifest->workspace->members) {
+            auto member_manifest = Manifest::load(*root / member);
+            if (!member_manifest || !member_manifest->has_package()) continue;
+            if (auto p = args.get_option("p");
+                p && *p != member_manifest->package->name) {
+                continue;
+            }
+            selected_member_manifests.push_back(std::move(*member_manifest));
+        }
+        std::vector<const Manifest*> selected_member_refs;
+        selected_member_refs.reserve(selected_member_manifests.size());
+        for (const auto& selected : selected_member_manifests)
+            selected_member_refs.push_back(&selected);
+        if (int rc = build_path_meta_dependencies(
+                selected_member_refs, args, project_out); rc != 0) {
+            return rc;
+        }
 
         for (auto& member : manifest->workspace->members) {
             Path member_dir = *root / member;
@@ -791,15 +1553,27 @@ export int cmd_build(const ParsedArgs& args) {
                 if (*p != member_manifest->package->name) continue;
             }
 
+            auto member_package_requirements =
+                load_path_meta_package_requirements(
+                    *member_manifest, project_out);
+            if (!member_package_requirements) return 1;
+
             std::println("bake: building '{}'", member_manifest->package->name);
             auto layout = Layout::detect(member_dir, *root);
             auto tc = Toolchain::detect();
+            Path member_std_pcm;
+            if (!is_c_standard(member_manifest->package->std_version)) {
+                if (!std_pcm.is_regular_file())
+                    std_pcm = ensure_std_pcm(tc, layout.out_dir);
+                member_std_pcm = std_pcm;
+            }
 
             auto plan = create_convention_plan(*member_manifest, layout, tc,
                                                 member_manifest->options,
                                                 dep_sources, dep_include_dirs,
                                                 /*compile_path_deps=*/false,
-                                                std_pcm);
+                                                member_std_pcm,
+                                                *member_package_requirements);
 
             // Inject external modules from built dependencies
             for (auto& action : plan.actions) {
@@ -878,14 +1652,26 @@ export int cmd_build(const ParsedArgs& args) {
         return 1;
     }
 
-    // Single package build
     auto layout = Layout::detect(*root);
+    if (int rc = build_path_meta_dependencies(
+            *manifest, args, layout.out_dir); rc != 0)
+        return rc;
+    auto package_requirements =
+        load_path_meta_package_requirements(*manifest, layout.out_dir);
+    if (!package_requirements) return 1;
+
+    // Single package build
     auto tc = Toolchain::detect();
 
-    std::println("bake: detected {} ({})", tc.kind_name(), tc.cxx_path);
+    const bool package_uses_c = is_c_standard(manifest->package->std_version);
+    std::println("bake: detected {} ({})", tc.kind_name(),
+                 package_uses_c ? tc.cc_path : tc.cxx_path);
 
-    // Pre-build std module PCM for import std support (cached, one-time)
-    auto std_pcm = ensure_std_pcm(tc);
+    // A pure C package must not depend on libc++'s std module.
+    Path std_pcm;
+    if (!package_uses_c) {
+        std_pcm = ensure_std_pcm(tc, layout.out_dir);
+    }
 
     // Extract dep sources + include dirs from lockfile
     std::vector<DepSourceEntry> dep_sources;
@@ -896,27 +1682,15 @@ export int cmd_build(const ParsedArgs& args) {
                          dep_sources, dep_include_dirs);
     }
 
-    // Apply option overrides
-    auto options = manifest->options;
-    for (auto& opt : args.options) {
-        if (starts_with(opt, "--option=") || opt == "--option") {
-            std::string val = starts_with(opt, "--option=") ? opt.substr(9) : "";
-            if (val.empty()) continue;
-            size_t eq = val.find('=');
-            std::string name = (eq == std::string::npos) ? val : val.substr(0, eq);
-            std::string value = (eq == std::string::npos) ? "" : val.substr(eq + 1);
-            if (!value.empty()) {
-                options[name] = BuildOption::from_string(value);
-            } else {
-                options[name] = BuildOption::from_bool(true);
-            }
-        }
-    }
+    // Apply type-preserving option overrides.
+    auto options = effective_build_options(*manifest, {}, &args);
+    if (!options) return 1;
 
-    auto plan = create_convention_plan(*manifest, layout, tc, options,
+    auto plan = create_convention_plan(*manifest, layout, tc, *options,
                                         dep_sources, dep_include_dirs,
                                         /*compile_path_deps=*/true,
-                                        std_pcm);
+                                        std_pcm,
+                                        *package_requirements);
 
     // Write compile_commands.json
     write_compile_commands(plan, *root / "compile_commands.json");
@@ -949,27 +1723,6 @@ export int cmd_clean(const ParsedArgs& args) {
         removed++;
     }
 
-    // Remove .bake/ (build script staging) for root and workspace members
-    auto manifest = Manifest::load(*root);
-    if (manifest && manifest->is_workspace()) {
-        for (auto& member : manifest->workspace->members) {
-            Path member_dir = *root / member;
-            Path member_bake = member_dir / ".bake";
-            if (member_bake.exists()) {
-                member_bake.remove_all();
-                std::println("Removed {}", member_bake.string());
-                removed++;
-            }
-        }
-    } else {
-        Path bake_dir = *root / ".bake";
-        if (bake_dir.exists()) {
-            bake_dir.remove_all();
-            std::println("Removed {}", bake_dir.string());
-            removed++;
-        }
-    }
-
     if (removed == 0) {
         std::println("Nothing to clean");
     }
@@ -991,12 +1744,15 @@ export int cmd_run(const ParsedArgs& args) {
     Path exe_path;
 
     // If build.cpp was used, read primary output from build.json
-    Path build_json = *root / ".bake" / "build.json";
+    auto root_layout = Layout::detect(*root);
+    Path build_json = root_layout.bake_dir / "build.json";
     Path build_cpp = *root / "build.cpp";
     if (build_cpp.is_regular_file() && build_json.is_regular_file()) {
         auto plan = read_build_json(build_json, *root);
         if (plan.primary_output.string() != "") {
-            exe_path = *root / plan.primary_output;
+            exe_path = plan.primary_output.fs().is_absolute()
+                ? plan.primary_output
+                : *root / plan.primary_output;
         }
     }
 

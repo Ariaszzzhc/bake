@@ -75,12 +75,16 @@ static CmdResult run_cmd(const std::string& cmd, const fs::path& cwd) {
     return result;
 }
 
-static CmdResult run_bake(const std::string& args, const fs::path& cwd) {
-    std::string env_prefix;
+static CmdResult run_bake(const std::string& args, const fs::path& cwd,
+                          const std::string& extra_env = {}) {
+    std::string env_prefix = extra_env;
+    if (!env_prefix.empty() && env_prefix.back() != ' ') {
+        env_prefix += ' ';
+    }
 #ifdef __APPLE__
     // Ensure the test binary can find libbake at runtime.
     fs::path lib_dir = fs::path(g_bake_bin).parent_path();
-    env_prefix = "DYLD_LIBRARY_PATH=" + lib_dir.string() + " ";
+    env_prefix += "DYLD_LIBRARY_PATH=" + lib_dir.string() + " ";
 #endif
     return run_cmd(env_prefix + g_bake_bin + " " + args, cwd);
 }
@@ -110,6 +114,20 @@ static void write_file(const fs::path& path, std::string_view content) {
     if (!f) { perror("fopen"); return; }
     fwrite(content.data(), 1, content.size(), f);
     fclose(f);
+}
+
+static std::string read_file(const fs::path& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return {};
+
+    std::string content;
+    char buffer[4096];
+    size_t count = 0;
+    while ((count = fread(buffer, 1, sizeof(buffer), f)) != 0) {
+        content.append(buffer, count);
+    }
+    fclose(f);
+    return content;
 }
 
 // ----------------------------------------------------------------
@@ -148,6 +166,29 @@ TestResult test_static_lib_build() {
         }
     }
     CHECK(found, "static library (.a) not found in out/lib/");
+
+    return {};
+}
+
+// Build a genuine C17 executable. C-only syntax keeps this from silently
+// passing when a C++ driver treats .c input as C++.
+TestResult test_pure_c_build() {
+    auto dir = make_temp_dir("pure_c");
+    copy_fixture("pure_c", dir);
+
+    auto r = run_bake("build", dir);
+    CHECK(r.success(), "bake build failed for pure C project: " + r.stdout);
+
+    fs::path exe = dir / "out" / "bin" / "pure-c";
+    CHECK(fs::exists(exe), "pure C executable not found at out/bin/pure-c");
+
+    auto run = run_cmd(exe.string(), dir);
+    CHECK_EQ(run.exit_code, 0,
+             "pure C executable returned non-zero: " + std::to_string(run.exit_code));
+
+    auto compile_commands = read_file(dir / "compile_commands.json");
+    CHECK(compile_commands.find("-std=c17") != std::string::npos,
+          "pure C compile command does not select C17: " + compile_commands);
 
     return {};
 }
@@ -288,7 +329,8 @@ TestResult test_unified_output_layout() {
 
     // Old layout should not exist
     CHECK(!fs::exists(dir / "build"), "old build/ directory should not exist");
-    CHECK(!fs::exists(dir / ".bake" / "obj"), "old .bake/obj/ should not exist");
+    CHECK(fs::is_directory(dir / "out" / ".obj"), "out/.obj/ not created");
+    CHECK(!fs::exists(dir / ".bake"), "project-root .bake/ should not exist");
 
     return {};
 }
@@ -324,6 +366,29 @@ TestResult test_init() {
     // The generated project should be buildable
     auto r2 = run_bake("build", dir);
     CHECK(r2.success(), "generated project failed to build: " + r2.stdout);
+
+    return {};
+}
+
+// bake init should produce a real C project when given a C standard.
+TestResult test_init_c() {
+    auto dir = make_temp_dir("init_c_test");
+
+    auto r = run_bake("init --type executable --std c17", dir);
+    CHECK(r.success(), "bake init --std c17 failed: " + r.stdout);
+    CHECK(fs::exists(dir / "src" / "main.c"),
+          "C scaffold did not create src/main.c");
+    CHECK(!fs::exists(dir / "src" / "main.cpp"),
+          "C scaffold unexpectedly created src/main.cpp");
+
+    auto build = run_bake("build", dir);
+    CHECK(build.success(), "generated C project failed to build: " + build.stdout);
+
+    fs::path exe = dir / "out" / "bin" / dir.filename();
+    CHECK(fs::exists(exe), "generated C executable was not created");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK_EQ(run.exit_code, 0,
+             "generated C executable returned non-zero: " + std::to_string(run.exit_code));
 
     return {};
 }
@@ -519,10 +584,10 @@ TestResult test_workspace_unified_output() {
     CHECK(fs::is_directory(dir / "out" / "lib"), "out/lib/ should exist");
 
     // Check per-member obj directories
-    CHECK(fs::is_directory(dir / "out" / "obj" / "mylib"),
-          "out/obj/mylib/ should exist for workspace member");
-    CHECK(fs::is_directory(dir / "out" / "obj" / "app"),
-          "out/obj/app/ should exist for workspace member");
+    CHECK(fs::is_directory(dir / "out" / ".obj" / "mylib"),
+          "out/.obj/mylib/ should exist for workspace member");
+    CHECK(fs::is_directory(dir / "out" / ".obj" / "app"),
+          "out/.obj/app/ should exist for workspace member");
 
     // Verify executable runs
     fs::path exe = dir / "out" / "bin" / "app";
@@ -530,6 +595,38 @@ TestResult test_workspace_unified_output() {
     auto run = run_cmd(exe.string(), dir);
     CHECK_EQ(run.exit_code, 0,
              "workspace exe returned non-zero: " + std::to_string(run.exit_code));
+
+    auto conflict_dir = make_temp_dir("ws_meta_option_conflict");
+    fs::copy(fs::path(g_fixture_root) / "build_cpp_meta_dep" / "base",
+             conflict_dir / "base",
+             fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+    write_file(conflict_dir / "bake.toml",
+        "[workspace]\n"
+        "members = [\"a\", \"b\"]\n");
+    write_file(conflict_dir / "a" / "bake.toml",
+        "[package]\n"
+        "name = \"member-a\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"static-lib\"\n\n"
+        "[dependencies]\n"
+        "base = { path = \"../base\", options = { tls = \"mbedtls\" } }\n");
+    write_file(conflict_dir / "b" / "bake.toml",
+        "[package]\n"
+        "name = \"member-b\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"static-lib\"\n\n"
+        "[dependencies]\n"
+        "base = { path = \"../base\", options = { tls = \"wolfssl\" } }\n");
+
+    auto conflict = run_bake("build", conflict_dir);
+    CHECK(!conflict.success(),
+          "workspace members must not build two configurations of one package");
+    CHECK(conflict.stdout.find("option conflict for package 'base'") !=
+              std::string::npos &&
+          conflict.stdout.find("member-a -> base") != std::string::npos &&
+          conflict.stdout.find("member-b -> base") != std::string::npos,
+          "workspace option conflict did not identify both members: " +
+              conflict.stdout);
 
     return {};
 }
@@ -556,24 +653,362 @@ TestResult test_workspace_member_filter() {
     return {};
 }
 
-// build.cpp can resolve a declared source dependency without knowing or
-// invoking any foreign build system.
-TestResult test_build_cpp_dependency_src_dir() {
-    auto dir = make_temp_dir("build_cpp_dep_src");
-    copy_fixture("build_cpp_dep_src", dir);
+// A convention-mode consumer needs only bake.toml and src/. Bake must build
+// each Bake-native dependency's own recipe and automatically consume its
+// exported usage requirements; the consumer must not need build.cpp glue.
+TestResult test_convention_meta_dependency() {
+    auto dir = make_temp_dir("build_cpp_meta_dep");
+    copy_fixture("build_cpp_meta_dep", dir);
 
-    auto r = run_bake("build", dir);
-    CHECK(r.success(), "build.cpp dependency source build failed: " + r.stdout);
+    auto build = run_bake("build", dir);
+    CHECK(build.success(), "meta dependency build failed: " + build.stdout);
 
-    fs::path exe = dir / "out" / "bin" / "build-cpp-dep-src";
-    CHECK(fs::exists(exe), "build.cpp dependency executable not found");
+    const fs::path answer_lib =
+        dir / "out" / ".pkgs" / "answer" / "lib" / "libanswer.a";
+    const fs::path base_lib =
+        dir / "out" / ".pkgs" / "base" / "lib" / "libbase.a";
+    CHECK(fs::exists(answer_lib),
+          "dependency library was not built under consumer out/.pkgs");
+    CHECK(fs::exists(base_lib),
+          "transitive dependency library was not built under consumer out/.pkgs");
+    CHECK(fs::is_directory(dir / "out" / ".obj" / "answer"),
+          "dependency objects were not built under consumer out/.obj");
+    CHECK(fs::is_directory(dir / "out" / ".obj" / "base"),
+          "transitive dependency objects were not built under consumer out/.obj");
+    CHECK(!fs::exists(dir / "answer" / "out") &&
+              !fs::exists(dir / "answer" / ".bake"),
+          "dependency source directory was modified by the build");
+    CHECK(!fs::exists(dir / "base" / "out") &&
+              !fs::exists(dir / "base" / ".bake"),
+          "transitive dependency source directory was modified by the build");
 
+    const auto answer_mtime = fs::last_write_time(answer_lib);
+    const auto base_mtime = fs::last_write_time(base_lib);
+
+    auto rebuild = run_bake("build", dir);
+    CHECK(rebuild.success(), "meta dependency rebuild failed: " + rebuild.stdout);
+    CHECK_EQ(fs::last_write_time(answer_lib),
+             answer_mtime, "unchanged direct meta dependency was rebuilt");
+    CHECK_EQ(fs::last_write_time(base_lib),
+             base_mtime, "unchanged transitive meta dependency was rebuilt");
+
+    fs::path exe = dir / "out" / "bin" / "meta-consumer";
+    CHECK(fs::exists(exe), "meta consumer executable was not created");
     auto run = run_cmd(exe.string(), dir);
     CHECK_EQ(run.exit_code, 0,
-             "build.cpp dependency executable returned non-zero: " +
-             std::to_string(run.exit_code));
+             "dependency option was not applied: " + std::to_string(run.exit_code));
+
+    // A CLI option belongs to the package at the command root. Even when the
+    // consumer and dependency declare the same name, the consumer's CLI value
+    // must not replace the value nested in the dependency declaration.
+    auto consumer_option = run_bake("build --option bias=2", dir);
+    CHECK(consumer_option.success(),
+          "consumer's own option should be accepted: " + consumer_option.stdout);
+    auto isolated_run = run_cmd(exe.string(), dir);
+    CHECK_EQ(isolated_run.exit_code, 0,
+             "consumer CLI option leaked into the dependency package");
+
+    auto unknown_dir = make_temp_dir("build_cpp_meta_dep_unknown_option");
+    copy_fixture("build_cpp_meta_dep", unknown_dir);
+    write_file(unknown_dir / "bake.toml",
+        "[package]\n"
+        "name = \"meta-consumer\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "std = \"c++23\"\n\n"
+        "[dependencies]\n"
+        "answer = { path = \"answer\", options = { missing = true } }\n");
+    auto unknown = run_bake("build", unknown_dir);
+    CHECK(!unknown.success(), "undeclared dependency option should fail");
+    CHECK(unknown.stdout.find("option 'missing' is not declared by package 'answer'") !=
+              std::string::npos,
+          "undeclared dependency option did not identify its owner: " +
+              unknown.stdout);
+
+    auto wrong_type_dir = make_temp_dir("build_cpp_meta_dep_wrong_option_type");
+    copy_fixture("build_cpp_meta_dep", wrong_type_dir);
+    write_file(wrong_type_dir / "bake.toml",
+        "[package]\n"
+        "name = \"meta-consumer\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "std = \"c++23\"\n\n"
+        "[dependencies]\n"
+        "answer = { path = \"answer\", options = { bias = \"one\" } }\n");
+    auto wrong_type = run_bake("build", wrong_type_dir);
+    CHECK(!wrong_type.success(), "wrong dependency option type should fail");
+    CHECK(wrong_type.stdout.find("expects integer, got string") !=
+              std::string::npos,
+          "wrong dependency option type was not diagnosed: " +
+              wrong_type.stdout);
+
+    // Dependency options are constraints on the one package instance built
+    // for this project. An omitted value is not a request for the default: a
+    // different edge may select the package-wide value before defaults apply.
+    auto unified_dir = make_temp_dir("build_cpp_meta_dep_unified_option");
+    copy_fixture("build_cpp_meta_dep", unified_dir);
+    write_file(unified_dir / "bake.toml",
+        "[package]\n"
+        "name = \"meta-consumer\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "std = \"c++23\"\n\n"
+        "[dependencies]\n"
+        "answer = { path = \"answer\", options = { bias = 2 } }\n"
+        "base = { path = \"base\", options = { tls = \"wolfssl\" } }\n");
+    auto unified = run_bake("build", unified_dir);
+    CHECK(unified.success(),
+          "an explicit option should satisfy an unspecified edge: " +
+              unified.stdout);
+    auto unified_run = run_cmd(
+        (unified_dir / "out" / "bin" / "meta-consumer").string(),
+        unified_dir);
+    CHECK_EQ(unified_run.exit_code, 0,
+             "the unified dependency option was not used by the package");
+
+    // Two explicit, different values for a single-valued option cannot be
+    // represented by one package build. The error must identify both values
+    // and the dependency paths that requested them.
+    auto conflict_dir = make_temp_dir("build_cpp_meta_dep_option_conflict");
+    copy_fixture("build_cpp_meta_dep", conflict_dir);
+    write_file(conflict_dir / "bake.toml",
+        "[package]\n"
+        "name = \"meta-consumer\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "std = \"c++23\"\n\n"
+        "[dependencies]\n"
+        "answer = { path = \"answer\", options = { bias = 1 } }\n"
+        "base = { path = \"base\", options = { tls = \"wolfssl\" } }\n");
+    write_file(conflict_dir / "answer" / "bake.toml",
+        "[package]\n"
+        "name = \"answer\"\n"
+        "version = \"1.0.0\"\n"
+        "type = \"static-lib\"\n"
+        "std = \"c++23\"\n\n"
+        "[dependencies]\n"
+        "base = { path = \"../base\", options = { tls = \"mbedtls\" } }\n\n"
+        "[options]\n"
+        "bias = 0\n");
+    auto conflict = run_bake("build", conflict_dir);
+    CHECK(!conflict.success(), "different tls selections should conflict");
+    CHECK(conflict.stdout.find("option conflict for package 'base'") !=
+              std::string::npos &&
+          conflict.stdout.find("option 'tls'") != std::string::npos &&
+          conflict.stdout.find("\"mbedtls\"") != std::string::npos &&
+          conflict.stdout.find("\"wolfssl\"") != std::string::npos &&
+          conflict.stdout.find("meta-consumer -> answer -> base") !=
+              std::string::npos &&
+          conflict.stdout.find("meta-consumer -> base") != std::string::npos,
+          "option conflict did not report values and dependency paths: " +
+              conflict.stdout);
 
     return {};
+}
+
+// build.cpp must observe typed CLI option overrides. Changing an option must
+// invalidate actions whose command line changed, even when sources did not.
+TestResult test_build_cpp_options() {
+    auto dir = make_temp_dir("build_cpp_options");
+    copy_fixture("build_cpp_options", dir);
+
+    auto test_home = dir / "home";
+    fs::create_directories(test_home);
+#ifdef _WIN32
+    const std::string cache_env =
+        "LOCALAPPDATA=" + test_home.string();
+#else
+    const std::string cache_env = "HOME=" + test_home.string();
+#endif
+    auto run_option_bake = [&](const std::string& args) {
+        return run_bake(args, dir, cache_env);
+    };
+
+    auto initial = run_option_bake("build");
+    CHECK(initial.success(), "default option build failed: " + initial.stdout);
+    CHECK(fs::is_directory(dir / "out" / ".bmi" / ".std"),
+          "std module was not built in the project-local out/.bmi tree");
+    CHECK(!fs::exists(test_home / ".cache" / "bake") &&
+              !fs::exists(test_home / "bake"),
+          "build artifacts leaked into the global Bake source cache");
+
+    fs::path exe = dir / "out" / "bin" / "option-app";
+    CHECK(fs::exists(exe), "option-app executable was not produced");
+    auto initial_run = run_cmd(exe.string(), dir);
+    CHECK(initial_run.success(), "default option executable failed");
+    CHECK_EQ(initial_run.stdout, std::string("portable|0|1\n"),
+             "build.cpp did not receive default typed options");
+
+    auto unchanged = run_option_bake("build");
+    CHECK(unchanged.success(), "unchanged option rebuild failed: " + unchanged.stdout);
+    CHECK(unchanged.stdout.find("up to date") != std::string::npos,
+          "unchanged options did not reuse build actions: " + unchanged.stdout);
+
+    auto overridden = run_option_bake(
+        "build --option backend=native --option diagnostics --option level=7");
+    CHECK(overridden.success(), "overridden option build failed: " + overridden.stdout);
+    CHECK(overridden.stdout.find("up to date") == std::string::npos,
+          "option change incorrectly reused stale actions: " + overridden.stdout);
+
+    auto overridden_run = run_cmd(exe.string(), dir);
+    CHECK(overridden_run.success(), "overridden option executable failed");
+    CHECK_EQ(overridden_run.stdout, std::string("native|1|7\n"),
+             "build.cpp did not receive string/bool/int CLI overrides");
+
+    auto invalid_type = run_option_bake(
+        "build --option level=not-an-integer");
+    CHECK(!invalid_type.success(), "invalid integer option should fail");
+    CHECK(invalid_type.stdout.find("expects an integer") != std::string::npos,
+          "invalid integer option did not report its type: " + invalid_type.stdout);
+
+    auto unknown = run_option_bake("build --option missing=value");
+    CHECK(!unknown.success(), "undeclared option should fail");
+    CHECK(unknown.stdout.find("unknown build option 'missing'") != std::string::npos,
+          "unknown option did not report its name: " + unknown.stdout);
+
+    auto run_via_bake = run_option_bake("run");
+    CHECK(run_via_bake.success(),
+          "bake run could not read out/.bake/build.json: " +
+              run_via_bake.stdout);
+    CHECK(run_via_bake.stdout.find("portable|0|1\n") != std::string::npos,
+          "bake run executed the wrong build.cpp output: " +
+              run_via_bake.stdout);
+
+    return {};
+}
+
+// Remote dependency archives must extract with the platform tar. This uses a
+// local file:// Git repository and archive, so it exercises the real resolver
+// without relying on the network. In particular, macOS bsdtar does not support
+// GNU tar's --no-overwrite-dir option.
+TestResult test_remote_archive_extract() {
+#ifdef _WIN32
+    return {};
+#else
+    auto dir = make_temp_dir("remote_archive_extract");
+    auto remote = dir / "remote";
+    auto project = dir / "project";
+    auto test_home = dir / "home";
+
+    fs::create_directories(remote / "src");
+    fs::create_directories(test_home);
+    copy_fixture("simple_app", project);
+
+    fs::create_directories(remote / "public");
+    write_file(remote / "public" / "remote_fixture.hpp",
+        "#pragma once\nint remote_archive_fixture();\n");
+    write_file(remote / "src" / "fixture.cpp",
+        "#include <remote_fixture.hpp>\n"
+        "int remote_archive_fixture() { return 42; }\n");
+
+    auto init = run_cmd("git init -q", remote);
+    CHECK(init.success(), "failed to initialize local remote: " + init.stdout);
+    CHECK(run_cmd("git config user.email bake-test@example.invalid", remote).success(),
+          "failed to configure fixture git email");
+    CHECK(run_cmd("git config user.name bake-test", remote).success(),
+          "failed to configure fixture git name");
+    CHECK(run_cmd("git config commit.gpgsign false", remote).success(),
+          "failed to disable fixture commit signing");
+    CHECK(run_cmd("git add public/remote_fixture.hpp src/fixture.cpp", remote).success(),
+          "failed to stage fixture repository");
+    auto commit = run_cmd("git commit -q -m fixture", remote);
+    CHECK(commit.success(), "failed to commit fixture repository: " + commit.stdout);
+    CHECK(run_cmd("git tag v1.0", remote).success(),
+          "failed to tag fixture repository");
+
+    auto rev = run_cmd("git rev-parse HEAD", remote);
+    CHECK(rev.success(), "failed to resolve fixture commit: " + rev.stdout);
+    while (!rev.stdout.empty() &&
+           (rev.stdout.back() == '\n' || rev.stdout.back() == '\r')) {
+        rev.stdout.pop_back();
+    }
+    CHECK(!rev.stdout.empty(), "fixture commit was empty");
+
+    fs::create_directories(remote / "archive");
+    auto archive = remote / "archive" / (rev.stdout + ".tar.gz");
+    auto make_archive = run_cmd(
+        "git archive --format=tar.gz --prefix=remote-archive-fixture/ -o " +
+            archive.string() + " HEAD",
+        remote);
+    CHECK(make_archive.success(),
+          "failed to create fixture archive: " + make_archive.stdout);
+
+    write_file(project / "bake.toml",
+        "[package]\n"
+        "name = \"remote-archive-app\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "std = \"c++17\"\n\n"
+        "[dependencies]\n"
+        "fixture = { url = \"file://" + remote.string() +
+            "\", tag = \"v1.0\" }\n"
+    );
+
+    auto build = run_bake("build", project, "HOME=" + test_home.string());
+    CHECK(build.success(),
+          "local remote dependency failed to extract/build: " + build.stdout);
+    CHECK(fs::exists(project / "bake.lock"),
+          "remote dependency build did not write bake.lock");
+
+    // A path meta package may itself resolve remote raw sources. Its source
+    // directory is immutable from the consumer's perspective: generated lock
+    // state belongs under the consumer's out/.pkgs tree.
+    auto meta = dir / "remote-meta";
+    auto consumer = dir / "meta-consumer";
+    fs::create_directories(meta);
+    fs::create_directories(consumer / "src");
+    write_file(meta / "bake.toml",
+        "[package]\n"
+        "name = \"remote-meta\"\n"
+        "version = \"1.0.0\"\n"
+        "type = \"static-lib\"\n"
+        "std = \"c++23\"\n\n"
+        "[dependencies]\n"
+        "upstream = { url = \"file://" + remote.string() +
+            "\", tag = \"v1.0\" }\n");
+    write_file(meta / "build.cpp",
+        "import bake.build;\n\n"
+        "int main() {\n"
+        "    bake::Builder b;\n"
+        "    auto& upstream = b.dependency(\"upstream\");\n"
+        "    b.static_lib(\"remote-meta\")\n"
+        "        .sources(upstream, \"src/*.cpp\")\n"
+        "        .include_dirs(upstream, \"public\")\n"
+        "        .std(\"c++23\");\n"
+        "    return b.build();\n"
+        "}\n");
+    write_file(consumer / "bake.toml",
+        "[package]\n"
+        "name = \"remote-meta-consumer\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "std = \"c++23\"\n\n"
+        "[dependencies]\n"
+        "remote-meta = { path = \"../remote-meta\" }\n");
+    write_file(consumer / "src" / "main.cpp",
+        "#include <remote_fixture.hpp>\n"
+        "int main() { return remote_archive_fixture() == 42 ? 0 : 1; }\n");
+
+    auto meta_build = run_bake(
+        "build", consumer, "HOME=" + test_home.string());
+    CHECK(meta_build.success(),
+          "path meta package could not resolve its remote source: " +
+              meta_build.stdout);
+    CHECK(!fs::exists(meta / "bake.lock") &&
+              !fs::exists(meta / ".bake") &&
+              !fs::exists(meta / "out"),
+          "consumer build modified the path meta package source directory");
+    CHECK(fs::exists(consumer / "out" / ".pkgs" / "remote-meta" /
+                     ".bake" / "bake.lock"),
+          "dependency lock state was not stored under consumer out/.pkgs");
+    auto meta_run = run_cmd(
+        (consumer / "out" / "bin" / "remote-meta-consumer").string(),
+        consumer);
+    CHECK(meta_run.success(),
+          "remote-backed meta package did not link into its consumer");
+
+    return {};
+#endif
 }
 
 // ----------------------------------------------------------------
@@ -583,6 +1018,7 @@ TestResult test_build_cpp_dependency_src_dir() {
 static std::vector<TestCase> all_tests = {
     {"simple_app_build",              test_simple_app_build},
     {"static_lib_build",              test_static_lib_build},
+    {"pure_c_build",                  test_pure_c_build},
     {"path_dep_build",                test_path_dep_build},
     {"path_dep_locked",               test_path_dep_locked},
     {"frozen_no_lock",                test_frozen_no_lock},
@@ -595,13 +1031,16 @@ static std::vector<TestCase> all_tests = {
     {"unified_output_layout",         test_unified_output_layout},
     {"clean",                         test_clean},
     {"init",                          test_init},
+    {"init_c",                        test_init_c},
     {"version",                       test_version},
     {"update_single_dep",             test_update_single_dep},
     {"standalone_path_dep_build",     test_standalone_path_dep_build},
     {"standalone_path_dep_locked",    test_standalone_path_dep_locked},
     {"workspace_unified_output",      test_workspace_unified_output},
     {"workspace_member_filter",       test_workspace_member_filter},
-    {"build_cpp_dependency_src_dir",  test_build_cpp_dependency_src_dir},
+    {"convention_meta_dependency",    test_convention_meta_dependency},
+    {"build_cpp_options",             test_build_cpp_options},
+    {"remote_archive_extract",        test_remote_archive_extract},
 };
 
 // ----------------------------------------------------------------

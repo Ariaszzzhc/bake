@@ -37,16 +37,6 @@ export inline std::optional<PackageType> parse_package_type(std::string_view s) 
     return std::nullopt;
 }
 
-// ===== Dependency =====
-
-export struct Dependency {
-    std::string name;
-    std::string url;           // git URL (empty for path deps)
-    std::string tag;           // git tag/branch (empty for path deps)
-    std::string path;          // relative path (for path deps)
-    bool is_path_dep = false;
-};
-
 // ===== BuildOption =====
 
 export struct BuildOption {
@@ -65,6 +55,20 @@ export struct BuildOption {
     static BuildOption from_string(std::string v) {
         BuildOption o; o.type = Type::String; o.str_value = std::move(v); return o;
     }
+
+    bool operator==(const BuildOption&) const = default;
+};
+
+// ===== Dependency =====
+
+export struct Dependency {
+    std::string name;
+    std::string url;           // git URL (empty for path deps)
+    std::string tag;           // git tag/branch (empty for path deps)
+    std::string path;          // relative path (for path deps)
+    bool is_path_dep = false;
+    // Configuration owned and type-checked by the dependency package.
+    std::map<std::string, BuildOption> options;
 };
 
 // ===== Package =====
@@ -112,6 +116,22 @@ export struct Manifest {
             return std::nullopt;
         }
 
+        auto parse_option_value = [](const toml::node& value)
+                -> std::optional<BuildOption> {
+            // toml++ value<T>() performs numeric conversions, so inspect the
+            // node type before extracting the value.
+            if (value.is_boolean()) {
+                return BuildOption::from_bool(*value.value<bool>());
+            }
+            if (value.is_integer()) {
+                return BuildOption::from_int(*value.value<int64_t>());
+            }
+            if (value.is_string()) {
+                return BuildOption::from_string(*value.value<std::string>());
+            }
+            return std::nullopt;
+        };
+
         // [workspace]
         if (auto* ws = tbl["workspace"].as_table()) {
             Workspace w;
@@ -149,6 +169,21 @@ export struct Manifest {
                         d.path = *v;
                         d.is_path_dep = true;
                     }
+                    if (auto* opts = (*t)["options"].as_table()) {
+                        for (auto& [opt_key, opt_value] : *opts) {
+                            auto parsed = parse_option_value(opt_value);
+                            if (!parsed) {
+                                std::println(
+                                    std::cerr,
+                                    "bake: dependency '{}': option '{}' must be "
+                                    "a bool, integer, or string",
+                                    d.name, opt_key.str());
+                                return std::nullopt;
+                            }
+                            d.options[std::string(opt_key.str())] =
+                                std::move(*parsed);
+                        }
+                    }
                 }
                 m.dependencies[d.name] = std::move(d);
             }
@@ -158,13 +193,8 @@ export struct Manifest {
         if (auto* opts = tbl["options"].as_table()) {
             for (auto& [key, val] : *opts) {
                 std::string opt_name = std::string(key.str());
-                if (auto v = val.value<bool>()) {
-                    m.options[opt_name] = BuildOption::from_bool(*v);
-                } else if (auto v = val.value<int64_t>()) {
-                    m.options[opt_name] = BuildOption::from_int(*v);
-                } else if (auto v = val.value<std::string>()) {
-                    m.options[opt_name] = BuildOption::from_string(*v);
-                }
+                if (auto parsed = parse_option_value(val))
+                    m.options[opt_name] = std::move(*parsed);
             }
         }
 
@@ -175,18 +205,22 @@ export struct Manifest {
 // ===== Layout (directory conventions) =====
 
 export struct Layout {
-    Path root;              // project root (contains bake.toml)
+    Path root;              // source root (contains bake.toml)
     Path source_dir;        // root/src/
     Path public_dir;        // root/public/
     Path tests_dir;         // root/tests/
-    Path bake_dir;          // root/.bake/ (build script staging)
+    Path bake_dir;          // private build-script state/staging
 
-    // Unified output directory
-    Path out_dir;           // <out_root>/out/
-    Path bin_dir;           // out/bin/   (executables)
-    Path lib_dir;           // out/lib/   (static/shared libs)
-    Path obj_dir;           // out/obj/[<member>/]
-    Path bmi_dir;           // out/bmi/[<member>/]
+    // All mutable build products belong to the top-level project's out/.
+    Path out_dir;           // <top-level>/out/
+    Path package_dir;       // out/ for root, out/.pkgs/<package>/ for deps
+    Path package_file;      // exported package usage requirements
+    Path bin_dir;
+    Path lib_dir;
+    Path obj_dir;           // out/.obj/[<member-or-package>/]
+    Path bmi_dir;           // out/.bmi/[<member-or-package>/]
+    std::string package_name;
+    bool dependency_layout = false;
 
     // Detect layout. Pass ws_root for workspace members so all outputs
     // go under the workspace root's out/ directory.
@@ -196,29 +230,56 @@ export struct Layout {
         l.source_dir = root / "src";
         l.public_dir = root / "public";
         l.tests_dir = root / "tests";
-        l.bake_dir = root / ".bake";
 
         Path out_base = ws_root.string().empty() ? root : ws_root;
         l.out_dir = out_base / "out";
+        l.package_dir = l.out_dir;
         l.bin_dir = l.out_dir / "bin";
         l.lib_dir = l.out_dir / "lib";
 
         if (ws_root.string().empty() || ws_root == root) {
-            l.obj_dir = l.out_dir / "obj";
-            l.bmi_dir = l.out_dir / "bmi";
+            l.bake_dir = l.out_dir / ".bake";
+            l.obj_dir = l.out_dir / ".obj";
+            l.bmi_dir = l.out_dir / ".bmi";
         } else {
             // Per-member subdirs to avoid name collisions in workspace builds
             std::string member = root.filename_string();
-            l.obj_dir = l.out_dir / "obj" / member;
-            l.bmi_dir = l.out_dir / "bmi" / member;
+            l.bake_dir = l.out_dir / ".bake" / member;
+            l.obj_dir = l.out_dir / ".obj" / member;
+            l.bmi_dir = l.out_dir / ".bmi" / member;
         }
+        l.package_file = l.bake_dir / "package.json";
+        return l;
+    }
+
+    // A dependency keeps immutable sources at root, while every generated
+    // file is placed in the consuming top-level project's out directory.
+    static Layout for_dependency(const Path& root, const Path& project_out,
+                                 std::string_view package_name) {
+        Layout l;
+        l.root = root;
+        l.source_dir = root / "src";
+        l.public_dir = root / "public";
+        l.tests_dir = root / "tests";
+        l.out_dir = project_out;
+        l.package_dir = project_out / ".pkgs" / std::string(package_name);
+        l.package_file = l.package_dir / "package.json";
+        l.bake_dir = l.package_dir / ".bake";
+        l.bin_dir = l.package_dir / "bin";
+        l.lib_dir = l.package_dir / "lib";
+        l.obj_dir = project_out / ".obj" / std::string(package_name);
+        l.bmi_dir = project_out / ".bmi" / std::string(package_name);
+        l.package_name = package_name;
+        l.dependency_layout = true;
         return l;
     }
 
     void create_directories() const {
-        source_dir.mkdir_recursive();
-        public_dir.mkdir_recursive();
         bake_dir.mkdir_recursive();
+        obj_dir.mkdir_recursive();
+        bmi_dir.mkdir_recursive();
+        bin_dir.mkdir_recursive();
+        lib_dir.mkdir_recursive();
     }
 
     // Output directory for a given package type.

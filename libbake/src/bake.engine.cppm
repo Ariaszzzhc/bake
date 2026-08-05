@@ -244,6 +244,7 @@ export struct BuildPlan {
     std::vector<BuildAction> actions;
     Path primary_output;      // final executable or library
     Path project_root;
+    Path state_dir;
     Path obj_dir;
     Path bmi_dir;
 
@@ -257,6 +258,19 @@ export struct DepSourceEntry {
     Path source;
 };
 
+// Public compile/link requirements exported by a built Bake-native package.
+// The CLI reads these from out/.pkgs/<package>/package.json; the convention
+// planner consumes them exactly as build.cpp's dependency(...).link_to() does.
+export struct PackageUsageRequirements {
+    std::string dependency_name;
+    std::vector<Path> include_dirs;
+    std::vector<std::pair<std::string, std::string>> defines;
+    std::vector<Path> link_inputs;
+    std::vector<std::string> system_libs;
+    std::vector<std::string> frameworks;
+    bool uses_cxx = false;
+};
+
 // Create a build plan using convention rules
 export BuildPlan create_convention_plan(
         const Manifest& manifest,
@@ -266,10 +280,12 @@ export BuildPlan create_convention_plan(
         const std::vector<DepSourceEntry>& dep_sources = {},
         const std::vector<Path>& dep_include_dirs = {},
         bool compile_path_deps = true,
-        const Path& std_module_pcm = {}) {
+        const Path& std_module_pcm = {},
+        const std::vector<PackageUsageRequirements>& package_requirements = {}) {
 
     BuildPlan plan;
     plan.project_root = layout.root;
+    plan.state_dir = layout.bake_dir;
     plan.obj_dir = layout.obj_dir;
     plan.bmi_dir = layout.bmi_dir;
 
@@ -290,6 +306,34 @@ export BuildPlan create_convention_plan(
     if (layout.public_dir.is_directory()) {
         include_dirs.push_back(layout.public_dir);
     }
+
+    std::set<std::string> packaged_path_dependencies;
+    std::vector<std::pair<std::string, std::string>> package_defines;
+    std::vector<Path> package_link_inputs;
+    std::vector<std::string> package_system_libs;
+    std::vector<std::string> package_frameworks;
+    bool package_uses_cxx = false;
+
+    auto append_unique = []<typename T>(std::vector<T>& values, const T& value) {
+        if (std::find(values.begin(), values.end(), value) == values.end())
+            values.push_back(value);
+    };
+
+    for (const auto& requirements : package_requirements) {
+        packaged_path_dependencies.insert(requirements.dependency_name);
+        for (const auto& include_dir : requirements.include_dirs)
+            append_unique(include_dirs, include_dir);
+        for (const auto& define : requirements.defines)
+            append_unique(package_defines, define);
+        for (const auto& input : requirements.link_inputs)
+            append_unique(package_link_inputs, input);
+        for (const auto& library : requirements.system_libs)
+            append_unique(package_system_libs, library);
+        for (const auto& framework : requirements.frameworks)
+            append_unique(package_frameworks, framework);
+        package_uses_cxx = package_uses_cxx || requirements.uses_cxx;
+    }
+
     // Resolve path dependencies — add their public/ as include dirs AND
     // collect their source files for compilation + linking.
     // When compile_path_deps is false (workspace builds), only include dirs
@@ -297,6 +341,10 @@ export BuildPlan create_convention_plan(
     std::vector<DepSourceEntry> path_dep_sources;
     for (auto& [name, dep] : manifest.dependencies) {
         if (dep.is_path_dep) {
+            // A built Bake-native package is consumed through its exported
+            // usage requirements. Its sources remain owned by that package.
+            if (packaged_path_dependencies.contains(name)) continue;
+
             Path dep_dir = manifest.project_dir / dep.path;
             Path dep_public = dep_dir / "public";
             if (dep_public.is_directory()) {
@@ -327,6 +375,7 @@ export BuildPlan create_convention_plan(
     // Ensures import std; works in ALL C++ sources, not just those
     // discovered through module graph scanning.
     auto ensure_std_dep = [&](CompileConfig& cc) {
+        if (cc.source.is_c()) return;
         if (std_module_pcm.string().empty() || !std_module_pcm.is_regular_file())
             return;
         for (auto& [name, _] : cc.module_deps) {
@@ -362,6 +411,7 @@ export BuildPlan create_convention_plan(
         cc.output = obj;
         cc.std_ver = std_ver;
         cc.include_dirs = include_dirs;
+        cc.defines = package_defines;
         cc.is_module_interface = true;
         cc.bmi_output = bmi;
         cc.use_pic = (pkg.type == PackageType::SharedLib);
@@ -406,6 +456,7 @@ export BuildPlan create_convention_plan(
         cc.output = obj;
         cc.std_ver = std_ver;
         cc.include_dirs = include_dirs;
+        cc.defines = package_defines;
         cc.use_pic = (pkg.type == PackageType::SharedLib);
 
         // Collect transitive module dependencies for this consumer
@@ -477,6 +528,7 @@ export BuildPlan create_convention_plan(
         cc.output = obj;
         cc.std_ver = std_ver;
         cc.include_dirs = include_dirs;
+        cc.defines = package_defines;
         cc.use_pic = (pkg.type == PackageType::SharedLib);
         ensure_std_dep(cc);
 
@@ -533,12 +585,28 @@ export BuildPlan create_convention_plan(
 
             LinkConfig lc;
             lc.inputs = obj_files;
+            for (const auto& input : package_link_inputs)
+                lc.inputs.push_back(input);
             lc.output = output;
             lc.type = pkg.type;
+            lc.use_cxx_linker = !sources.cpp_files.empty() ||
+                                !sources.module_interfaces.empty() ||
+                                package_uses_cxx;
+            for (const auto& ds : all_dep_sources) {
+                if (!ds.source.is_c()) {
+                    lc.use_cxx_linker = true;
+                    break;
+                }
+            }
+            lc.link_libs = package_system_libs;
+            lc.frameworks = package_frameworks;
             link_action.command = make_link_command(tc, lc);
 
+            for (const auto& input : package_link_inputs)
+                link_action.inputs.push_back(input);
+
             // Ensure libc++ at link time when import std is in use
-            if (!std_module_pcm.string().empty() && tc.is_clang()) {
+            if (lc.use_cxx_linker && !std_module_pcm.string().empty() && tc.is_clang()) {
                 link_action.command.insert(link_action.command.begin() + 1,
                                            "-stdlib=libc++");
             }
@@ -580,6 +648,46 @@ export bool needs_rebuild(const BuildAction& action) {
     return false;
 }
 
+namespace {
+
+std::string action_fingerprint(const BuildAction& action) {
+    nlohmann::json document;
+    document["type"] = static_cast<int>(action.type);
+    document["id"] = action.id;
+    document["command"] = action.command;
+    document["inputs"] = nlohmann::json::array();
+    document["outputs"] = nlohmann::json::array();
+    document["depends_on"] = action.depends_on;
+    for (const auto& input : action.inputs)
+        document["inputs"].push_back(input.string());
+    for (const auto& output : action.outputs)
+        document["outputs"].push_back(output.string());
+    return SHA256::hex(document.dump());
+}
+
+std::map<std::string, std::string> load_action_fingerprints(const Path& path) {
+    std::map<std::string, std::string> fingerprints;
+    auto content = read_file(path);
+    if (!content) return fingerprints;
+
+    try {
+        auto document = nlohmann::json::parse(*content);
+        if (document.value("schema", 0) != 1 ||
+            !document.contains("actions") ||
+            !document["actions"].is_object()) {
+            return fingerprints;
+        }
+        for (auto& [id, value] : document["actions"].items()) {
+            if (value.is_string()) fingerprints[id] = value.get<std::string>();
+        }
+    } catch (...) {
+        // A missing/corrupt state file is only a cache miss: rebuild safely.
+    }
+    return fingerprints;
+}
+
+} // namespace
+
 // ===== Executor =====
 
 export int execute_plan(BuildPlan& plan, int jobs) {
@@ -597,6 +705,21 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     int skipped = 0;
     int failed = 0;
 
+    const Path state_path = plan.state_dir / "action-state.json";
+    const auto previous_fingerprints = load_action_fingerprints(state_path);
+    std::vector<std::string> fingerprints;
+    fingerprints.reserve(plan.actions.size());
+    for (const auto& action : plan.actions)
+        fingerprints.push_back(action_fingerprint(action));
+
+    auto action_needs_rebuild = [&](size_t index) {
+        const auto& action = plan.actions[index];
+        auto previous = previous_fingerprints.find(action.id);
+        return previous == previous_fingerprints.end() ||
+               previous->second != fingerprints[index] ||
+               needs_rebuild(action);
+    };
+
     // Track completion
     std::vector<int> status(plan.actions.size(), 0);  // 0=pending, 1=done, -1=failed
     std::atomic<int> actions_done{0};
@@ -608,7 +731,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     for (size_t i = 0; i < plan.actions.size(); ++i) {
         if (plan.actions[i].type == BuildAction::Type::CompileModule) {
             auto& action = plan.actions[i];
-            if (!needs_rebuild(action)) {
+            if (!action_needs_rebuild(i)) {
                 status[i] = 1;
                 actions_done++;
                 skipped++;
@@ -658,7 +781,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
 
                 {
                     std::lock_guard<std::mutex> lock(mtx);
-                    if (!needs_rebuild(action)) {
+                    if (!action_needs_rebuild(i)) {
                         status[i] = 1;
                         actions_done++;
                         skipped++;
@@ -707,7 +830,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
             plan.actions[i].type == BuildAction::Type::Archive) {
             auto& action = plan.actions[i];
 
-            if (!needs_rebuild(action)) {
+            if (!action_needs_rebuild(i)) {
                 status[i] = 1;
                 skipped++;
                 continue;
@@ -736,6 +859,18 @@ export int execute_plan(BuildPlan& plan, int jobs) {
         std::println("bake: build complete ({} compiled, {} skipped)", total, skipped);
     }
 
+    nlohmann::json state;
+    state["schema"] = 1;
+    state["actions"] = nlohmann::json::object();
+    for (size_t i = 0; i < plan.actions.size(); ++i) {
+        state["actions"][plan.actions[i].id] = fingerprints[i];
+    }
+    if (!atomic_write_file(state_path, state.dump(2))) {
+        std::println(std::cerr,
+                     "bake: warning: failed to write incremental state at {}",
+                     state_path.string());
+    }
+
     return 0;
 }
 
@@ -744,6 +879,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
 export BuildPlan read_build_json(const Path& json_path, const Path& project_root) {
     BuildPlan plan;
     plan.project_root = project_root;
+    plan.state_dir = json_path.parent();
 
     auto content = read_file(json_path);
     if (!content) return plan;
@@ -756,6 +892,12 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
     }
 
     if (!doc.contains("actions")) return plan;
+
+    auto action_path = [&](const std::string& value) {
+        Path path(value);
+        if (path.fs().is_absolute()) return path;
+        return (project_root / path).lexically_normal();
+    };
 
     // First pass: create all actions
     std::map<std::string, size_t> id_to_index;
@@ -772,10 +914,10 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
         else action.type = BuildAction::Type::Compile;
 
         for (auto& inp : jaction.value("inputs", std::vector<std::string>{})) {
-            action.inputs.push_back(Path(inp));
+            action.inputs.push_back(action_path(inp));
         }
         for (auto& out : jaction.value("outputs", std::vector<std::string>{})) {
-            action.outputs.push_back(Path(out));
+            action.outputs.push_back(action_path(out));
         }
         for (auto& cmd : jaction.value("command", std::vector<std::string>{})) {
             action.command.push_back(cmd);

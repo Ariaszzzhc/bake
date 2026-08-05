@@ -504,7 +504,9 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     tmp_dir.mkdir_recursive();
 
     // Phase 3: Extract with tar.
-    // POSIX: strip ownership/permissions with GNU-specific flags.
+    // POSIX: strip ownership/permissions with flags supported by both GNU tar
+    // and BSD tar. Extraction always targets a new, empty temp directory, so
+    // GNU tar's non-portable --no-overwrite-dir is unnecessary.
     // Windows: plain extraction (Windows tar.exe doesn't support those flags).
     std::vector<std::string> cmd = {
         "tar", "xf", archive.string(),
@@ -513,7 +515,6 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
 #ifndef _WIN32
     cmd.push_back("--no-same-owner");
     cmd.push_back("--no-same-permissions");
-    cmd.push_back("--no-overwrite-dir");
 #endif
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {

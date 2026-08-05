@@ -129,6 +129,14 @@ export struct CompileConfig {
     bool use_pic = false;  // -fPIC
 };
 
+// The manifest/build API uses the compiler's standard spelling directly.
+// A standard beginning with "c++" is C++; the remaining C spellings (c17,
+// c23, gnu17, ...) select C when the source itself is a .c file.
+export bool is_c_standard(std::string_view std_ver) {
+    return (std_ver.starts_with("c") || std_ver.starts_with("gnu")) &&
+           !std_ver.starts_with("c++") && !std_ver.starts_with("gnu++");
+}
+
 // ===== Link configuration =====
 
 export struct LinkConfig {
@@ -136,6 +144,8 @@ export struct LinkConfig {
     Path output;                // output path
     PackageType type = PackageType::Executable;
     std::vector<std::string> link_libs;  // -l flags
+    std::vector<std::string> frameworks; // Apple -framework flags
+    bool use_cxx_linker = true;
 };
 
 // ===== Command generation =====
@@ -143,7 +153,8 @@ export struct LinkConfig {
 export std::vector<std::string> make_compile_command(const Toolchain& tc,
                                                       const CompileConfig& cc) {
     std::vector<std::string> cmd;
-    cmd.push_back(tc.cxx_path);
+    const bool compile_as_c = cc.source.is_c() && !cc.is_module_interface;
+    cmd.push_back(compile_as_c ? tc.cc_path : tc.cxx_path);
 
     // Mode
     cmd.push_back("-c");
@@ -154,8 +165,10 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
     // When using import std;, Clang requires libc++.
     // Detect this by checking if "std" is in module_deps.
     bool needs_libcxx = false;
-    for (const auto& [mod_name, _] : cc.module_deps) {
-        if (mod_name == "std") { needs_libcxx = true; break; }
+    if (!compile_as_c) {
+        for (const auto& [mod_name, _] : cc.module_deps) {
+            if (mod_name == "std") { needs_libcxx = true; break; }
+        }
     }
     if (needs_libcxx && tc.is_clang()) {
         cmd.push_back("-stdlib=libc++");
@@ -197,7 +210,7 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
     }
 
     // Module dependencies (BMI references for consumers AND interfaces)
-    if (!cc.module_deps.empty()) {
+    if (!compile_as_c && !cc.module_deps.empty()) {
         for (auto& [mod_name, bmi_path] : cc.module_deps) {
             if (tc.is_clang()) {
                 cmd.push_back("-fmodule-file=" + mod_name + "=" + bmi_path.string());
@@ -220,7 +233,7 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
 export std::vector<std::string> make_link_command(const Toolchain& tc,
                                                    const LinkConfig& lc) {
     std::vector<std::string> cmd;
-    cmd.push_back(tc.cxx_path);
+    cmd.push_back(lc.use_cxx_linker ? tc.cxx_path : tc.cc_path);
 
     if (lc.type == PackageType::SharedLib) {
         cmd.push_back("-shared");
@@ -235,6 +248,11 @@ export std::vector<std::string> make_link_command(const Toolchain& tc,
     // Link libraries
     for (auto& lib : lc.link_libs) {
         cmd.push_back("-l" + lib);
+    }
+
+    for (auto& framework : lc.frameworks) {
+        cmd.push_back("-framework");
+        cmd.push_back(framework);
     }
 
     // Output

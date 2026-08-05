@@ -17,6 +17,7 @@ export namespace bake {
 
 class Builder;
 class Step;
+class Dependency;
 
 class Target {
     friend class Builder;
@@ -27,12 +28,34 @@ public:
 
     Target& std(const char* ver) { bake_target_std(handle_, ver); return *this; }
     Target& sources(const char* pattern) { bake_target_sources(handle_, pattern); return *this; }
+    Target& sources(std::initializer_list<const char*> patterns) {
+        for (const char* pattern : patterns) bake_target_sources(handle_, pattern);
+        return *this;
+    }
+    Target& sources(Dependency& dependency, const char* pattern);
+    Target& sources(Dependency& dependency,
+                    std::initializer_list<const char*> patterns);
     Target& include_dirs(const char* dirs) { bake_target_include_dirs(handle_, dirs); return *this; }
+    Target& include_dirs(std::initializer_list<const char*> dirs) {
+        for (const char* dir : dirs) bake_target_include_dirs(handle_, dir);
+        return *this;
+    }
+    Target& include_dirs(Dependency& dependency, const char* dirs);
+    Target& private_include_dirs(const char* dirs) {
+        bake_target_private_include_dirs(handle_, dirs); return *this;
+    }
+    Target& private_include_dirs(Dependency& dependency, const char* dirs);
     Target& define(const char* name, const char* value = "") {
         bake_target_define(handle_, name, value); return *this;
     }
+    Target& private_define(const char* name, const char* value = "") {
+        bake_target_private_define(handle_, name, value); return *this;
+    }
     Target& link(Target& other) { bake_target_link(handle_, other.handle_); return *this; }
     Target& link_system(const char* lib) { bake_target_link_system(handle_, lib); return *this; }
+    Target& link_framework(const char* framework) {
+        bake_target_link_framework(handle_, framework); return *this;
+    }
     Target& depends_on(Step& step);
 
     bake_target* raw() const { return handle_; }
@@ -73,6 +96,29 @@ public:
 
     bake_dependency* raw() const { return handle_; }
 };
+
+inline Target& Target::sources(Dependency& dependency, const char* pattern) {
+    bake_target_dependency_sources(handle_, dependency.raw(), pattern);
+    return *this;
+}
+
+inline Target& Target::sources(
+    Dependency& dependency, std::initializer_list<const char*> patterns) {
+    for (const char* pattern : patterns)
+        bake_target_dependency_sources(handle_, dependency.raw(), pattern);
+    return *this;
+}
+
+inline Target& Target::include_dirs(Dependency& dependency, const char* dirs) {
+    bake_target_dependency_include_dirs(handle_, dependency.raw(), dirs);
+    return *this;
+}
+
+inline Target& Target::private_include_dirs(Dependency& dependency,
+                                            const char* dirs) {
+    bake_target_dependency_private_include_dirs(handle_, dependency.raw(), dirs);
+    return *this;
+}
 
 class Builder {
     bake_builder* handle_ = nullptr;

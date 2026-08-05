@@ -100,6 +100,20 @@ elseif(UNIX)
 endif()
 # Windows: no RPATH concept — DLLs found via PATH or same directory as EXE
 
+# ---- Installation ----
+
+include(GNUInstallDirs)
+install(TARGETS bake libbake
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+install(FILES
+    libbake/public/bake.build.cppm
+    libbake/src/cabi/bake_cabi.h
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/bake
+)
+
 # ---- Tests ----
 
 enable_testing()
@@ -115,4 +129,7 @@ add_test(
     NAME bake_test_suite
     COMMAND test_runner $<TARGET_FILE:bake>
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+)
+set_tests_properties(bake_test_suite PROPERTIES
+    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )

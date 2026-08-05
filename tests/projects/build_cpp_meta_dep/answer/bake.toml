@@ -1,0 +1,11 @@
+[package]
+name = "answer"
+version = "1.0.0"
+type = "static-lib"
+std = "c++23"
+
+[dependencies]
+base = { path = "../base" }
+
+[options]
+bias = 0

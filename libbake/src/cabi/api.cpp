@@ -57,6 +57,7 @@ struct bake_builder {
     std::vector<std::unique_ptr<bake_target>> targets;
     std::vector<std::unique_ptr<bake_step>> steps;
     std::vector<std::unique_ptr<bake_dependency>> deps;
+    std::vector<std::string> configuration_errors;
 };
 
 // ---- struct bake_target (opaque handle) ----
@@ -68,10 +69,28 @@ struct bake_target {
 
     std::vector<std::string> source_patterns;
     std::vector<std::string> include_dirs;
+    std::vector<std::string> private_include_dirs;
     std::vector<std::pair<std::string, std::string>> defines;
+    std::vector<std::pair<std::string, std::string>> private_defines;
 
     std::vector<bake_target*> linked_targets;     // other bake targets
     std::vector<std::string> system_libs;          // -l flags
+    std::vector<std::string> frameworks;           // Apple frameworks
+
+    // Usage requirements imported from Bake-native package dependencies.
+    // Static libraries propagate these to their consumers; executables and
+    // shared libraries consume them in their own link action.
+    std::vector<std::string> dependency_include_dirs;
+    std::vector<std::pair<std::string, std::string>> dependency_defines;
+    std::vector<std::string> dependency_link_inputs;
+    std::vector<std::string> dependency_system_libs;
+    std::vector<std::string> dependency_frameworks;
+    bool dependency_uses_cxx = false;
+
+    // Populated while serializing the build graph and then exported through
+    // out/.pkgs/<package>/package.json for consumers.
+    std::string output_path;
+    bool uses_cxx = false;
 
     std::vector<bake_step*> depends_on_steps;
 };
@@ -108,10 +127,105 @@ nlohmann::json to_json_array(const std::vector<std::string>& vec) {
     return arr;
 }
 
+template <typename T>
+void append_unique(std::vector<T>& values, const T& value) {
+    if (std::find(values.begin(), values.end(), value) == values.end())
+        values.push_back(value);
+}
+
 // Convert an absolute filesystem path to one relative to the project root.
 std::string rel_to_root(const std::filesystem::path& p,
                         const std::filesystem::path& root) {
     return std::filesystem::relative(p, root).string();
+}
+
+std::vector<bake::Path> expand_source_pattern(
+    const bake::Path& project_root, std::string_view pattern) {
+    namespace fs = std::filesystem;
+
+    fs::path pattern_path{std::string(pattern)};
+    if (!pattern_path.is_absolute()) {
+        return bake::glob(project_root, pattern);
+    }
+
+    pattern_path = pattern_path.lexically_normal();
+    fs::path search_root = pattern_path.root_path();
+    fs::path relative_pattern;
+    bool found_glob = false;
+
+    for (const auto& component : pattern_path.relative_path()) {
+        const std::string text = component.generic_string();
+        if (!found_glob && text.find_first_of("*?") == std::string::npos) {
+            search_root /= component;
+        } else {
+            found_glob = true;
+            relative_pattern /= component;
+        }
+    }
+
+    if (!found_glob) {
+        if (fs::is_regular_file(pattern_path)) {
+            return {bake::Path(pattern_path)};
+        }
+        return {};
+    }
+
+    return bake::glob(bake::Path(search_root), relative_pattern.generic_string());
+}
+
+std::string absolute_from_root(const bake::Path& root, std::string_view value) {
+    std::filesystem::path path{std::string(value)};
+    if (!path.is_absolute()) path = root.fs() / path;
+    return std::filesystem::absolute(path).lexically_normal().string();
+}
+
+std::optional<std::string> dependency_relative_path(
+    bake_dependency* dependency,
+    std::string_view value,
+    bool require_raw_source) {
+    if (!dependency || !dependency->builder) return std::nullopt;
+
+    const char* source_dir = bake_dep_src_dir(dependency);
+    if (!source_dir) {
+        dependency->builder->configuration_errors.push_back(
+            "dependency '" + dependency->name + "' is not declared or resolved");
+        return std::nullopt;
+    }
+
+    std::filesystem::path relative{std::string(value)};
+    if (relative.is_absolute()) {
+        dependency->builder->configuration_errors.push_back(
+            "dependency-relative path for '" + dependency->name +
+            "' must not be absolute: " + std::string(value));
+        return std::nullopt;
+    }
+    relative = relative.lexically_normal();
+    if (!relative.empty() && *relative.begin() == "..") {
+        dependency->builder->configuration_errors.push_back(
+            "dependency-relative path for '" + dependency->name +
+            "' escapes its source root: " + std::string(value));
+        return std::nullopt;
+    }
+
+    std::filesystem::path root{source_dir};
+    if (require_raw_source &&
+        std::filesystem::is_regular_file(root / "bake.toml")) {
+        dependency->builder->configuration_errors.push_back(
+            "dependency '" + dependency->name +
+            "' is a Bake package; use link_to() instead of compiling its sources");
+        return std::nullopt;
+    }
+
+    return (root / relative).lexically_normal().string();
+}
+
+nlohmann::json defines_to_json(
+    const std::vector<std::pair<std::string, std::string>>& defines) {
+    auto result = nlohmann::json::array();
+    for (const auto& [name, value] : defines) {
+        result.push_back({{"name", name}, {"value", value}});
+    }
+    return result;
 }
 
 } // anonymous namespace
@@ -134,22 +248,110 @@ BAKE_API bake_builder* bake_builder_new(void) noexcept {
     try {
         auto b = std::make_unique<bake_builder>();
 
-        // Locate the project root (walks up from cwd to find bake.toml).
-        auto root = bake::find_project_root();
-        if (!root)
-            root = bake::Path::current();
+        // The CLI supplies source/output ownership explicitly when it launches
+        // build_app. Falling back to cwd keeps manually executed build scripts
+        // usable without permitting dependencies to write into their sources.
+        std::optional<bake::Path> root;
+        if (const char* configured_root =
+                std::getenv("BAKE_INTERNAL_SOURCE_ROOT");
+            configured_root && *configured_root) {
+            root = bake::Path(configured_root);
+        } else {
+            root = bake::find_project_root();
+            if (!root) root = bake::Path::current();
+        }
 
         // Load the manifest if present.
         b->manifest = bake::Manifest::load(*root);
 
-        // Load the lockfile if present (for resolving remote dep source dirs).
-        b->lockfile = bake::Lockfile::load(*root / "bake.lock");
+        // Establish the directory layout before reading any process-boundary
+        // files. A dependency's source root and mutable output root differ.
+        const char* configured_out =
+            std::getenv("BAKE_INTERNAL_PROJECT_OUT");
+        const char* configured_package =
+            std::getenv("BAKE_INTERNAL_PACKAGE_NAME");
+        if (configured_out && *configured_out &&
+            configured_package && *configured_package) {
+            b->layout = bake::Layout::for_dependency(
+                *root, bake::Path(configured_out), configured_package);
+            if (b->manifest && b->manifest->package &&
+                b->manifest->package->name != configured_package) {
+                b->configuration_errors.push_back(
+                    "build context package '" +
+                    std::string(configured_package) +
+                    "' does not match manifest package '" +
+                    b->manifest->package->name + "'");
+            }
+        } else {
+            b->layout = bake::Layout::detect(*root);
+        }
+
+        // bake writes the effective, type-preserving CLI overrides before it
+        // starts build_app. Keep this file as the process boundary between the
+        // CLI and the independently compiled build.cpp executable.
+        if (b->manifest) {
+            bake::Path options_path = b->layout.bake_dir / "options.json";
+            if (auto content = bake::read_file(options_path)) {
+                try {
+                    auto document = nlohmann::json::parse(*content);
+                    if (document.value("schema", 0) != 1 ||
+                        !document.contains("options") ||
+                        !document["options"].is_object()) {
+                        b->configuration_errors.push_back(
+                            "invalid .bake/options.json schema");
+                    } else {
+                        for (auto& [name, value] : document["options"].items()) {
+                            auto option = b->manifest->options.find(name);
+                            if (option == b->manifest->options.end()) continue;
+
+                            switch (option->second.type) {
+                                case bake::BuildOption::Type::Bool:
+                                    if (value.is_boolean()) {
+                                        option->second = bake::BuildOption::from_bool(
+                                            value.get<bool>());
+                                    } else {
+                                        b->configuration_errors.push_back(
+                                            "option '" + name + "' has the wrong type");
+                                    }
+                                    break;
+                                case bake::BuildOption::Type::Int:
+                                    if (value.is_number_integer()) {
+                                        option->second = bake::BuildOption::from_int(
+                                            value.get<int64_t>());
+                                    } else {
+                                        b->configuration_errors.push_back(
+                                            "option '" + name + "' has the wrong type");
+                                    }
+                                    break;
+                                case bake::BuildOption::Type::String:
+                                    if (value.is_string()) {
+                                        option->second = bake::BuildOption::from_string(
+                                            value.get<std::string>());
+                                    } else {
+                                        b->configuration_errors.push_back(
+                                            "option '" + name + "' has the wrong type");
+                                    }
+                                    break;
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    b->configuration_errors.push_back(
+                        std::string("cannot parse .bake/options.json: ") + e.what());
+                }
+            }
+        }
+
+        // Load the lockfile used for this build context. Dependency lock state
+        // is consumer-local; a versioned lock in the dependency source is only
+        // copied/read by the CLI and is never rewritten by build_app.
+        b->lockfile = bake::Lockfile::load(
+            b->layout.dependency_layout
+                ? b->layout.bake_dir / "bake.lock"
+                : *root / "bake.lock");
 
         // Detect toolchain.
         b->toolchain = bake::Toolchain::detect();
-
-        // Establish the directory layout.
-        b->layout = bake::Layout::detect(*root);
 
         // Cache directory strings for the C API getters.
         b->source_dir_str = b->layout.source_dir.string();
@@ -177,6 +379,16 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
     }
 
     try {
+        if (!b->configuration_errors.empty()) {
+            std::string message = "bake_builder_build: invalid dependency configuration";
+            for (const auto& error : b->configuration_errors) {
+                message += "\n  - " + error;
+            }
+            set_error(message);
+            std::println(std::cerr, "{}", message);
+            return -1;
+        }
+
         // Ensure output directories exist.
         b->layout.bake_dir.mkdir_recursive();
         b->layout.obj_dir.mkdir_recursive();
@@ -214,32 +426,45 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         // ---------------------------------------------------
         for (const auto& target : b->targets) {
             std::vector<std::string> compile_ids;
-            std::vector<std::string> obj_rel_paths;
+            std::vector<std::string> object_paths;
+            bool has_cxx_sources = false;
 
             // -- Expand source glob patterns --
             for (const auto& pattern : target->source_patterns) {
-                auto files = bake::glob(b->layout.root, pattern);
+                auto files = expand_source_pattern(b->layout.root, pattern);
 
                 for (const auto& src : files) {
+                    if (!src.is_c()) has_cxx_sources = true;
                     std::string src_rel = rel_to_root(src.fs(), b->layout.root.fs());
                     std::string stem    = src.stem_string();
-                    std::string obj_rel = "out/obj/" + stem + ".o";
+                    std::string object_path =
+                        (b->layout.obj_dir /
+                         (target->name + "__" + stem + ".o"))
+                            .absolute().string();
                     std::string comp_id = target->name + "__" + src.filename_string();
 
                     compile_ids.push_back(comp_id);
-                    obj_rel_paths.push_back(obj_rel);
+                    object_paths.push_back(object_path);
 
                     // Build compile configuration.
                     bake::CompileConfig cc;
                     cc.source  = bake::Path(src_rel);
-                    cc.output  = bake::Path(obj_rel);
+                    cc.output  = bake::Path(object_path);
                     cc.std_ver = target->std_ver;
                     cc.use_pic = (target->type == TargetType::SharedLib);
 
                     for (const auto& inc : target->include_dirs)
                         cc.include_dirs.push_back(bake::Path(inc));
+                    for (const auto& inc : target->private_include_dirs)
+                        cc.include_dirs.push_back(bake::Path(inc));
+                    for (const auto& inc : target->dependency_include_dirs)
+                        cc.include_dirs.push_back(bake::Path(inc));
 
                     for (const auto& [name, value] : target->defines)
+                        cc.defines.push_back({name, value});
+                    for (const auto& [name, value] : target->private_defines)
+                        cc.defines.push_back({name, value});
+                    for (const auto& [name, value] : target->dependency_defines)
                         cc.defines.push_back({name, value});
 
                     auto cmd = bake::make_compile_command(b->toolchain, cc);
@@ -248,7 +473,7 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                     action["type"]       = "compile";
                     action["id"]         = comp_id;
                     action["inputs"]     = to_json_array({src_rel});
-                    action["outputs"]    = to_json_array({obj_rel});
+                    action["outputs"]    = to_json_array({object_path});
                     action["command"]    = to_json_array(cmd);
                     action["depends_on"] = nlohmann::json::array();
 
@@ -257,7 +482,7 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
             }
 
             // -- Link / archive action --
-            if (!obj_rel_paths.empty()) {
+            if (!object_paths.empty()) {
                 bake::PackageType pkg_type;
                 std::string type_str;
 
@@ -277,18 +502,38 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 }
 
                 std::string out_name = bake::library_name(target->name, pkg_type);
-                std::string out_subdir = (target->type == TargetType::Executable) ? "bin" : "lib";
-                std::string out_rel  = "out/" + out_subdir + "/" + out_name;
+                bake::Path output =
+                    ((target->type == TargetType::Executable)
+                         ? b->layout.bin_dir
+                         : b->layout.lib_dir) /
+                    out_name;
+                std::string output_path = output.absolute().string();
 
                 // Build link configuration.
                 bake::LinkConfig lc;
-                for (const auto& obj : obj_rel_paths)
+                for (const auto& obj : object_paths)
                     lc.inputs.push_back(bake::Path(obj));
-                lc.output = bake::Path(out_rel);
+                lc.output = bake::Path(output_path);
                 lc.type   = pkg_type;
+                lc.use_cxx_linker = has_cxx_sources || target->dependency_uses_cxx;
+
+                if (target->type != TargetType::StaticLib) {
+                    for (const auto& input : target->dependency_link_inputs)
+                        lc.inputs.push_back(bake::Path(input));
+                }
 
                 for (const auto& lib : target->system_libs)
-                    lc.link_libs.push_back(lib);
+                    append_unique(lc.link_libs, lib);
+                if (target->type != TargetType::StaticLib) {
+                    for (const auto& lib : target->dependency_system_libs)
+                        append_unique(lc.link_libs, lib);
+                }
+                for (const auto& framework : target->frameworks)
+                    append_unique(lc.frameworks, framework);
+                if (target->type != TargetType::StaticLib) {
+                    for (const auto& framework : target->dependency_frameworks)
+                        append_unique(lc.frameworks, framework);
+                }
 
                 std::vector<std::string> cmd;
                 if (target->type == TargetType::StaticLib)
@@ -304,15 +549,25 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 for (const auto* step : target->depends_on_steps)
                     depends.push_back(step->name);
 
+                std::vector<std::string> link_inputs = object_paths;
+                if (target->type != TargetType::StaticLib) {
+                    link_inputs.insert(link_inputs.end(),
+                                       target->dependency_link_inputs.begin(),
+                                       target->dependency_link_inputs.end());
+                }
+
                 nlohmann::json action;
                 action["type"]       = type_str;
                 action["id"]         = target->name + "__link";
-                action["inputs"]     = to_json_array(obj_rel_paths);
-                action["outputs"]    = to_json_array({out_rel});
+                action["inputs"]     = to_json_array(link_inputs);
+                action["outputs"]    = to_json_array({output_path});
                 action["command"]    = to_json_array(cmd);
                 action["depends_on"] = to_json_array(depends);
 
                 actions.push_back(std::move(action));
+
+                target->output_path = output_path;
+                target->uses_cxx = lc.use_cxx_linker;
             }
         }
 
@@ -327,6 +582,93 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
 
         if (!bake::write_file(out_path, content)) {
             set_error("bake_builder_build: failed to write " + out_path.string());
+            return -1;
+        }
+
+        // Export one package-level link interface. A package normally exposes
+        // the target named by [package].name; a single library target is an
+        // unambiguous fallback for meta packages whose package/display name
+        // differs from the upstream library filename.
+        bake_target* exported = nullptr;
+        if (b->manifest && b->manifest->package) {
+            const auto& package_name = b->manifest->package->name;
+            for (const auto& target : b->targets) {
+                if (target->type != TargetType::Executable &&
+                    target->name == package_name && !target->output_path.empty()) {
+                    exported = target.get();
+                    break;
+                }
+            }
+        }
+        if (!exported) {
+            for (const auto& target : b->targets) {
+                if (target->type == TargetType::Executable || target->output_path.empty())
+                    continue;
+                if (exported) {
+                    exported = nullptr; // ambiguous: do not guess
+                    break;
+                }
+                exported = target.get();
+            }
+        }
+
+        nlohmann::json package_json;
+        package_json["schema"] = 1;
+        package_json["include_dirs"] = nlohmann::json::array();
+        package_json["defines"] = nlohmann::json::array();
+        package_json["link_inputs"] = nlohmann::json::array();
+        package_json["system_libs"] = nlohmann::json::array();
+        package_json["frameworks"] = nlohmann::json::array();
+        package_json["uses_cxx"] = false;
+
+        if (exported) {
+            for (const auto& include_dir : exported->include_dirs) {
+                package_json["include_dirs"].push_back(
+                    absolute_from_root(b->layout.root, include_dir));
+            }
+            for (const auto& include_dir : exported->dependency_include_dirs)
+                package_json["include_dirs"].push_back(include_dir);
+
+            auto public_defines = exported->defines;
+            public_defines.insert(public_defines.end(),
+                                  exported->dependency_defines.begin(),
+                                  exported->dependency_defines.end());
+            package_json["defines"] = defines_to_json(public_defines);
+            package_json["link_inputs"].push_back(exported->output_path);
+            if (exported->type == TargetType::StaticLib) {
+                for (const auto& input : exported->dependency_link_inputs)
+                    package_json["link_inputs"].push_back(input);
+                for (const auto& lib : exported->dependency_system_libs) {
+                    if (std::find(package_json["system_libs"].begin(),
+                                  package_json["system_libs"].end(), lib) ==
+                        package_json["system_libs"].end())
+                        package_json["system_libs"].push_back(lib);
+                }
+                for (const auto& framework : exported->dependency_frameworks) {
+                    if (std::find(package_json["frameworks"].begin(),
+                                  package_json["frameworks"].end(), framework) ==
+                        package_json["frameworks"].end())
+                        package_json["frameworks"].push_back(framework);
+                }
+            }
+            for (const auto& lib : exported->system_libs) {
+                if (std::find(package_json["system_libs"].begin(),
+                              package_json["system_libs"].end(), lib) ==
+                    package_json["system_libs"].end())
+                    package_json["system_libs"].push_back(lib);
+            }
+            for (const auto& framework : exported->frameworks) {
+                if (std::find(package_json["frameworks"].begin(),
+                              package_json["frameworks"].end(), framework) ==
+                    package_json["frameworks"].end())
+                    package_json["frameworks"].push_back(framework);
+            }
+            package_json["uses_cxx"] = exported->uses_cxx;
+        }
+
+        bake::Path package_path = b->layout.package_file;
+        if (!bake::write_file(package_path, package_json.dump(2))) {
+            set_error("bake_builder_build: failed to write " + package_path.string());
             return -1;
         }
 
@@ -495,12 +837,70 @@ BAKE_API bake_target* bake_target_include_dirs(bake_target* t, const char* dirs)
     return t;
 }
 
+BAKE_API bake_target* bake_target_private_include_dirs(
+    bake_target* t, const char* dirs) noexcept {
+    if (!t || !dirs) return t;
+    try {
+        t->private_include_dirs.push_back(dirs);
+    } catch (const std::exception& e) {
+        set_error(std::string("bake_target_private_include_dirs: ") + e.what());
+    }
+    return t;
+}
+
 BAKE_API bake_target* bake_target_define(bake_target* t, const char* name, const char* value) noexcept {
     if (!t || !name) return t;
     try {
         t->defines.push_back({name, value ? value : ""});
     } catch (const std::exception& e) {
         set_error(std::string("bake_target_define: ") + e.what());
+    }
+    return t;
+}
+
+BAKE_API bake_target* bake_target_private_define(
+    bake_target* t, const char* name, const char* value) noexcept {
+    if (!t || !name) return t;
+    try {
+        t->private_defines.push_back({name, value ? value : ""});
+    } catch (const std::exception& e) {
+        set_error(std::string("bake_target_private_define: ") + e.what());
+    }
+    return t;
+}
+
+BAKE_API bake_target* bake_target_dependency_sources(
+    bake_target* t, bake_dependency* dependency, const char* pattern) noexcept {
+    if (!t || !dependency || !pattern) return t;
+    try {
+        if (auto path = dependency_relative_path(dependency, pattern, true))
+            t->source_patterns.push_back(std::move(*path));
+    } catch (const std::exception& e) {
+        set_error(std::string("bake_target_dependency_sources: ") + e.what());
+    }
+    return t;
+}
+
+BAKE_API bake_target* bake_target_dependency_include_dirs(
+    bake_target* t, bake_dependency* dependency, const char* dirs) noexcept {
+    if (!t || !dependency || !dirs) return t;
+    try {
+        if (auto path = dependency_relative_path(dependency, dirs, false))
+            t->include_dirs.push_back(std::move(*path));
+    } catch (const std::exception& e) {
+        set_error(std::string("bake_target_dependency_include_dirs: ") + e.what());
+    }
+    return t;
+}
+
+BAKE_API bake_target* bake_target_dependency_private_include_dirs(
+    bake_target* t, bake_dependency* dependency, const char* dirs) noexcept {
+    if (!t || !dependency || !dirs) return t;
+    try {
+        if (auto path = dependency_relative_path(dependency, dirs, false))
+            t->private_include_dirs.push_back(std::move(*path));
+    } catch (const std::exception& e) {
+        set_error(std::string("bake_target_dependency_private_include_dirs: ") + e.what());
     }
     return t;
 }
@@ -521,6 +921,17 @@ BAKE_API bake_target* bake_target_link_system(bake_target* t, const char* lib) n
         t->system_libs.push_back(lib);
     } catch (const std::exception& e) {
         set_error(std::string("bake_target_link_system: ") + e.what());
+    }
+    return t;
+}
+
+BAKE_API bake_target* bake_target_link_framework(
+    bake_target* t, const char* framework) noexcept {
+    if (!t || !framework) return t;
+    try {
+        t->frameworks.push_back(framework);
+    } catch (const std::exception& e) {
+        set_error(std::string("bake_target_link_framework: ") + e.what());
     }
     return t;
 }
@@ -608,17 +1019,63 @@ BAKE_API const char* bake_dep_src_dir(const bake_dependency* d) noexcept {
     }
 }
 
-// Link a dependency's build output to a target.
-// Bake-native dependency linking is not implemented in build.cpp mode yet.
+// Import a Bake-native dependency's package-level usage requirements.
 BAKE_API void bake_dep_link_to(bake_dependency* d, bake_target* t) noexcept {
     if (!d || !t) return;
     try {
-        // Resolve the dep's source dir and look for build artifacts.
         const char* src = bake_dep_src_dir(d);
-        if (!src) return;
+        if (!src) {
+            d->builder->configuration_errors.push_back(
+                "dependency '" + d->name + "' is not declared or resolved");
+            return;
+        }
 
-        // TODO: implement bake-native dep linking in a future iteration.
+        auto dependency_manifest = bake::Manifest::load(bake::Path(src));
+        if (!dependency_manifest || !dependency_manifest->package ||
+            dependency_manifest->package->name.empty()) {
+            d->builder->configuration_errors.push_back(
+                "dependency '" + d->name +
+                "' is not a named Bake package and cannot be linked");
+            return;
+        }
+        bake::Path metadata_path = bake::Layout::for_dependency(
+            bake::Path(src), d->builder->layout.out_dir,
+            dependency_manifest->package->name).package_file;
+        auto content = bake::read_file(metadata_path);
+        if (!content) {
+            d->builder->configuration_errors.push_back(
+                "dependency '" + d->name + "' has no built package metadata at " +
+                metadata_path.string());
+            return;
+        }
+
+        auto metadata = nlohmann::json::parse(*content);
+        if (metadata.value("schema", 0) != 1) {
+            d->builder->configuration_errors.push_back(
+                "dependency '" + d->name + "' has unsupported package metadata");
+            return;
+        }
+
+        for (const auto& value : metadata.value("include_dirs", nlohmann::json::array()))
+            append_unique(t->dependency_include_dirs, value.get<std::string>());
+        for (const auto& define : metadata.value("defines", nlohmann::json::array())) {
+            t->dependency_defines.push_back({
+                define.value("name", std::string{}),
+                define.value("value", std::string{})});
+        }
+        for (const auto& value : metadata.value("link_inputs", nlohmann::json::array()))
+            append_unique(t->dependency_link_inputs, value.get<std::string>());
+        for (const auto& value : metadata.value("system_libs", nlohmann::json::array()))
+            append_unique(t->dependency_system_libs, value.get<std::string>());
+        for (const auto& value : metadata.value("frameworks", nlohmann::json::array()))
+            append_unique(t->dependency_frameworks, value.get<std::string>());
+        t->dependency_uses_cxx =
+            t->dependency_uses_cxx || metadata.value("uses_cxx", false);
     } catch (const std::exception& e) {
         set_error(std::string("bake_dep_link_to: ") + e.what());
+        if (d && d->builder) {
+            d->builder->configuration_errors.push_back(
+                "failed to read dependency '" + d->name + "': " + e.what());
+        }
     }
 }

@@ -50,9 +50,18 @@ BAKE_API const char* bake_builder_build_dir(const bake_builder*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_std(bake_target*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_sources(bake_target*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_include_dirs(bake_target*, const char*) BAKE_NOEXCEPT;
+BAKE_API bake_target* bake_target_private_include_dirs(bake_target*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_define(bake_target*, const char*, const char*) BAKE_NOEXCEPT;
+BAKE_API bake_target* bake_target_private_define(bake_target*, const char*, const char*) BAKE_NOEXCEPT;
+BAKE_API bake_target* bake_target_dependency_sources(
+    bake_target*, bake_dependency*, const char*) BAKE_NOEXCEPT;
+BAKE_API bake_target* bake_target_dependency_include_dirs(
+    bake_target*, bake_dependency*, const char*) BAKE_NOEXCEPT;
+BAKE_API bake_target* bake_target_dependency_private_include_dirs(
+    bake_target*, bake_dependency*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_link(bake_target*, bake_target*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_link_system(bake_target*, const char*) BAKE_NOEXCEPT;
+BAKE_API bake_target* bake_target_link_framework(bake_target*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_depends_on_step(bake_target*, bake_step*) BAKE_NOEXCEPT;
 
 // Step
