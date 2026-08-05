@@ -24,7 +24,7 @@ echo "==> Configuring LLVM (AArch64, clang+lld, Release)"
 cmake -G Ninja -S "$SRC/llvm" -B "$BUILD" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$INSTALL" \
-  -DLLVM_ENABLE_PROJECTS="clang;lld" \
+  -DLLVM_ENABLE_PROJECTS="clang;lld;libcxx" \
   -DLLVM_TARGETS_TO_BUILD="AArch64" \
   -DLLVM_ENABLE_ASSERTIONS=OFF \
   -DLLVM_INCLUDE_TESTS=OFF \

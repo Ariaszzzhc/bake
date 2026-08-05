@@ -305,19 +305,19 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     for (const char *Arg : Cmd->getArguments())
       LldArgs.push_back(Arg);
 
-    // On macOS, ld64.lld needs -syslibroot to find system libraries.
-    // The system ld has built-in paths; LLD does not.
+    // On macOS, add the vendored libSystem.tbd directory to library search
+    // path so LLD can find libSystem without the system SDK.
     if (Flavor == BAKE_LLD_MACHO) {
-      // Check SDKROOT env first, then fall back to xcrun.
+#ifdef BAKE_DARWIN_LIB
+      OwnedStrings.push_back(std::string("-L") + BAKE_DARWIN_LIB);
+#else
+      // Fallback: SDKROOT env or system SDK.
       if (const char *SdkRoot = ::getenv("SDKROOT")) {
-        OwnedStrings.push_back(std::string("-syslibroot"));
-        OwnedStrings.push_back(SdkRoot);
+        OwnedStrings.push_back(std::string("-L") + SdkRoot + "/usr/lib");
       } else {
-        // Use the Clang driver's resource dir to find the SDK.
-        // As a last resort, query xcrun.
-        OwnedStrings.push_back("-syslibroot");
-        OwnedStrings.push_back("/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk");
+        OwnedStrings.push_back("-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib");
       }
+#endif
       for (auto &S : OwnedStrings)
         LldArgs.push_back(S.c_str());
     }
@@ -501,34 +501,36 @@ static int clang_main(int Argc, const char **Argv,
     llvm::CrashRecoveryContext::Enable();
   }
 
-  // On macOS, inject -isysroot so the Clang driver can find system headers
-  // (stdio.h, wchar.h, etc.) from the macOS SDK.  A properly installed Clang
-  // discovers this automatically via xcrun; bake's binary location doesn't
-  // match a standard LLVM install, so we help it here.
+  // Use vendored headers instead of system SDK (macOS).
+  // -nostdinc disables ALL default include search; we re-add everything via -isystem.
+  // Search order is critical: libc++ headers must come first so their wrapper
+  // versions of stddef.h/stdlib.h are found before Clang builtins and C headers.
 #ifdef __APPLE__
-  {
-    std::string sdk_path;
-    if (const char *sdk = ::getenv("SDKROOT"))
-      sdk_path = sdk;
-    if (sdk_path.empty()) {
-      // Query xcrun for the default SDK path.
-      if (FILE *fp = ::popen("xcrun --show-sdk-path", "r")) {
-        char buf[4096];
-        if (fgets(buf, sizeof(buf), fp))
-          sdk_path = buf;
-        ::pclose(fp);
-      }
-      // Strip trailing whitespace.
-      while (!sdk_path.empty() &&
-             (sdk_path.back() == '\n' || sdk_path.back() == '\r' ||
-              sdk_path.back() == ' ' || sdk_path.back() == '\t'))
-        sdk_path.pop_back();
-    }
-    if (!sdk_path.empty()) {
-      Args.push_back(Saver.save("-isysroot").data());
-      Args.push_back(Saver.save(sdk_path).data());
+  Args.push_back(Saver.save("-nostdinc").data());
+  bool IsCxx = false;
+  for (const char *A : Args) {
+    if (A && llvm::StringRef(A).contains("driver-mode=g++")) {
+      IsCxx = true;
+      break;
     }
   }
+  if (IsCxx)
+    Args.push_back(Saver.save("-nostdinc++").data());
+  // 1. libc++ headers (C++ wrappers that must shadow C builtins)
+#ifdef BAKE_LIBCXX_INC
+  Args.push_back(Saver.save("-isystem").data());
+  Args.push_back(Saver.save(BAKE_LIBCXX_INC).data());
+#endif
+  // 2. Clang builtin headers (stdarg.h, stddef.h — the real definitions)
+#ifdef BAKE_RESOURCE_DIR
+  Args.push_back(Saver.save("-isystem").data());
+  Args.push_back(Saver.save(BAKE_RESOURCE_DIR "/include").data());
+#endif
+  // 3. Darwin C library headers (stdio.h, stdlib.h, etc.)
+#ifdef BAKE_DARWIN_INC
+  Args.push_back(Saver.save("-isystem").data());
+  Args.push_back(Saver.save(BAKE_DARWIN_INC).data());
+#endif
 #endif
 
   // Inject -resource-dir so Clang finds its builtin headers (stdarg.h,

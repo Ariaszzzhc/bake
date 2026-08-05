@@ -7,7 +7,6 @@
 /bake/.bake/
 /bake/out/
 /bake/build/
-/lib/
 /external/llvm-build/
 /.codegraph/
 /__cmake_systeminformation/
