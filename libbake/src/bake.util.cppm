@@ -11,6 +11,9 @@ module;
   #include <sys/wait.h>
   #include <unistd.h>
   #include <fcntl.h>
+  #ifdef __APPLE__
+    #include <mach-o/dyld.h>
+  #endif
 #endif
 #include <errno.h>
 
@@ -379,6 +382,43 @@ private:
         state[4] += e; state[5] += f; state[6] += g; state[7] += h;
     }
 };
+
+// ===== Self executable path =====
+
+// Returns the canonical absolute path to the running executable.
+// Returns an empty string if the path cannot be determined.
+export inline std::string get_self_exe_path() {
+#ifdef _WIN32
+    wchar_t buf[MAX_PATH];
+    DWORD len = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return {};
+    std::wstring wide(buf, len);
+    int needed = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1,
+                                     nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string result(needed - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1,
+                        result.data(), needed, nullptr, nullptr);
+    return result;
+#elif defined(__APPLE__)
+    uint32_t bufsize = 0;
+    _NSGetExecutablePath(nullptr, &bufsize);
+    if (bufsize == 0) return {};
+    std::string raw(bufsize, '\0');
+    if (_NSGetExecutablePath(raw.data(), &bufsize) != 0) return {};
+    raw.resize(std::strlen(raw.c_str()));
+    std::error_code ec;
+    auto canonical = std::filesystem::canonical(raw, ec);
+    if (ec) return raw;
+    return canonical.string();
+#else
+    char buf[4096];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (len < 0) return {};
+    buf[len] = '\0';
+    return std::string(buf);
+#endif
+}
 
 // ===== Process =====
 

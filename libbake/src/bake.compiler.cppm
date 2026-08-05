@@ -4,6 +4,11 @@ import std;
 import bake.util;
 import bake.project;
 
+// Phase 5: LLVM compiler integration — C ABI
+extern "C" {
+    int bake_has_llvm(void);
+}
+
 // ============================================================
 // bake.compiler — toolchain detection, compile/link commands
 // ============================================================
@@ -14,6 +19,7 @@ export enum class CompilerKind {
     Clang,
     Gcc,
     AppleClang,
+    BakeSelf,   // bake itself acting as compiler (bake c++ / bake cc)
     Unknown,
 };
 
@@ -25,11 +31,30 @@ export struct Toolchain {
     std::string scanner_path;   // clang-scan-deps (Clang only)
 
     bool has_scanner() const { return !scanner_path.empty(); }
-    bool is_clang() const { return kind == CompilerKind::Clang || kind == CompilerKind::AppleClang; }
+    bool is_clang() const { return kind == CompilerKind::Clang || kind == CompilerKind::AppleClang || kind == CompilerKind::BakeSelf; }
     bool is_gcc() const { return kind == CompilerKind::Gcc; }
 
     static Toolchain detect() {
         Toolchain tc;
+
+        // 0. Self-spawn: if bake was built with LLVM, use bake c++ as the compiler
+        if (bake_has_llvm()) {
+            tc.kind = CompilerKind::BakeSelf;
+            // When running inside build_app (linked to libbake), get_self_exe_path()
+            // returns build_app's path, not bake's. Use BAKE_EXE env var if set.
+            std::string self;
+            if (const char* bake_exe = std::getenv("BAKE_EXE")) {
+                self = bake_exe;
+            } else {
+                self = get_self_exe_path();
+            }
+            if (self.empty()) self = "bake";  // graceful fallback
+            tc.cxx_path = self;
+            tc.cc_path = self;
+            tc.scanner_path = "";  // bake c++ has built-in module scanning via Clang
+            tc.ar_path = "ar";     // still use system ar for now (bake ar is Phase 6)
+            return tc;
+        }
 
         // 1. Check CXX environment variable
         if (const char* cxx_env = std::getenv("CXX")) {
@@ -109,10 +134,18 @@ export struct Toolchain {
             case CompilerKind::Clang:       return "clang";
             case CompilerKind::AppleClang:  return "apple-clang";
             case CompilerKind::Gcc:         return "gcc";
+            case CompilerKind::BakeSelf:    return "bake";
             default:                        return "unknown";
         }
     }
 };
+
+// Returns the argv prefix for invoking the C++ compiler driver.
+// BakeSelf needs ["<bake_path>", "c++"]; other kinds just need ["<cxx_path>"].
+export inline std::vector<std::string> cxx_prefix(const Toolchain& tc) {
+    if (tc.kind == CompilerKind::BakeSelf) return {tc.cxx_path, "c++"};
+    return {tc.cxx_path};
+}
 
 // ===== Compile configuration =====
 
@@ -153,8 +186,14 @@ export struct LinkConfig {
 export std::vector<std::string> make_compile_command(const Toolchain& tc,
                                                       const CompileConfig& cc) {
     std::vector<std::string> cmd;
-    const bool compile_as_c = cc.source.is_c() && !cc.is_module_interface;
-    cmd.push_back(compile_as_c ? tc.cc_path : tc.cxx_path);
+    // BakeSelf spawns "<bake_path> c++" as two argv elements; other kinds use cc/cxx_path directly.
+    if (tc.kind == CompilerKind::BakeSelf) {
+        cmd.push_back(tc.cxx_path);
+        cmd.push_back("c++");
+    } else {
+        const bool compile_as_c = cc.source.is_c() && !cc.is_module_interface;
+        cmd.push_back(compile_as_c ? tc.cc_path : tc.cxx_path);
+    }
 
     // Mode
     cmd.push_back("-c");
@@ -233,7 +272,13 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
 export std::vector<std::string> make_link_command(const Toolchain& tc,
                                                    const LinkConfig& lc) {
     std::vector<std::string> cmd;
-    cmd.push_back(lc.use_cxx_linker ? tc.cxx_path : tc.cc_path);
+    // BakeSelf spawns "<bake_path> c++" as two argv elements (handles linking via in-process LLD).
+    if (tc.kind == CompilerKind::BakeSelf) {
+        cmd.push_back(tc.cxx_path);
+        cmd.push_back("c++");
+    } else {
+        cmd.push_back(lc.use_cxx_linker ? tc.cxx_path : tc.cc_path);
+    }
 
     if (lc.type == PackageType::SharedLib) {
         cmd.push_back("-shared");

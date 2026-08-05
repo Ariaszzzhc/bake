@@ -7,3 +7,7 @@
 /bake/.bake/
 /bake/out/
 /bake/build/
+/lib/
+/.codegraph/
+/__cmake_systeminformation/
+/zig_native_cpp.o

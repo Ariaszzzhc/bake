@@ -18,8 +18,25 @@ endif()
 
 project(bake
     VERSION 0.1.0
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
+
+# ── LLVM/Clang/LLD (Phase 5: compiler integration) ──
+find_package(LLVM REQUIRED CONFIG)
+find_package(Clang REQUIRED CONFIG)
+find_package(LLD REQUIRED CONFIG)
+
+message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
+message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
+
+# Derive LLVM installation prefix for runtime header/library lookup.
+# llvm-config --prefix gives the canonical prefix (e.g. /opt/homebrew/Cellar/llvm/22.1.8).
+execute_process(
+    COMMAND ${LLVM_TOOLS_BINARY_DIR}/llvm-config --prefix
+    OUTPUT_VARIABLE LLVM_PREFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+message(STATUS "LLVM prefix: ${LLVM_PREFIX}")
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -46,6 +63,10 @@ target_include_directories(nlohmann_json INTERFACE
 
 add_library(libbake SHARED
     libbake/src/cabi/api.cpp
+    # Phase 5: LLVM/Clang/LLD compiler integration
+    libbake/src/compiler/bake_llvm.cpp
+    libbake/src/compiler/bake_clang_driver.cpp
+    libbake/src/compiler/bake_clang_cc1_main.cpp
 )
 
 target_sources(libbake
@@ -62,8 +83,17 @@ target_sources(libbake
 
 set_target_properties(libbake PROPERTIES OUTPUT_NAME "bake")
 
-target_link_libraries(libbake PRIVATE tomlplusplus nlohmann_json)
+target_link_libraries(libbake PRIVATE
+    tomlplusplus nlohmann_json
+    # Phase 5: LLVM/Clang/LLD
+    clang-cpp
+    lldELF lldCOFF lldMachO lldWasm lldCommon
+    LLVM
+)
 target_include_directories(libbake PRIVATE
+    ${LLVM_INCLUDE_DIRS}
+    ${CLANG_INCLUDE_DIRS}
+    ${LLD_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus/public
     ${CMAKE_SOURCE_DIR}/third_party/nlohmann/public
     ${CMAKE_SOURCE_DIR}/libbake/src/cabi
@@ -72,6 +102,7 @@ target_compile_definitions(libbake PRIVATE
     BAKE_VERSION="${PROJECT_VERSION}"
     BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
     BAKE_LIB_DIR="${CMAKE_BINARY_DIR}"
+    BAKE_LLVM_PREFIX="${LLVM_PREFIX}"
 )
 
 # On Windows, libbake exports symbols; consumers import them.

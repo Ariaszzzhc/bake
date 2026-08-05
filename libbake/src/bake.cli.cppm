@@ -41,6 +41,12 @@ import bake.package;
 #define BAKE_LIB_DIR "."
 #endif
 
+// Phase 5: LLVM compiler integration — C ABI
+extern "C" {
+    int bake_clang_main(int argc, const char** argv);
+    int bake_has_llvm(void);
+}
+
 namespace bake::cli {
 
 namespace {
@@ -492,6 +498,10 @@ export void print_help() {
         "    run             Build and run the executable\n"
         "    test            Build and run tests\n"
         "    clean           Remove build artifacts\n"
+        "    cc              Invoke embedded Clang C driver\n"
+        "    c++             Invoke embedded Clang C++ driver\n"
+        "    ar              Archiver (not yet implemented)\n"
+        "    ranlib          Archive index (not yet implemented)\n"
         "\n"
         "GLOBAL OPTIONS:\n"
         "    -V, --version   Print version and exit\n"
@@ -684,7 +694,9 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     pcm_cache.mkdir_recursive();
 
     // Cache key: hash of compiler path + version output
-    auto ver = run_process({tc.cxx_path, "--version"}, Path(), true);
+    auto cxx_args = cxx_prefix(tc);
+    cxx_args.push_back("--version");
+    auto ver = run_process(cxx_args, Path(), true);
     std::string key_data = tc.cxx_path + "\n" + ver.stdout_output;
     std::string key = SHA256::hex(key_data).substr(0, 16);
 
@@ -694,6 +706,12 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     // Locate std.cppm relative to the compiler: <prefix>/share/libc++/v1/std.cppm
     Path cxx_dir = Path(tc.cxx_path).parent();       // bin/
     Path prefix = cxx_dir.parent();                   // llvm/<ver>/
+#ifdef BAKE_LLVM_PREFIX
+    // For BakeSelf, the bake binary isn't in the LLVM installation tree.
+    // Use the LLVM prefix recorded at build time.
+    if (tc.kind == CompilerKind::BakeSelf)
+        prefix = Path(BAKE_LLVM_PREFIX);
+#endif
     Path std_cppm = prefix / "share" / "libc++" / "v1" / "std.cppm";
     if (!std_cppm.is_regular_file()) return Path();   // not a libc++-shipping Clang
 
@@ -703,7 +721,7 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     std::println("   Preparing standard library module");
 
     std::vector<std::string> cmd;
-    cmd.push_back(tc.cxx_path);
+    for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
     cmd.push_back("-std=c++23");
     cmd.push_back("-stdlib=libc++");
     cmd.push_back("-nostdinc++");
@@ -770,7 +788,7 @@ export int build_with_build_cpp(
 
     {
         std::vector<std::string> cmd;
-        cmd.push_back(tc.cxx_path);
+        for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
         if (tc.is_clang()) {
@@ -800,7 +818,7 @@ export int build_with_build_cpp(
     Path build_o = bake_dir / "build.o";
     {
         std::vector<std::string> cmd;
-        cmd.push_back(tc.cxx_path);
+        for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
         if (tc.is_clang()) {
@@ -833,7 +851,7 @@ export int build_with_build_cpp(
 #endif
     {
         std::vector<std::string> cmd;
-        cmd.push_back(tc.cxx_path);
+        for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
         if (tc.is_clang()) {
             cmd.push_back("-stdlib=libc++");
         }
@@ -859,6 +877,8 @@ export int build_with_build_cpp(
     }
 
     // Step 4: Run build_app → .bake/build.json
+    // Set BAKE_EXE so build_app's Toolchain::detect() uses the real bake
+    // binary (not build_app itself) for BakeSelf compile/link commands.
     {
         ScopedBuildContext context(layout);
         if (!context.active()) {
@@ -866,6 +886,8 @@ export int build_with_build_cpp(
                          "bake: failed to establish build script context");
             return 1;
         }
+        std::string self = get_self_exe_path();
+        if (!self.empty()) ::setenv("BAKE_EXE", self.c_str(), 1);
         auto result = run_process({build_app.string()}, root, true);
         if (!result.success()) {
             std::print(std::cerr, "{}", result.stderr_output);
@@ -1621,7 +1643,10 @@ export int cmd_build(const ParsedArgs& args) {
 
                 // Clang needs -stdlib=libc++ when import std is in use
                 if (std_pcm.is_regular_file() && tc.is_clang()) {
-                    action.command.insert(action.command.begin() + 1, "-stdlib=libc++");
+                    // Insert after the executable prefix (1 for normal compilers,
+                    // 2 for BakeSelf where prefix is [bake, c++]).
+                    auto prefix_len = cxx_prefix(tc).size();
+                    action.command.insert(action.command.begin() + prefix_len, "-stdlib=libc++");
                 }
 
                 for (auto& bm : built) {
@@ -2123,6 +2148,21 @@ export int cmd_test(const ParsedArgs& args) {
 // ===== Main dispatch =====
 
 export int main(int argc, char* argv[]) {
+    // Fast path: -cc1 / -cc1as are Clang driver internal modes spawned when
+    // the driver falls back to subprocess execution.  These must bypass bake's
+    // argument parser entirely (the args contain options like -triple that
+    // look like flags to our parser).
+    if (argc >= 2 && argv[1]) {
+        std::string_view a1(argv[1]);
+        if (a1 == "-cc1" || a1 == "-cc1as") {
+            if (!bake_has_llvm()) {
+                std::println(std::cerr, "bake: LLVM support not compiled in");
+                return 1;
+            }
+            return bake_clang_main(argc, const_cast<const char**>(argv));
+        }
+    }
+
     ParsedArgs args = parse_args(argc, argv);
 
     // No command: handle --version / --help / default
@@ -2149,6 +2189,21 @@ export int main(int argc, char* argv[]) {
     if (args.command == "run")      return cmd_run(args);
     if (args.command == "test")     return cmd_test(args);
     if (args.command == "clean")    return cmd_clean(args);
+
+    // Phase 5: LLVM compiler integration — pass raw argv to Clang driver
+    if (args.command == "cc" || args.command == "c++") {
+        if (!bake_has_llvm()) {
+            std::println(std::cerr, "bake {}: LLVM support not compiled in", args.command);
+            return 1;
+        }
+        return bake_clang_main(argc, const_cast<const char**>(argv));
+    }
+
+    // Phase 6: LLVM binutils (stubs for now)
+    if (args.command == "ar" || args.command == "ranlib") {
+        std::println(std::cerr, "bake {} not yet implemented (Phase 6)", args.command);
+        return 1;
+    }
 
     // Version / help as commands
     if (args.command == "--version" || args.command == "-V") {

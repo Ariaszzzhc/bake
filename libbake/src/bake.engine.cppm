@@ -648,7 +648,10 @@ export BuildPlan create_convention_plan(
 
             // Ensure libc++ at link time when import std is in use
             if (lc.use_cxx_linker && !std_module_pcm.string().empty() && tc.is_clang()) {
-                link_action.command.insert(link_action.command.begin() + 1,
+                // Insert after the executable prefix (1 for normal compilers,
+                // 2 for BakeSelf where prefix is [bake, c++]).
+                auto prefix_len = cxx_prefix(tc).size();
+                link_action.command.insert(link_action.command.begin() + prefix_len,
                                            "-stdlib=libc++");
             }
         }
