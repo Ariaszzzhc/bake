@@ -131,6 +131,7 @@ target_compile_definitions(libbake PRIVATE
     BAKE_DARWIN_INC="${CMAKE_SOURCE_DIR}/lib/bake/libc/darwin/include"
     BAKE_DARWIN_LIB="${CMAKE_SOURCE_DIR}/lib/bake/libc/darwin"
     BAKE_LIBCXX_INC="${LLVM_PREFIX}/include/c++/v1"
+    BAKE_LIBCXX_MODULES_DIR="${CMAKE_SOURCE_DIR}/external/llvm-project/libcxx/modules"
 )
 
 # On Windows, libbake exports symbols; consumers import them.

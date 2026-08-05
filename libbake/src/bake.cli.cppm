@@ -683,6 +683,49 @@ export int cmd_init(const ParsedArgs& args) {
 
 // ===== build.cpp compilation + execution =====
 
+// Generate std.cppm from the vendored libc++ source template.
+// std.cppm.in contains @LIBCXX_MODULE_STD_INCLUDE_SOURCES@ which gets
+// replaced by the concatenation of all modules/std/*.inc files.
+// This mirrors what libc++'s CMake would do at configure time.
+static Path generate_std_cppm(const Path& cache_dir) {
+#ifdef BAKE_LIBCXX_MODULES_DIR
+    Path modules_dir(BAKE_LIBCXX_MODULES_DIR);
+    Path cppm_in = modules_dir / "std.cppm.in";
+    if (!cppm_in.is_regular_file()) return Path();
+
+    auto in_content = read_file(cppm_in);
+    if (!in_content) return Path();
+
+    // Collect all .inc files (glob returns sorted results)
+    auto incs = glob(modules_dir / "std", "*.inc");
+    if (incs.empty()) return Path();
+
+    std::string inc_sources;
+    for (const auto& inc : incs) {
+        auto content = read_file(inc);
+        if (content) {
+            inc_sources += *content;
+            inc_sources += "\n";
+        }
+    }
+
+    // Replace the placeholder
+    std::string cppm = *in_content;
+    constexpr std::string_view placeholder = "@LIBCXX_MODULE_STD_INCLUDE_SOURCES@";
+    auto pos = cppm.find(placeholder);
+    if (pos == std::string::npos) return Path();
+    cppm.replace(pos, placeholder.size(), inc_sources);
+
+    // Write to cache
+    Path result = cache_dir / "std.cppm";
+    if (!write_file(result, cppm)) return Path();
+
+    return result;
+#else
+    return Path();
+#endif
+}
+
 // Ensure the libc++ std module PCM is built in this project's output tree.
 // Returns the path to std.pcm, or an empty Path on failure.
 // For Clang only — GCC handles import std via its gcm cache.
@@ -713,7 +756,11 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
         prefix = Path(BAKE_LLVM_PREFIX);
 #endif
     Path std_cppm = prefix / "share" / "libc++" / "v1" / "std.cppm";
-    if (!std_cppm.is_regular_file()) return Path();   // not a libc++-shipping Clang
+    if (!std_cppm.is_regular_file()) {
+        // Not installed — generate from vendored libc++ source template.
+        std_cppm = generate_std_cppm(pcm_cache);
+        if (std_cppm.string().empty()) return Path();
+    }
 
     // libc++ include directory: <prefix>/include/c++/v1
     Path libcxx_inc = prefix / "include" / "c++" / "v1";
