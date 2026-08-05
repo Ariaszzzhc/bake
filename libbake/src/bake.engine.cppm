@@ -323,9 +323,22 @@ export BuildPlan create_convention_plan(
         include_dirs.push_back(inc);
     }
 
-    // Build module graph
+    // Helper: inject std module PCM into a CompileConfig if available.
+    // Ensures import std; works in ALL C++ sources, not just those
+    // discovered through module graph scanning.
+    auto ensure_std_dep = [&](CompileConfig& cc) {
+        if (std_module_pcm.string().empty() || !std_module_pcm.is_regular_file())
+            return;
+        for (auto& [name, _] : cc.module_deps) {
+            if (name == "std") return;  // already present
+        }
+        cc.module_deps.push_back({"std", std_module_pcm});
+    };
+
+    // Build module graph (scan even with no interfaces — .cpp files may
+    // import std or other modules that need dependency resolution)
     ModuleGraph mod_graph;
-    if (!sources.module_interfaces.empty()) {
+    if (!sources.module_interfaces.empty() || !sources.cpp_files.empty()) {
         mod_graph = ModuleGraph::build(tc, sources, std_ver, include_dirs);
     }
 
@@ -360,6 +373,7 @@ export BuildPlan create_convention_plan(
                 cc.module_deps.push_back({imp, it->second});
             }
         }
+        ensure_std_dep(cc);
 
         BuildAction action;
         action.type = BuildAction::Type::CompileModule;
@@ -420,6 +434,9 @@ export BuildPlan create_convention_plan(
             }
         }
 
+        // Ensure import std; resolves even without a module graph
+        ensure_std_dep(cc);
+
         BuildAction action;
         action.type = BuildAction::Type::Compile;
         action.id = "compile:" + src.string();
@@ -461,6 +478,7 @@ export BuildPlan create_convention_plan(
         cc.std_ver = std_ver;
         cc.include_dirs = include_dirs;
         cc.use_pic = (pkg.type == PackageType::SharedLib);
+        ensure_std_dep(cc);
 
         BuildAction action;
         action.type = BuildAction::Type::Compile;
