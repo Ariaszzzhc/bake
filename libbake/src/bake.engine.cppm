@@ -266,7 +266,8 @@ export BuildPlan create_convention_plan(
         const std::vector<DepSourceEntry>& dep_sources = {},
         const std::vector<Path>& dep_include_dirs = {},
         bool compile_path_deps = true,
-        const Path& std_module_pcm = {}) {
+        const Path& std_module_pcm = {},
+        const std::vector<Path>& external_libs = {}) {
 
     BuildPlan plan;
     plan.project_root = layout.root;
@@ -506,6 +507,11 @@ export BuildPlan create_convention_plan(
             if (a.is_compile() && !a.outputs.empty()) {
                 obj_files.push_back(a.outputs[0]);
             }
+        }
+
+        // Add external libraries (from CMake deps) as additional link inputs
+        for (auto& elib : external_libs) {
+            obj_files.push_back(elib);
         }
 
         std::string out_name = library_name(pkg.name, pkg.type);
