@@ -77,6 +77,54 @@ inline std::optional<std::string> find_cmake() {
     return std::nullopt;
 }
 
+// Compute a cache key for a CMake sub-build.
+// Changes in CMakeLists.txt, defines, or toolchain invalidate the cache.
+inline std::string compute_cache_key(const CMakeConfig& config) {
+    std::string key_data;
+
+    // CMakeLists.txt content
+    Path cmake_lists = config.source_dir / "CMakeLists.txt";
+    auto content = read_file(cmake_lists);
+    if (content) key_data += *content;
+    key_data += "\n---\n";
+
+    // Build config
+    key_data += config.build_config;
+    key_data += "\n---\n";
+
+    // Sorted defines
+    auto sorted_defines = config.defines;
+    std::sort(sorted_defines.begin(), sorted_defines.end());
+    for (auto& [k, v] : sorted_defines) {
+        key_data += k + "=" + v + "\n";
+    }
+    key_data += "\n---\n";
+
+    // Toolchain fingerprint
+    if (config.toolchain) {
+        key_data += config.toolchain->cxx_path + "\n";
+        key_data += config.toolchain->cc_path + "\n";
+    }
+
+    return SHA256::hex(key_data);
+}
+
+// Check if the CMake build cache is valid.
+// Returns true if staging dir has a matching cache key and install artifacts.
+inline bool cache_is_valid(const CMakeConfig& config) {
+    Path cache_file = config.staging_dir / ".bake_cmake_cache_key";
+    auto cached_key = read_file(cache_file);
+    if (!cached_key) return false;
+
+    auto current_key = compute_cache_key(config);
+    if (*cached_key != current_key) return false;
+
+    // Verify install artifacts exist (include/ or lib/ directory)
+    Path inc_dir = config.staging_dir / "include";
+    Path lib_dir = config.staging_dir / "lib";
+    return inc_dir.is_directory() || lib_dir.is_directory();
+}
+
 // Run cmake configure: cmake -S <src> -B <build> -DCMAKE_INSTALL_PREFIX=<staging> <flags>
 inline bool cmake_configure(const std::string& cmake_exe,
                             const CMakeConfig& config,
@@ -218,7 +266,15 @@ export inline std::optional<UsageRequirements> run_cmake_bridge(const CMakeConfi
     Path build_dir = config.staging_dir / "build";
     Path install_dir = config.staging_dir;  // CMAKE_INSTALL_PREFIX = staging itself
 
-    // Clean previous build if exists (simple approach — no incremental yet)
+    // Check cache — skip CMake configure+build if key matches
+    if (detail::cache_is_valid(config)) {
+        // Scan existing install tree and return cached results
+        auto usage = detail::scan_install_tree(install_dir);
+        std::println("bake: CMake dependency up to date (cached)");
+        return usage;
+    }
+
+    // Clean previous build if exists
     if (build_dir.is_directory()) {
         build_dir.remove_all();
     }
@@ -234,7 +290,11 @@ export inline std::optional<UsageRequirements> run_cmake_bridge(const CMakeConfi
         return std::nullopt;
     }
 
-    // Step 3: Scan install tree for usage requirements
+    // Step 3: Write cache key
+    write_file(install_dir / ".bake_cmake_cache_key",
+               detail::compute_cache_key(config));
+
+    // Step 4: Scan install tree for usage requirements
     auto usage = detail::scan_install_tree(install_dir);
 
     if (usage.includes.empty() && usage.libraries.empty()) {
