@@ -699,16 +699,17 @@ static void extract_dep_info(
                 config.toolchain = &tc;
 
                 auto usage = run_cmake_bridge(config);
-                if (usage) {
-                    for (const auto& inc : usage->includes) {
-                        dep_include_dirs.push_back(Path(inc));
-                    }
-                    for (const auto& lib : usage->libraries) {
-                        external_libs.push_back(lib);
-                    }
-                } else {
+                if (!usage) {
                     std::println(std::cerr,
-                        "bake: CMake bridge failed for '{}' — continuing", node_id);
+                        "bake: CMake bridge failed for '{}'", node_id);
+                    external_libs.clear();
+                    return;
+                }
+                for (const auto& inc : usage->includes) {
+                    dep_include_dirs.push_back(Path(inc));
+                }
+                for (const auto& lib : usage->libraries) {
+                    external_libs.push_back(lib);
                 }
             } else {
                 // No build system detected — just add public/ if it exists
@@ -950,12 +951,14 @@ export int cmd_build(const ParsedArgs& args) {
             config.staging_dir = staging;
             config.toolchain = &tc;
             auto usage = run_cmake_bridge(config);
-            if (usage) {
-                for (auto& inc : usage->includes)
-                    dep_include_dirs.push_back(Path(inc));
-                for (auto& lib : usage->libraries)
-                    external_libs.push_back(lib);
+            if (!usage) {
+                std::println(std::cerr, "bake: CMake bridge failed for '{}'", name);
+                return 1;
             }
+            for (auto& inc : usage->includes)
+                dep_include_dirs.push_back(Path(inc));
+            for (auto& lib : usage->libraries)
+                external_libs.push_back(lib);
         }
     }
 

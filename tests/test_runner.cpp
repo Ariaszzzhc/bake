@@ -600,6 +600,28 @@ TestResult test_cmake_dep_convention() {
     return {};
 }
 
+// Sandbox test: CMake project attempts find_package(ZLIB) but ZLIB is not
+// in the lock. bake's sandbox injects CMAKE_DISABLE_FIND_PACKAGE_ZLIB=ON,
+// causing the configure step to fail.
+TestResult test_cmake_sandbox() {
+    auto dir = make_temp_dir("cmake_sandbox");
+    copy_fixture("cmake_sandbox", dir);
+
+    auto r = run_bake("build", dir);
+    CHECK(!r.success(),
+          "bake build should have failed — sandbox should block find_package(ZLIB)");
+
+    // The error output should mention ZLIB or "disabled" or "not found"
+    bool has_relevant_error =
+        r.stdout.find("ZLIB") != std::string::npos ||
+        r.stdout.find("Could NOT find") != std::string::npos ||
+        r.stdout.find("CMake configure failed") != std::string::npos;
+    CHECK(has_relevant_error,
+          "expected ZLIB/CMake failure in output: " + r.stdout);
+
+    return {};
+}
+
 // ----------------------------------------------------------------
 // Test registry
 // ----------------------------------------------------------------
@@ -627,6 +649,7 @@ static std::vector<TestCase> all_tests = {
     {"workspace_member_filter",       test_workspace_member_filter},
     {"cmake_dep_build",               test_cmake_dep_build},
     {"cmake_dep_convention",          test_cmake_dep_convention},
+    {"cmake_sandbox",                 test_cmake_sandbox},
 };
 
 // ----------------------------------------------------------------
