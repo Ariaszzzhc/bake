@@ -100,18 +100,17 @@ target_link_libraries(libbake PRIVATE
     ${BAKE_LLVM_STATIC_LIBS}
 )
 
-# System libraries needed by LLVM static libs
-# dead_strip ensures only referenced code is kept in the final binary
-find_package(ZLIB QUIET)
-find_package(LibXml2 QUIET)
-find_package(zstd QUIET)
-target_link_libraries(libbake PRIVATE
-    ${ZLIB_LIBRARIES}
-    ${LIBXML2_LIBRARIES}
-    $<TARGET_NAME_IF_EXISTS:zstd::libzstd_shared>
-    $<TARGET_NAME_IF_EXISTS:zstd::libzstd_static>
-)
-# Fallback: link system libs by name if find_package didn't find them
+# Vendored static compression libraries (built from git submodules).
+# No system dependency — fully reproducible.
+find_library(ZLIB_STATIC_LIB NAMES libz.a
+  PATHS ${CMAKE_SOURCE_DIR}/external/zlib-install/lib
+  NO_DEFAULT_PATH REQUIRED)
+find_library(ZSTD_STATIC_LIB NAMES libzstd.a
+  PATHS ${CMAKE_SOURCE_DIR}/external/zstd-install/lib
+  NO_DEFAULT_PATH REQUIRED)
+target_link_libraries(libbake PRIVATE ${ZLIB_STATIC_LIB} ${ZSTD_STATIC_LIB})
+
+# dead_strip removes unreferenced code from the final binary.
 if(APPLE)
     target_link_options(libbake PRIVATE -Wl,-dead_strip)
 endif()

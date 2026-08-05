@@ -12,3 +12,7 @@
 /__cmake_systeminformation/
 /zig_native_cpp.o
 /external/llvm-install/
+/external/zlib-build/
+/external/zlib-install/
+/external/zstd-build/
+/external/zstd-install/
