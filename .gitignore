@@ -16,3 +16,4 @@
 /external/zlib-install/
 /external/zstd-build/
 /external/zstd-install/
+compile_commands.json

@@ -19,6 +19,11 @@ class Builder;
 class Step;
 class Dependency;
 
+// Options for source files added via Target::sources().
+struct SourceOptions {
+    std::vector<std::string> flags;  // extra compiler flags for these sources
+};
+
 class Target {
     friend class Builder;
     bake_target* handle_ = nullptr;
@@ -30,6 +35,17 @@ public:
     Target& sources(const char* pattern) { bake_target_sources(handle_, pattern); return *this; }
     Target& sources(std::initializer_list<const char*> patterns) {
         for (const char* pattern : patterns) bake_target_sources(handle_, pattern);
+        return *this;
+    }
+    Target& sources(const char* pattern, const SourceOptions& opts) {
+        std::vector<const char*> flags(opts.flags.size());
+        for (size_t i = 0; i < opts.flags.size(); ++i) flags[i] = opts.flags[i].c_str();
+        bake_target_sources_with_flags(handle_, pattern, flags.data(),
+                                       static_cast<int>(flags.size()));
+        return *this;
+    }
+    Target& sources(std::initializer_list<const char*> patterns, const SourceOptions& opts) {
+        for (const char* pattern : patterns) sources(pattern, opts);
         return *this;
     }
     Target& sources(Dependency& dependency, const char* pattern);

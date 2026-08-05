@@ -15,6 +15,7 @@ import std;
 import bake.util;
 import bake.project;
 import bake.compiler;
+import bake.engine;
 
 #include "bake_cabi.h"
 
@@ -62,12 +63,18 @@ struct bake_builder {
 
 // ---- struct bake_target (opaque handle) ----
 
+// A source glob pattern with optional per-source compile flags.
+struct source_entry {
+    std::string pattern;
+    std::vector<std::string> flags;  // extra compiler flags for matched files
+};
+
 struct bake_target {
     std::string name;
     TargetType type = TargetType::Executable;
     std::string std_ver = "c++20";
 
-    std::vector<std::string> source_patterns;
+    std::vector<source_entry> source_entries;
     std::vector<std::string> include_dirs;
     std::vector<std::string> private_include_dirs;
     std::vector<std::pair<std::string, std::string>> defines;
@@ -498,73 +505,213 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
 
         // ---------------------------------------------------
         // Phase 2: compile + link/archive actions per target.
+        // Uses the engine's ModuleGraph for C++20 module scanning,
+        // DAG, and topological sort — same as convention builds.
         // ---------------------------------------------------
+        // Modules compiled by earlier targets are importable by later
+        // targets in the same package (mirrors cross-member visibility
+        // in convention workspace builds).
+        std::map<std::string, bake::Path> module_bmi;
+        std::map<std::string, std::string> module_action;
         for (const auto& target : b->targets) {
             std::vector<std::string> compile_ids;
             std::vector<std::string> object_paths;
             std::set<std::string> emitted_compile_ids;
             bool has_cxx_sources = false;
 
-            // -- Expand source glob patterns --
-            for (const auto& pattern : target->source_patterns) {
-                auto files = expand_source_pattern(b->layout.root, pattern);
-
-                for (const auto& src : files) {
-                    if (!src.is_c()) has_cxx_sources = true;
-                    std::string src_rel = rel_to_root(src.fs(), b->layout.root.fs());
-                    const auto source_names = source_action_names(*b, src);
-                    std::string stem    = src.stem_string();
-                    std::string comp_id = build_action_id(
-                        "compile", package_name, target->name,
-                        source_names.identity);
-                    if (!emitted_compile_ids.insert(comp_id).second) continue;
-                    std::string object_hash =
-                        bake::SHA256::hex(comp_id).substr(0, 12);
-                    std::string object_path =
-                        (b->layout.obj_dir /
-                         (target->name + "__" + stem + "_" +
-                          object_hash + ".o"))
-                            .absolute().string();
-
-                    compile_ids.push_back(comp_id);
-                    object_paths.push_back(object_path);
-
-                    // Build compile configuration.
-                    bake::CompileConfig cc;
-                    cc.source  = bake::Path(src_rel);
-                    cc.output  = bake::Path(object_path);
-                    cc.std_ver = target->std_ver;
-                    cc.use_pic = (target->type == TargetType::SharedLib);
-
-                    for (const auto& inc : target->include_dirs)
-                        cc.include_dirs.push_back(bake::Path(inc));
-                    for (const auto& inc : target->private_include_dirs)
-                        cc.include_dirs.push_back(bake::Path(inc));
-                    for (const auto& inc : target->dependency_include_dirs)
-                        cc.include_dirs.push_back(bake::Path(inc));
-
-                    for (const auto& [name, value] : target->defines)
-                        cc.defines.push_back({name, value});
-                    for (const auto& [name, value] : target->private_defines)
-                        cc.defines.push_back({name, value});
-                    for (const auto& [name, value] : target->dependency_defines)
-                        cc.defines.push_back({name, value});
-
-                    auto cmd = bake::make_compile_command(b->toolchain, cc);
-
-                    nlohmann::json action;
-                    action["type"]       = "compile";
-                    action["id"]         = comp_id;
-                    action["description"] =
-                        action_owner(package_name, target->name) + ": " +
-                        source_names.display;
-                    action["inputs"]     = to_json_array({src_rel});
-                    action["outputs"]    = to_json_array({object_path});
-                    action["command"]    = to_json_array(cmd);
-                    action["depends_on"] = nlohmann::json::array();
-
-                    actions.push_back(std::move(action));
+            // -- Expand source entries (pattern + per-source flags) --
+            std::vector<bake::Path> all_sources;
+            std::map<std::string, std::vector<std::string>> source_flag_map;
+            for (const auto& entry : target->source_entries) {
+                auto files = expand_source_pattern(b->layout.root, entry.pattern);
+                for (auto& src : files) {
+                    all_sources.push_back(src);
+                    for (auto& f : entry.flags)
+                        source_flag_map[src.string()].push_back(f);
                 }
+            }
+
+            // -- Build include_dirs and defines --
+            // Include dirs are made absolute: the module scanner runs with a
+            // per-source working directory, so root-relative paths would not
+            // resolve there.
+            std::vector<bake::Path> include_dirs;
+            auto add_include_dir = [&](const std::string& inc) {
+                include_dirs.push_back(
+                    bake::Path(absolute_from_root(b->layout.root, inc)));
+            };
+            for (const auto& inc : target->include_dirs)
+                add_include_dir(inc);
+            for (const auto& inc : target->private_include_dirs)
+                add_include_dir(inc);
+            for (const auto& inc : target->dependency_include_dirs)
+                add_include_dir(inc);
+
+            std::vector<std::pair<std::string, std::string>> defines;
+            for (const auto& [name, value] : target->defines)
+                defines.push_back({name, value});
+            for (const auto& [name, value] : target->private_defines)
+                defines.push_back({name, value});
+            for (const auto& [name, value] : target->dependency_defines)
+                defines.push_back({name, value});
+
+            // -- Separate sources and build module graph --
+            bake::SourceSet src_set;
+            for (auto& src : all_sources) {
+                if (src.has_extension(".cppm")) {
+                    src_set.module_interfaces.push_back(src);
+                    has_cxx_sources = true;
+                } else if (src.is_cpp()) {
+                    src_set.cpp_files.push_back(src);
+                    has_cxx_sources = true;
+                } else {
+                    src_set.c_files.push_back(src);
+                }
+            }
+
+            bake::ModuleGraph mod_graph;
+            if (!src_set.module_interfaces.empty() || !src_set.cpp_files.empty()) {
+                b->layout.bmi_dir.mkdir_recursive();
+                mod_graph = bake::ModuleGraph::build(
+                    b->toolchain, src_set, target->std_ver, include_dirs);
+            }
+
+            // Helper to make a CompileConfig with common fields
+            auto make_cc = [&](bake::Path src, std::string src_rel,
+                               std::string obj_path) {
+                bake::CompileConfig cc;
+                cc.source  = bake::Path(src_rel);
+                cc.output  = bake::Path(obj_path);
+                cc.std_ver = target->std_ver;
+                cc.use_pic = (target->type == TargetType::SharedLib);
+                cc.include_dirs = include_dirs;
+                cc.defines = defines;
+                // Per-source flags from the source entry that matched this file
+                auto it = source_flag_map.find(src.string());
+                if (it != source_flag_map.end())
+                    cc.extra_flags = it->second;
+                return cc;
+            };
+
+            // -- Phase 2a: Compile module interfaces (topological order) --
+            for (auto& mod_name : mod_graph.sorted) {
+                auto& info = mod_graph.modules[mod_name];
+                bake::Path src(info.source_path);
+                std::string src_rel = rel_to_root(src.fs(), b->layout.root.fs());
+                std::string comp_id = build_action_id(
+                    "module", package_name, target->name, src_rel);
+                std::string object_hash = bake::SHA256::hex(comp_id).substr(0, 12);
+                std::string object_path =
+                    (b->layout.obj_dir /
+                     (target->name + "__" + src.stem_string() + "_" +
+                      object_hash + ".o"))
+                        .absolute().string();
+                bake::Path bmi = b->layout.bmi_dir / (mod_name + ".pcm");
+                module_bmi[mod_name] = bmi;
+                module_action[mod_name] = comp_id;
+
+                bake::CompileConfig cc = make_cc(src, src_rel, object_path);
+                cc.is_module_interface = true;
+                cc.bmi_output = bmi;
+                nlohmann::json deps = nlohmann::json::array();
+                for (auto& imp : info.imports) {
+                    auto it = module_bmi.find(imp);
+                    if (it != module_bmi.end())
+                        cc.module_deps.push_back({imp, it->second});
+                    auto ait = module_action.find(imp);
+                    if (ait != module_action.end() && ait->second != comp_id)
+                        deps.push_back(ait->second);
+                }
+
+                compile_ids.push_back(comp_id);
+                object_paths.push_back(object_path);
+
+                auto cmd = bake::make_compile_command(b->toolchain, cc);
+                nlohmann::json action;
+                action["type"]       = "compile_module";
+                action["id"]         = comp_id;
+                action["description"] =
+                    action_owner(package_name, target->name) + ": " +
+                    src.filename_string();
+                action["inputs"]     = to_json_array({src_rel});
+                action["outputs"]    = to_json_array({object_path, bmi.string()});
+                action["command"]    = to_json_array(cmd);
+                action["depends_on"] = std::move(deps);
+                actions.push_back(std::move(action));
+            }
+
+            // -- Phase 2b: Compile regular sources --
+            for (auto& src : src_set.cpp_files) {
+                std::string src_rel = rel_to_root(src.fs(), b->layout.root.fs());
+                const auto source_names = source_action_names(*b, src);
+                std::string comp_id = build_action_id(
+                    "compile", package_name, target->name, source_names.identity);
+                if (!emitted_compile_ids.insert(comp_id).second) continue;
+                std::string object_hash = bake::SHA256::hex(comp_id).substr(0, 12);
+                std::string object_path =
+                    (b->layout.obj_dir /
+                     (target->name + "__" + src.stem_string() + "_" +
+                      object_hash + ".o"))
+                        .absolute().string();
+
+                bake::CompileConfig cc = make_cc(src, src_rel, object_path);
+                // Inject module deps. Clang's -fmodule-file doesn't resolve
+                // transitive dependencies, so we must provide ALL available
+                // module BMIs to every consumer, not just direct imports.
+                nlohmann::json deps = nlohmann::json::array();
+                for (auto& [name, bmi] : module_bmi) {
+                    cc.module_deps.push_back({name, bmi});
+                }
+                // Record dependency on the actions that built those modules
+                for (auto& imp : mod_graph.consumers[src.string()].imports) {
+                    auto ait = module_action.find(imp);
+                    if (ait != module_action.end())
+                        deps.push_back(ait->second);
+                }
+
+                compile_ids.push_back(comp_id);
+                object_paths.push_back(object_path);
+                auto cmd = bake::make_compile_command(b->toolchain, cc);
+                nlohmann::json action;
+                action["type"]       = "compile";
+                action["id"]         = comp_id;
+                action["description"] =
+                    action_owner(package_name, target->name) + ": " +
+                    source_names.display;
+                action["inputs"]     = to_json_array({src_rel});
+                action["outputs"]    = to_json_array({object_path});
+                action["command"]    = to_json_array(cmd);
+                action["depends_on"] = std::move(deps);
+                actions.push_back(std::move(action));
+            }
+            for (auto& src : src_set.c_files) {
+                std::string src_rel = rel_to_root(src.fs(), b->layout.root.fs());
+                const auto source_names = source_action_names(*b, src);
+                std::string comp_id = build_action_id(
+                    "compile", package_name, target->name, source_names.identity);
+                if (!emitted_compile_ids.insert(comp_id).second) continue;
+                std::string object_hash = bake::SHA256::hex(comp_id).substr(0, 12);
+                std::string object_path =
+                    (b->layout.obj_dir /
+                     (target->name + "__" + src.stem_string() + "_" +
+                      object_hash + ".o"))
+                        .absolute().string();
+
+                bake::CompileConfig cc = make_cc(src, src_rel, object_path);
+                compile_ids.push_back(comp_id);
+                object_paths.push_back(object_path);
+                auto cmd = bake::make_compile_command(b->toolchain, cc);
+                nlohmann::json action;
+                action["type"]       = "compile";
+                action["id"]         = comp_id;
+                action["description"] =
+                    action_owner(package_name, target->name) + ": " +
+                    source_names.display;
+                action["inputs"]     = to_json_array({src_rel});
+                action["outputs"]    = to_json_array({object_path});
+                action["command"]    = to_json_array(cmd);
+                action["depends_on"] = nlohmann::json::array();
+                actions.push_back(std::move(action));
             }
 
             // -- Link / archive action --
@@ -599,6 +746,11 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 bake::LinkConfig lc;
                 for (const auto& obj : object_paths)
                     lc.inputs.push_back(bake::Path(obj));
+                // Add outputs of linked targets (e.g. bake links libbake)
+                for (const auto* linked : target->linked_targets) {
+                    if (!linked->output_path.empty())
+                        lc.inputs.push_back(bake::Path(linked->output_path));
+                }
                 lc.output = bake::Path(output_path);
                 lc.type   = pkg_type;
                 lc.use_cxx_linker = has_cxx_sources || target->dependency_uses_cxx;
@@ -915,9 +1067,25 @@ BAKE_API bake_target* bake_target_std(bake_target* t, const char* std_ver) noexc
 BAKE_API bake_target* bake_target_sources(bake_target* t, const char* pattern) noexcept {
     if (!t || !pattern) return t;
     try {
-        t->source_patterns.push_back(pattern);
+        t->source_entries.push_back({pattern, {}});
     } catch (const std::exception& e) {
         set_error(std::string("bake_target_sources: ") + e.what());
+    }
+    return t;
+}
+
+BAKE_API bake_target* bake_target_sources_with_flags(
+    bake_target* t, const char* pattern,
+    const char* const* flags, int num_flags) noexcept {
+    if (!t || !pattern) return t;
+    try {
+        source_entry entry;
+        entry.pattern = pattern;
+        for (int i = 0; i < num_flags; ++i)
+            if (flags[i]) entry.flags.push_back(flags[i]);
+        t->source_entries.push_back(std::move(entry));
+    } catch (const std::exception& e) {
+        set_error(std::string("bake_target_sources_with_flags: ") + e.what());
     }
     return t;
 }
@@ -969,7 +1137,7 @@ BAKE_API bake_target* bake_target_dependency_sources(
     if (!t || !dependency || !pattern) return t;
     try {
         if (auto path = dependency_relative_path(dependency, pattern, true))
-            t->source_patterns.push_back(std::move(*path));
+            t->source_entries.push_back({std::move(*path), {}});
     } catch (const std::exception& e) {
         set_error(std::string("bake_target_dependency_sources: ") + e.what());
     }

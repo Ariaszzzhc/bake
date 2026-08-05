@@ -96,6 +96,10 @@ export std::optional<ModuleInfo> scan_module_file(
     for (auto& inc : include_dirs) {
         cmd.push_back("-I" + inc.string());
     }
+    for (auto& inc : tc.scan_include_dirs) {
+        cmd.push_back("-isystem");
+        cmd.push_back(inc);
+    }
     cmd.push_back("-c");
     cmd.push_back(source.string());
 
@@ -980,6 +984,7 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
 
         std::string type_str = jaction.value("type", "compile");
         if (type_str == "compile") action.type = BuildAction::Type::Compile;
+        else if (type_str == "compile_module") action.type = BuildAction::Type::CompileModule;
         else if (type_str == "link") action.type = BuildAction::Type::Link;
         else if (type_str == "archive") action.type = BuildAction::Type::Archive;
         else action.type = BuildAction::Type::Compile;

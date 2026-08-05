@@ -29,6 +29,10 @@ export struct Toolchain {
     std::string cc_path;        // C compiler
     std::string ar_path;        // archiver
     std::string scanner_path;   // clang-scan-deps (Clang only)
+    // Vendored system header dirs for the module scanner. clang-scan-deps
+    // runs the scan in-process and never enters bake's driver, so the
+    // driver's default -isystem injection must be repeated here (BakeSelf).
+    std::vector<std::string> scan_include_dirs;
 
     bool has_scanner() const { return !scanner_path.empty(); }
     bool is_clang() const { return kind == CompilerKind::Clang || kind == CompilerKind::AppleClang || kind == CompilerKind::BakeSelf; }
@@ -51,7 +55,24 @@ export struct Toolchain {
             if (self.empty()) self = "bake";  // graceful fallback
             tc.cxx_path = self;
             tc.cc_path = self;
-            tc.scanner_path = "";  // bake c++ has built-in module scanning via Clang
+#ifdef BAKE_LLVM_PREFIX
+            // Use the vendored clang-scan-deps for P1689 module scanning.
+            Path scanner = Path(BAKE_LLVM_PREFIX) / "bin" / "clang-scan-deps";
+            if (scanner.is_regular_file())
+                tc.scanner_path = scanner.string();
+#endif
+            // The scanner bypasses bake's driver, so repeat the vendored
+            // header search paths here (same order as bake_clang_driver.cpp).
+#ifdef BAKE_LIBCXX_INC
+            tc.scan_include_dirs.push_back(BAKE_LIBCXX_INC);
+#endif
+#ifdef BAKE_RESOURCE_DIR
+            tc.scan_include_dirs.push_back(
+                std::string(BAKE_RESOURCE_DIR) + "/include");
+#endif
+#if defined(BAKE_DARWIN_INC) && defined(__APPLE__)
+            tc.scan_include_dirs.push_back(BAKE_DARWIN_INC);
+#endif
             tc.ar_path = "ar";     // still use system ar for now (bake ar is Phase 6)
             return tc;
         }
@@ -160,6 +181,7 @@ export struct CompileConfig {
     // module dependencies: module_name → bmi_path
     std::vector<std::pair<std::string, Path>> module_deps;
     bool use_pic = false;  // -fPIC
+    std::vector<std::string> extra_flags;  // raw compiler flags (e.g. -fno-rtti)
 };
 
 // The manifest/build API uses the compiler's standard spelling directly.
@@ -217,6 +239,11 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
     // PIC
     if (cc.use_pic) {
         cmd.push_back("-fPIC");
+    }
+
+    // Extra raw compiler flags (e.g. -fno-rtti for LLVM-interfacing sources)
+    for (auto& flag : cc.extra_flags) {
+        cmd.push_back(flag);
     }
 
     // Module interface
@@ -290,9 +317,13 @@ export std::vector<std::string> make_link_command(const Toolchain& tc,
         cmd.push_back(input.string());
     }
 
-    // Link libraries
+    // Link libraries — full paths (containing / or ending in .a) are
+    // passed directly; bare names get -l prefix.
     for (auto& lib : lc.link_libs) {
-        cmd.push_back("-l" + lib);
+        if (lib.find('/') != std::string::npos || lib.ends_with(".a"))
+            cmd.push_back(lib);
+        else
+            cmd.push_back("-l" + lib);
     }
 
     for (auto& framework : lc.frameworks) {

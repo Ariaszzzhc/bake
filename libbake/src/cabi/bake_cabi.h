@@ -49,6 +49,7 @@ BAKE_API const char* bake_builder_build_dir(const bake_builder*) BAKE_NOEXCEPT;
 // Target
 BAKE_API bake_target* bake_target_std(bake_target*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_sources(bake_target*, const char*) BAKE_NOEXCEPT;
+BAKE_API bake_target* bake_target_sources_with_flags(bake_target*, const char* pattern, const char* const* flags, int num_flags) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_include_dirs(bake_target*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_private_include_dirs(bake_target*, const char*) BAKE_NOEXCEPT;
 BAKE_API bake_target* bake_target_define(bake_target*, const char*, const char*) BAKE_NOEXCEPT;
