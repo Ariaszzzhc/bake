@@ -186,12 +186,12 @@ export struct LinkConfig {
 export std::vector<std::string> make_compile_command(const Toolchain& tc,
                                                       const CompileConfig& cc) {
     std::vector<std::string> cmd;
-    // BakeSelf spawns "<bake_path> c++" as two argv elements; other kinds use cc/cxx_path directly.
+    const bool compile_as_c = cc.source.is_c() && !cc.is_module_interface;
+    // BakeSelf spawns "<bake_path> cc|c++" as two argv elements.
     if (tc.kind == CompilerKind::BakeSelf) {
         cmd.push_back(tc.cxx_path);
-        cmd.push_back("c++");
+        cmd.push_back(compile_as_c ? "cc" : "c++");
     } else {
-        const bool compile_as_c = cc.source.is_c() && !cc.is_module_interface;
         cmd.push_back(compile_as_c ? tc.cc_path : tc.cxx_path);
     }
 
@@ -272,10 +272,10 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
 export std::vector<std::string> make_link_command(const Toolchain& tc,
                                                    const LinkConfig& lc) {
     std::vector<std::string> cmd;
-    // BakeSelf spawns "<bake_path> c++" as two argv elements (handles linking via in-process LLD).
+    // BakeSelf spawns "<bake_path> cc|c++" as two argv elements (handles linking via in-process LLD).
     if (tc.kind == CompilerKind::BakeSelf) {
         cmd.push_back(tc.cxx_path);
-        cmd.push_back("c++");
+        cmd.push_back(lc.use_cxx_linker ? "c++" : "cc");
     } else {
         cmd.push_back(lc.use_cxx_linker ? tc.cxx_path : tc.cc_path);
     }
