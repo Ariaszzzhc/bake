@@ -1137,6 +1137,11 @@ export int build_with_build_cpp(
             if (action.type != BuildAction::Type::Compile &&
                 action.type != BuildAction::Type::CompileModule)
                 continue;
+            // Skip C source files — import std is C++ only
+            bool is_c_source = false;
+            for (auto& input : action.inputs)
+                if (input.is_c()) { is_c_source = true; break; }
+            if (is_c_source) continue;
             action.command.push_back("-fmodule-file=std=" + std_pcm.string());
             if (tc.is_clang()) {
                 action.command.push_back("-stdlib=libc++");
