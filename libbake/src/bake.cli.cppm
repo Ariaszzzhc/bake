@@ -796,10 +796,10 @@ export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
     cache_dir.mkdir_recursive();
     std::println("   Compiling libc++ + libc++abi from source (cached)");
 
-    std::string libcxxabi_inc = src + "/external/llvm-project/libcxxabi/include";
-    std::string libcxx_src    = src + "/external/llvm-project/libcxx/src";
-    std::string libcxxabi_src = src + "/external/llvm-project/libcxxabi/src";
-    std::string libc_inc      = src + "/external/llvm-project/libc";
+    std::string libcxxabi_inc = src + "/lib/libcxxabi/include";
+    std::string libcxx_src    = src + "/lib/libcxx/src";
+    std::string libcxxabi_src = src + "/lib/libcxxabi/src";
+    std::string libc_inc      = src + "/lib/libcxx/libc";
 
     // Common compile flags. bake's driver already injects vendored header
     // paths (libcxx_inc, builtins, darwin). We add:
@@ -932,8 +932,12 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
         if (std_cppm.string().empty()) return Path();
     }
 
-    // libc++ include directory: <prefix>/include/c++/v1
+    // libc++ include directory: prefer vendored source, fall back to install tree.
+#ifdef BAKE_LIBCXX_INC
+    Path libcxx_inc = Path(BAKE_LIBCXX_INC);
+#else
     Path libcxx_inc = prefix / "include" / "c++" / "v1";
+#endif
 
     std::println("   Preparing standard library module");
 

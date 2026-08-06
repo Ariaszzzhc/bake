@@ -71,10 +71,10 @@ int main() {
         .define("BAKE_LIB_DIR", q(b.build_dir()).c_str())
         .define("BAKE_LLVM_PREFIX", q(llvm_dir).c_str())
         .define("BAKE_RESOURCE_DIR", q(llvm_dir + "/lib/clang/22").c_str())
-        .define("BAKE_DARWIN_INC", q(ws + "/lib/bake/libc/darwin/include").c_str())
-        .define("BAKE_DARWIN_LIB", q(ws + "/lib/bake/libc/darwin").c_str())
-        .define("BAKE_LIBCXX_INC", q(llvm_dir + "/include/c++/v1").c_str())
-        .define("BAKE_LIBCXX_MODULES_DIR", q(ws + "/external/llvm-project/libcxx/modules").c_str());
+        .define("BAKE_DARWIN_INC", q(ws + "/lib/libc/darwin/include").c_str())
+        .define("BAKE_DARWIN_LIB", q(ws + "/lib/libc/darwin").c_str())
+        .define("BAKE_LIBCXX_INC", q(ws + "/lib/libcxx/include").c_str())
+        .define("BAKE_LIBCXX_MODULES_DIR", q(ws + "/lib/libcxx/modules").c_str());
 
     // Link all LLVM/Clang/LLD static libs in dependency order + zlib + zstd.
     for (auto& lib : clang_libs) libbake.link_system(lib.c_str());
