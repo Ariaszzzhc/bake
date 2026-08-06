@@ -524,6 +524,16 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         // module compiled in an earlier target can contribute its closure
         // to a module compiled in a later target.
         std::map<std::string, std::vector<std::string>> module_imports;
+
+        // Pre-build standard modules (std + std.compat) and seed module_bmi
+        // so that every C++ action gets the correct -fmodule-file mappings
+        // directly from make_compile_command — no CLI post-processing needed.
+        bake::ModuleFileMap standard_modules =
+            bake::ensure_std_modules(b->toolchain, b->layout.out_dir);
+        for (const auto& [name, pcm] : standard_modules) {
+            if (!pcm.string().empty() && pcm.is_regular_file())
+                module_bmi[name] = pcm;
+        }
         for (const auto& target : b->targets) {
             std::vector<std::string> compile_ids;
             std::vector<std::string> object_paths;
@@ -661,7 +671,14 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 action["description"] =
                     action_owner(package_name, target->name) + ": " +
                     src.filename_string();
-                action["inputs"]     = to_json_array({src_rel});
+                // Inputs: source file + all BMI dependencies (so module
+                // changes trigger incremental rebuild).
+                std::vector<std::string> action_inputs = {src_rel};
+                for (auto& [dep_name, dep_bmi] : cc.module_deps) {
+                    action_inputs.push_back(
+                        rel_to_root(dep_bmi.fs(), b->layout.root.fs()));
+                }
+                action["inputs"]     = to_json_array(action_inputs);
                 action["outputs"]    = to_json_array({object_path, bmi.string()});
                 action["command"]    = to_json_array(cmd);
                 action["depends_on"] = std::move(deps);
@@ -683,15 +700,34 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                         .absolute().string();
 
                 bake::CompileConfig cc = make_cc(src, src_rel, object_path);
-                // Inject module deps. Clang's -fmodule-file doesn't resolve
-                // transitive dependencies, so we must provide ALL available
-                // module BMIs to every consumer, not just direct imports.
-                nlohmann::json deps = nlohmann::json::array();
-                for (auto& [name, bmi] : module_bmi) {
-                    cc.module_deps.push_back({name, bmi});
+                // Inject the full transitive closure of module imports.
+                // Clang's -fmodule-file doesn't resolve transitive
+                // dependencies, so every reachable BMI must be listed.
+                auto consumer_it = mod_graph.consumers.find(src.string());
+                if (consumer_it != mod_graph.consumers.end()) {
+                    auto closure = bake::module_import_closure(
+                        consumer_it->second.imports, module_imports);
+                    for (auto& imp : closure) {
+                        auto it = module_bmi.find(imp);
+                        if (it != module_bmi.end())
+                            cc.module_deps.push_back({imp, it->second});
+                    }
                 }
-                // Record dependency on the actions that built those modules
-                for (auto& imp : mod_graph.consumers[src.string()].imports) {
+                // Also inject standard modules (std, std.compat) for all
+                // C++ sources, even if they don't explicitly import std.
+                for (auto& [name, bmi] : module_bmi) {
+                    if (name == "std" || name == "std.compat") {
+                        bool already = false;
+                        for (auto& [existing, _] : cc.module_deps)
+                            if (existing == name) { already = true; break; }
+                        if (!already)
+                            cc.module_deps.push_back({name, bmi});
+                    }
+                }
+                nlohmann::json deps = nlohmann::json::array();
+                for (auto& imp : consumer_it != mod_graph.consumers.end()
+                                     ? consumer_it->second.imports
+                                     : std::vector<std::string>{}) {
                     auto ait = module_action.find(imp);
                     if (ait != module_action.end())
                         deps.push_back(ait->second);
@@ -706,7 +742,12 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 action["description"] =
                     action_owner(package_name, target->name) + ": " +
                     source_names.display;
-                action["inputs"]     = to_json_array({src_rel});
+                std::vector<std::string> cpp_inputs = {src_rel};
+                for (auto& [dep_name, dep_bmi] : cc.module_deps) {
+                    cpp_inputs.push_back(
+                        rel_to_root(dep_bmi.fs(), b->layout.root.fs()));
+                }
+                action["inputs"]     = to_json_array(cpp_inputs);
                 action["outputs"]    = to_json_array({object_path});
                 action["command"]    = to_json_array(cmd);
                 action["depends_on"] = std::move(deps);
@@ -806,6 +847,16 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                     cmd = bake::make_archive_command(b->toolchain, lc);
                 else
                     cmd = bake::make_link_command(b->toolchain, lc);
+
+                // Ensure libc++ at link time when import std is in use.
+                // BakeSelf uses static libc++ objects instead (injected
+                // by the CLI caller via inject_static_libcxx).
+                if (lc.use_cxx_linker && !standard_modules.empty() &&
+                    b->toolchain.is_clang() &&
+                    b->toolchain.kind != bake::CompilerKind::BakeSelf) {
+                    auto prefix_len = bake::cxx_prefix(b->toolchain).size();
+                    cmd.insert(cmd.begin() + prefix_len, "-stdlib=libc++");
+                }
 
                 // depends_on: all compile actions for this target,
                 // plus any steps the target depends on.
