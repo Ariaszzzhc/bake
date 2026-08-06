@@ -51,6 +51,8 @@ int main() {
     libbake.std("c++23")
         .sources({
             "src/bake.util.cppm",
+            "src/nlohmann.json.cppm",
+            "src/tomlplusplus.cppm",
             "src/bake.project.cppm",
             "src/bake.compiler.cppm",
             "src/bake.engine.cppm",

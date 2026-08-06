@@ -1,13 +1,10 @@
-module;
-
-#include <nlohmann/json.hpp>
-
 export module bake.engine;
 
 import std;
 import bake.util;
 import bake.project;
 import bake.compiler;
+import nlohmann.json;
 
 // ============================================================
 // bake.engine — source discovery, module scanning, DAG, executor
@@ -240,7 +237,7 @@ export struct BuildAction {
     std::vector<Path> outputs;
     std::vector<std::string> command;
     // Index into the plan's action list
-    std::vector<size_t> depends_on;
+    std::vector<std::size_t> depends_on;
 
     bool is_compile() const { return type == Type::Compile || type == Type::CompileModule; }
 };
@@ -305,6 +302,29 @@ std::string object_name_for(const Path& source, std::string_view action_id) {
 
 } // namespace
 
+// Compute the full transitive closure of module imports starting from
+// ``roots``.  ``imports`` maps a module name to its direct imports.
+// Roots themselves are included; a std::set prevents cycles/duplicates.
+// Returns a sorted vector so command lines and fingerprints are deterministic.
+export std::vector<std::string> module_import_closure(
+        const std::vector<std::string>& roots,
+        const std::map<std::string, std::vector<std::string>>& imports) {
+    std::set<std::string> visited;
+    std::vector<std::string> queue(roots.begin(), roots.end());
+    while (!queue.empty()) {
+        std::string mod = std::move(queue.back());
+        queue.pop_back();
+        if (!visited.insert(mod).second) continue;
+        auto it = imports.find(mod);
+        if (it != imports.end()) {
+            for (const auto& imp : it->second) {
+                if (!visited.count(imp)) queue.push_back(imp);
+            }
+        }
+    }
+    return std::vector<std::string>(visited.begin(), visited.end());
+}
+
 // Create a build plan using convention rules
 export BuildPlan create_convention_plan(
         const Manifest& manifest,
@@ -314,7 +334,7 @@ export BuildPlan create_convention_plan(
         const std::vector<DepSourceEntry>& dep_sources = {},
         const std::vector<Path>& dep_include_dirs = {},
         bool compile_path_deps = true,
-        const Path& std_module_pcm = {},
+        const ModuleFileMap& standard_modules = {},
         const std::vector<PackageUsageRequirements>& package_requirements = {}) {
 
     BuildPlan plan;
@@ -407,17 +427,20 @@ export BuildPlan create_convention_plan(
         include_dirs.push_back(inc);
     }
 
-    // Helper: inject std module PCM into a CompileConfig if available.
-    // Ensures import std; works in ALL C++ sources, not just those
-    // discovered through module graph scanning.
+    // Helper: inject all valid standard-module PCMs into a CompileConfig.
+    // Ensures import std; and import std.compat; resolve in ALL C++ sources.
     auto ensure_std_dep = [&](CompileConfig& cc) {
         if (cc.source.is_c()) return;
-        if (std_module_pcm.string().empty() || !std_module_pcm.is_regular_file())
-            return;
-        for (auto& [name, _] : cc.module_deps) {
-            if (name == "std") return;  // already present
+        for (const auto& [mod_name, pcm_path] : standard_modules) {
+            if (pcm_path.string().empty() || !pcm_path.is_regular_file())
+                continue;
+            bool already = false;
+            for (const auto& [existing, _] : cc.module_deps) {
+                if (existing == mod_name) { already = true; break; }
+            }
+            if (!already)
+                cc.module_deps.push_back({mod_name, pcm_path});
         }
-        cc.module_deps.push_back({"std", std_module_pcm});
     };
 
     // Build module graph (scan even with no interfaces — .cpp files may
@@ -427,12 +450,22 @@ export BuildPlan create_convention_plan(
         mod_graph = ModuleGraph::build(tc, sources, std_ver, include_dirs);
     }
 
-    // Map module name → BMI path
+    // Map module name → BMI path.
+    // Seed with prebuilt standard-module PCMs so import std; and
+    // import std.compat; resolve. Prebuilt modules have no project
+    // compile action — they must NOT be added to ModuleGraph::modules.
     std::map<std::string, Path> module_bmi;
+    for (const auto& [mod_name, pcm_path] : standard_modules) {
+        if (!pcm_path.string().empty() && pcm_path.is_regular_file())
+            module_bmi[mod_name] = pcm_path;
+    }
 
-    // Register the pre-built libc++ std module so import std; resolves.
-    if (!std_module_pcm.string().empty() && std_module_pcm.is_regular_file()) {
-        module_bmi["std"] = std_module_pcm;
+    // Import adjacency for transitive-closure computation. Clang's
+    // -fmodule-file does not resolve transitive module dependencies, so
+    // every reachable BMI must be passed explicitly at each compile site.
+    std::map<std::string, std::vector<std::string>> module_imports;
+    for (auto& [name, info] : mod_graph.modules) {
+        module_imports[name] = info.imports;
     }
 
     // Phase 1: Compile module interfaces (in dependency order)
@@ -456,8 +489,9 @@ export BuildPlan create_convention_plan(
         cc.bmi_output = bmi;
         cc.use_pic = (pkg.type == PackageType::SharedLib);
 
-        // Module dependencies (imports)
-        for (auto& imp : info.imports) {
+        // Module dependencies — full transitive closure of imports.
+        auto closure = module_import_closure(info.imports, module_imports);
+        for (auto& imp : closure) {
             auto it = module_bmi.find(imp);
             if (it != module_bmi.end()) {
                 cc.module_deps.push_back({imp, it->second});
@@ -546,7 +580,7 @@ export BuildPlan create_convention_plan(
         action.command = make_compile_command(tc, cc);
 
         // Depend on all module compilations
-        for (size_t i = 0; i < plan.actions.size(); ++i) {
+        for (std::size_t i = 0; i < plan.actions.size(); ++i) {
             if (plan.actions[i].type == BuildAction::Type::CompileModule) {
                 action.depends_on.push_back(i);
             }
@@ -586,7 +620,7 @@ export BuildPlan create_convention_plan(
         action.command = make_compile_command(tc, cc);
 
         // Depend on all module compilations (dep sources may import modules)
-        for (size_t i = 0; i < plan.actions.size(); ++i) {
+        for (std::size_t i = 0; i < plan.actions.size(); ++i) {
             if (plan.actions[i].type == BuildAction::Type::CompileModule) {
                 action.depends_on.push_back(i);
             }
@@ -652,7 +686,7 @@ export BuildPlan create_convention_plan(
 
             // Ensure libc++ at link time when import std is in use.
             // BakeSelf uses static libc++ objects instead (injected by caller).
-            if (lc.use_cxx_linker && !std_module_pcm.string().empty() &&
+            if (lc.use_cxx_linker && standard_modules.contains("std") &&
                 tc.is_clang() && tc.kind != CompilerKind::BakeSelf) {
                 // Insert after the executable prefix (1 for normal compilers,
                 // 2 for BakeSelf where prefix is [bake, c++]).
@@ -663,7 +697,7 @@ export BuildPlan create_convention_plan(
         }
 
         // Depends on all compile actions
-        for (size_t i = 0; i < plan.actions.size(); ++i) {
+        for (std::size_t i = 0; i < plan.actions.size(); ++i) {
             if (plan.actions[i].is_compile()) {
                 link_action.depends_on.push_back(i);
             }
@@ -727,8 +761,9 @@ std::map<std::string, std::string> load_action_fingerprints(const Path& path) {
             !document["actions"].is_object()) {
             return fingerprints;
         }
-        for (auto& [id, value] : document["actions"].items()) {
-            if (value.is_string()) fingerprints[id] = value.get<std::string>();
+        for (auto& item : document["actions"].items()) {
+            if (item.value().is_string())
+                fingerprints[item.key()] = item.value().get<std::string>();
         }
     } catch (...) {
         // A missing/corrupt state file is only a cache miss: rebuild safely.
@@ -764,7 +799,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     for (const auto& action : plan.actions)
         fingerprints.push_back(action_fingerprint(action));
 
-    auto action_needs_rebuild = [&](size_t index) {
+    auto action_needs_rebuild = [&](std::size_t index) {
         const auto& action = plan.actions[index];
         auto previous = previous_fingerprints.find(action.id);
         return previous == previous_fingerprints.end() ||
@@ -776,14 +811,14 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     // through dependencies is important: a link action can look current until
     // one of its object inputs is rebuilt later in this invocation.
     std::vector<bool> rebuild(plan.actions.size(), false);
-    for (size_t i = 0; i < plan.actions.size(); ++i)
+    for (std::size_t i = 0; i < plan.actions.size(); ++i)
         rebuild[i] = action_needs_rebuild(i);
     bool changed = true;
     while (changed) {
         changed = false;
-        for (size_t i = 0; i < plan.actions.size(); ++i) {
+        for (std::size_t i = 0; i < plan.actions.size(); ++i) {
             if (rebuild[i]) continue;
-            for (size_t dependency : plan.actions[i].depends_on) {
+            for (std::size_t dependency : plan.actions[i].depends_on) {
                 if (dependency < rebuild.size() && rebuild[dependency]) {
                     rebuild[i] = true;
                     changed = true;
@@ -813,7 +848,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     // For simplicity: module interfaces sequential, regular compiles parallel
 
     // First pass: compile module interfaces (sequential, in order)
-    for (size_t i = 0; i < plan.actions.size(); ++i) {
+    for (std::size_t i = 0; i < plan.actions.size(); ++i) {
         if (plan.actions[i].type == BuildAction::Type::CompileModule) {
             auto& action = plan.actions[i];
             if (!rebuild[i]) {
@@ -839,8 +874,8 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     }
 
     // Second pass: compile regular sources (parallel with threads)
-    std::vector<size_t> compile_indices;
-    for (size_t i = 0; i < plan.actions.size(); ++i) {
+    std::vector<std::size_t> compile_indices;
+    for (std::size_t i = 0; i < plan.actions.size(); ++i) {
         if (plan.actions[i].type == BuildAction::Type::Compile) {
             compile_indices.push_back(i);
         }
@@ -852,11 +887,11 @@ export int execute_plan(BuildPlan& plan, int jobs) {
 
         int actual_jobs = std::min(jobs, static_cast<int>(compile_indices.size()));
 
-        auto worker = [&](size_t start, size_t stride) {
-            for (size_t k = start; k < compile_indices.size(); k += stride) {
+        auto worker = [&](std::size_t start, std::size_t stride) {
+            for (std::size_t k = start; k < compile_indices.size(); k += stride) {
                 if (compile_failed.load() > 0) return;
 
-                size_t i = compile_indices[k];
+                std::size_t i = compile_indices[k];
                 auto& action = plan.actions[i];
 
                 if (!rebuild[i]) {
@@ -895,7 +930,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     }
 
     // Third pass: link/archive
-    for (size_t i = 0; i < plan.actions.size(); ++i) {
+    for (std::size_t i = 0; i < plan.actions.size(); ++i) {
         if (plan.actions[i].type == BuildAction::Type::Link ||
             plan.actions[i].type == BuildAction::Type::Archive) {
             auto& action = plan.actions[i];
@@ -934,7 +969,7 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     nlohmann::json state;
     state["schema"] = 1;
     state["actions"] = nlohmann::json::object();
-    for (size_t i = 0; i < plan.actions.size(); ++i) {
+    for (std::size_t i = 0; i < plan.actions.size(); ++i) {
         state["actions"][plan.actions[i].id] = fingerprints[i];
     }
     if (!atomic_write_file(state_path, state.dump(2))) {
@@ -977,7 +1012,7 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
     };
 
     // First pass: create all actions
-    std::map<std::string, size_t> id_to_index;
+    std::map<std::string, std::size_t> id_to_index;
 
     for (auto& jaction : doc["actions"]) {
         BuildAction action;
@@ -1001,7 +1036,7 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
             action.command.push_back(cmd);
         }
 
-        size_t idx = plan.actions.size();
+        std::size_t idx = plan.actions.size();
         id_to_index[action.id] = idx;
         plan.actions.push_back(std::move(action));
     }
@@ -1046,7 +1081,7 @@ export void write_compile_commands(const BuildPlan& plan, const Path& output_pat
 
         // Join command args into a single string
         std::string cmd_str;
-        for (size_t i = 0; i < action.command.size(); ++i) {
+        for (std::size_t i = 0; i < action.command.size(); ++i) {
             if (i > 0) cmd_str += " ";
             cmd_str += action.command[i];
         }

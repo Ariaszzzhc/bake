@@ -1,12 +1,9 @@
-module;
-
-#include <nlohmann/json.hpp>
-
 export module bake.package;
 
 import std;
 import bake.util;
 import bake.project;
+import nlohmann.json;
 
 // ============================================================
 // bake.package — Resolver, Fetcher, Cache
@@ -173,11 +170,11 @@ inline std::optional<std::string> Resolver::resolve_tag(const std::string& url, 
     std::string fallback_commit;
 
     auto& out = result.stdout_output;
-    size_t pos = 0;
+    std::size_t pos = 0;
     while (pos < out.size()) {
-        size_t tab = out.find('\t', pos);
+        std::size_t tab = out.find('\t', pos);
         if (tab == std::string::npos) break;
-        size_t eol = out.find('\n', tab);
+        std::size_t eol = out.find('\n', tab);
         if (eol == std::string::npos) eol = out.size();
 
         std::string sha = out.substr(pos, tab - pos);
@@ -217,7 +214,7 @@ inline std::string build_archive_url(const std::string& url, const std::string& 
     if (base.find("gitlab.com") != std::string::npos ||
         base.find("gitlab") != std::string::npos) {
         // GitLab: <base>/-/archive/<commit>/<repo>.tar.gz
-        size_t last_slash = base.find_last_of('/');
+        std::size_t last_slash = base.find_last_of('/');
         std::string repo = (last_slash != std::string::npos)
                            ? base.substr(last_slash + 1) : "repo";
         return base + "/-/archive/" + commit + "/" + repo + ".tar.gz";
@@ -256,11 +253,11 @@ inline std::optional<Path> Resolver::download_archive(const std::string& url,
 inline bool validate_extracted_tree(const std::filesystem::path& tmpdir) {
     namespace fs = std::filesystem;
 
-    const size_t MAX_FILES = 100'000;
-    const uintmax_t MAX_TOTAL_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
+    const std::size_t MAX_FILES = 100'000;
+    const std::uintmax_t MAX_TOTAL_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
 
-    size_t file_count = 0;
-    uintmax_t total_size = 0;
+    std::size_t file_count = 0;
+    std::uintmax_t total_size = 0;
 
     fs::path canonical_tmp = fs::canonical(tmpdir);
 
@@ -315,10 +312,10 @@ inline bool validate_extracted_tree(const std::filesystem::path& tmpdir) {
 // extracting. This prevents path traversal, symlink escapes, and zip bombs
 // from ever touching the filesystem.
 // Returns true if the archive passes all safety checks.
-inline bool prescan_archive(const Path& archive, size_t& out_file_count,
-                            uintmax_t& out_total_size) {
-    const size_t MAX_FILES = 100'000;
-    const uintmax_t MAX_TOTAL_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
+inline bool prescan_archive(const Path& archive, std::size_t& out_file_count,
+                            std::uintmax_t& out_total_size) {
+    const std::size_t MAX_FILES = 100'000;
+    const std::uintmax_t MAX_TOTAL_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
 
     // List all entries with metadata using `tar -tvf` (verbose).
     // This gives us type, size, and symlink target for each entry.
@@ -329,17 +326,17 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
         return false;
     }
 
-    size_t file_count = 0;
-    uintmax_t total_size = 0;
+    std::size_t file_count = 0;
+    std::uintmax_t total_size = 0;
 
     // Parse the verbose listing line by line.
     // Format example (BSD tar):
     //   -rw-r--r--  0 user group     1234 Jan  1 12:00 prefix/file.txt
     //   lrwxrwxrwx  0 user group        8 Jan  1 12:00 prefix/link -> target
     const auto& listing = result.stdout_output;
-    size_t pos = 0;
+    std::size_t pos = 0;
     while (pos < listing.size()) {
-        size_t eol = listing.find('\n', pos);
+        std::size_t eol = listing.find('\n', pos);
         if (eol == std::string::npos) eol = listing.size();
 
         std::string line = listing.substr(pos, eol - pos);
@@ -350,8 +347,8 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
         char type_char = line[0];
 
         // Find path: after timestamp pattern "HH:MM " in the line
-        size_t time_end = std::string::npos;
-        for (size_t i = 10; i + 1 < line.size(); ++i) {
+        std::size_t time_end = std::string::npos;
+        for (std::size_t i = 10; i + 1 < line.size(); ++i) {
             if (line[i] == ':' && std::isdigit(static_cast<unsigned char>(line[i - 1]))) {
                 if (i + 2 < line.size() && line[i + 1] == ' ') {
                     time_end = i + 2;
@@ -370,7 +367,7 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
         std::string entry;
         std::string link_target;
         if (type_char == 'l') {
-            size_t arrow = line.find(" -> ", time_end);
+            std::size_t arrow = line.find(" -> ", time_end);
             if (arrow != std::string::npos) {
                 entry = line.substr(time_end, arrow - time_end);
                 link_target = line.substr(arrow + 4);
@@ -400,7 +397,7 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
 
         // Reject path traversal (any component that is "..")
         {
-            size_t dotdot = 0;
+            std::size_t dotdot = 0;
             while ((dotdot = entry.find("..", dotdot)) != std::string::npos) {
                 bool left_ok = (dotdot == 0 || entry[dotdot - 1] == '/');
                 bool right_ok = (dotdot + 2 >= entry.size() ||
@@ -423,7 +420,7 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
                     entry, link_target);
                 return false;
             }
-            size_t dd = 0;
+            std::size_t dd = 0;
             while ((dd = link_target.find("..", dd)) != std::string::npos) {
                 bool left_ok = (dd == 0 || link_target[dd - 1] == '/');
                 bool right_ok = (dd + 2 >= link_target.size() ||
@@ -454,7 +451,7 @@ inline bool prescan_archive(const Path& archive, size_t& out_file_count,
             std::vector<std::string> fields;
             while (iss >> field) fields.push_back(field);
             if (fields.size() >= 5) {
-                uintmax_t fsize = 0;
+                std::uintmax_t fsize = 0;
                 std::istringstream sz(fields[4]);
                 sz >> fsize;
                 total_size += fsize;
@@ -484,8 +481,8 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     // Phase 1: Pre-scan archive entries BEFORE extraction.
     // This prevents malicious archives from writing to the filesystem
     // before safety checks can run.
-    size_t file_count = 0;
-    uintmax_t total_size = 0;
+    std::size_t file_count = 0;
+    std::uintmax_t total_size = 0;
     if (!prescan_archive(archive, file_count, total_size)) {
         return false;
     }
@@ -710,8 +707,8 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
     std::map<std::string, std::string> url_commit_to_node; // "url\0commit" → node_id
     std::map<std::string, std::string> name_to_node_id;    // dep_name → actual node_id
 
-    const size_t MAX_NODES = 256;
-    size_t node_count = 0;
+    const std::size_t MAX_NODES = 256;
+    std::size_t node_count = 0;
 
     while (!queue.empty()) {
         if (node_count >= MAX_NODES) {
@@ -842,8 +839,8 @@ inline std::optional<Lockfile> Resolver::resolve_subtree(const Dependency& root_
     std::map<std::string, std::string> url_commit_to_node;
     std::map<std::string, std::string> name_to_node_id;
 
-    const size_t MAX_NODES = 256;
-    size_t node_count = 0;
+    const std::size_t MAX_NODES = 256;
+    std::size_t node_count = 0;
 
     while (!queue.empty()) {
         if (node_count >= MAX_NODES) {

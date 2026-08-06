@@ -31,7 +31,7 @@ namespace bake {
 // ===== String utilities =====
 
 export inline std::string trim(std::string_view s) {
-    size_t start = 0, end = s.size();
+    std::size_t start = 0, end = s.size();
     while (start < end && (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' || s[start] == '\r'))
         ++start;
     while (end > start && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\n' || s[end - 1] == '\r'))
@@ -41,8 +41,8 @@ export inline std::string trim(std::string_view s) {
 
 export inline std::vector<std::string> split(std::string_view s, char delim) {
     std::vector<std::string> result;
-    size_t start = 0;
-    for (size_t i = 0; i <= s.size(); ++i) {
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= s.size(); ++i) {
         if (i == s.size() || s[i] == delim) {
             result.emplace_back(s.substr(start, i - start));
             start = i + 1;
@@ -66,7 +66,7 @@ export inline bool contains(std::string_view s, std::string_view sub) {
 export inline std::string join(const std::vector<std::string>& parts, std::string_view delim) {
     if (parts.empty()) return {};
     std::string result = parts[0];
-    for (size_t i = 1; i < parts.size(); ++i) {
+    for (std::size_t i = 1; i < parts.size(); ++i) {
         result += delim;
         result += parts[i];
     }
@@ -163,9 +163,9 @@ export inline std::optional<Path> find_in_path(const std::string& name) {
 #endif
 
     std::string path_str(path_env);
-    size_t start = 0;
+    std::size_t start = 0;
     while (start <= path_str.size()) {
-        size_t end = path_str.find(path_sep, start);
+        std::size_t end = path_str.find(path_sep, start);
         if (end == std::string::npos) end = path_str.size();
         std::string dir = path_str.substr(start, end - start);
         start = end + 1;
@@ -242,7 +242,7 @@ export inline bool atomic_write_file(const Path& path, std::string_view content)
         return false;
     }
 
-    size_t written = 0;
+    std::size_t written = 0;
     const char* data = content.data();
     while (written < content.size()) {
         ssize_t n = write(fd, data + written, content.size() - written);
@@ -252,7 +252,7 @@ export inline bool atomic_write_file(const Path& path, std::string_view content)
             std::filesystem::remove(tmp);
             return false;
         }
-        written += static_cast<size_t>(n);
+        written += static_cast<std::size_t>(n);
     }
 
     if (fsync(fd) != 0) {
@@ -287,46 +287,46 @@ export inline bool dir_exists(const Path& p) { return p.is_directory(); }
 
 export class SHA256 {
 public:
-    static std::array<uint8_t, 32> compute(const uint8_t* data, size_t len) {
-        uint32_t state[8] = {
+    static std::array<std::uint8_t, 32> compute(const std::uint8_t* data, std::size_t len) {
+        std::uint32_t state[8] = {
             0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
             0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
         };
 
-        std::vector<uint8_t> msg(data, data + len);
-        uint64_t bit_len = static_cast<uint64_t>(len) * 8;
+        std::vector<std::uint8_t> msg(data, data + len);
+        std::uint64_t bit_len = static_cast<std::uint64_t>(len) * 8;
         msg.push_back(0x80);
         while (msg.size() % 64 != 56) msg.push_back(0x00);
         for (int i = 7; i >= 0; --i)
-            msg.push_back(static_cast<uint8_t>(bit_len >> (i * 8)));
+            msg.push_back(static_cast<std::uint8_t>(bit_len >> (i * 8)));
 
-        for (size_t offset = 0; offset < msg.size(); offset += 64)
+        for (std::size_t offset = 0; offset < msg.size(); offset += 64)
             process_block(msg.data() + offset, state);
 
-        std::array<uint8_t, 32> result{};
+        std::array<std::uint8_t, 32> result{};
         for (int i = 0; i < 8; ++i) {
-            result[i * 4]     = static_cast<uint8_t>(state[i] >> 24);
-            result[i * 4 + 1] = static_cast<uint8_t>(state[i] >> 16);
-            result[i * 4 + 2] = static_cast<uint8_t>(state[i] >> 8);
-            result[i * 4 + 3] = static_cast<uint8_t>(state[i]);
+            result[i * 4]     = static_cast<std::uint8_t>(state[i] >> 24);
+            result[i * 4 + 1] = static_cast<std::uint8_t>(state[i] >> 16);
+            result[i * 4 + 2] = static_cast<std::uint8_t>(state[i] >> 8);
+            result[i * 4 + 3] = static_cast<std::uint8_t>(state[i]);
         }
         return result;
     }
 
-    static std::array<uint8_t, 32> compute(std::string_view data) {
-        return compute(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+    static std::array<std::uint8_t, 32> compute(std::string_view data) {
+        return compute(reinterpret_cast<const std::uint8_t*>(data.data()), data.size());
     }
 
-    static std::array<uint8_t, 32> compute_file(const Path& path) {
+    static std::array<std::uint8_t, 32> compute_file(const Path& path) {
         auto content = read_file(path);
         if (!content) return {};
         return compute(*content);
     }
 
-    static std::string to_hex(const std::array<uint8_t, 32>& hash) {
+    static std::string to_hex(const std::array<std::uint8_t, 32>& hash) {
         static const char hex[] = "0123456789abcdef";
         std::string result(64, '0');
-        for (size_t i = 0; i < 32; ++i) {
+        for (std::size_t i = 0; i < 32; ++i) {
             result[i * 2]     = hex[hash[i] >> 4];
             result[i * 2 + 1] = hex[hash[i] & 0x0f];
         }
@@ -337,7 +337,7 @@ public:
     static std::string hex_file(const Path& path) { return to_hex(compute_file(path)); }
 
 private:
-    static constexpr uint32_t K[64] = {
+    static constexpr std::uint32_t K[64] = {
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
         0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
         0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
@@ -348,32 +348,32 @@ private:
         0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
     };
 
-    static uint32_t rotr(uint32_t x, uint32_t n) { return (x >> n) | (x << (32 - n)); }
+    static std::uint32_t rotr(std::uint32_t x, std::uint32_t n) { return (x >> n) | (x << (32 - n)); }
 
-    static void process_block(const uint8_t* block, uint32_t state[8]) {
-        uint32_t w[64];
+    static void process_block(const std::uint8_t* block, std::uint32_t state[8]) {
+        std::uint32_t w[64];
         for (int i = 0; i < 16; ++i) {
-            w[i] = (static_cast<uint32_t>(block[i * 4]) << 24) |
-                   (static_cast<uint32_t>(block[i * 4 + 1]) << 16) |
-                   (static_cast<uint32_t>(block[i * 4 + 2]) << 8) |
-                   (static_cast<uint32_t>(block[i * 4 + 3]));
+            w[i] = (static_cast<std::uint32_t>(block[i * 4]) << 24) |
+                   (static_cast<std::uint32_t>(block[i * 4 + 1]) << 16) |
+                   (static_cast<std::uint32_t>(block[i * 4 + 2]) << 8) |
+                   (static_cast<std::uint32_t>(block[i * 4 + 3]));
         }
         for (int i = 16; i < 64; ++i) {
-            uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-            uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            std::uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            std::uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
             w[i] = w[i - 16] + s0 + w[i - 7] + s1;
         }
 
-        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
-        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+        std::uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+        std::uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
 
         for (int i = 0; i < 64; ++i) {
-            uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-            uint32_t ch = (e & f) ^ ((~e) & g);
-            uint32_t temp1 = h + S1 + ch + K[i] + w[i];
-            uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-            uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
-            uint32_t temp2 = S0 + maj;
+            std::uint32_t S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            std::uint32_t ch = (e & f) ^ ((~e) & g);
+            std::uint32_t temp1 = h + S1 + ch + K[i] + w[i];
+            std::uint32_t S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            std::uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            std::uint32_t temp2 = S0 + maj;
             h = g; g = f; f = e; e = d + temp1;
             d = c; c = b; b = a; a = temp1 + temp2;
         }
@@ -401,7 +401,7 @@ export inline std::string get_self_exe_path() {
                         result.data(), needed, nullptr, nullptr);
     return result;
 #elif defined(__APPLE__)
-    uint32_t bufsize = 0;
+    std::uint32_t bufsize = 0;
     _NSGetExecutablePath(nullptr, &bufsize);
     if (bufsize == 0) return {};
     std::string raw(bufsize, '\0');
@@ -426,31 +426,46 @@ export inline std::string get_self_exe_path() {
 // compile-time defines that break when the binary is relocated or packaged.
 // Mirrors Zig's approach: find lib/ by walking up from the exe.
 
+// Walk up from an executable path looking for a lib/ directory that
+// contains libcxx/include. Returns an empty path if not found within
+// 6 parent levels.
+inline Path find_lib_from_executable(std::string_view exe_path) {
+    if (exe_path.empty()) return Path();
+    Path dir = Path(std::string(exe_path)).parent();
+    for (int i = 0; i < 6; i++) {
+        Path lib = dir / "lib";
+        if ((lib / "libcxx" / "include").is_directory())
+            return lib;
+        if (dir == dir.parent()) break;
+        dir = dir.parent();
+    }
+    return Path();
+}
+
 // Returns the bake resource directory (the "lib/" folder).
 // Resolution order:
 //   1. BAKE_LIB_DIR env var (explicit override)
-//   2. Walk up from executable looking for lib/libcxx/include
-//   3. Empty path (not found)
+//   2. BAKE_EXE env var — the real bake binary (set for build_app so it
+//      resolves resources relative to bake, not the temporary build_app)
+//   3. get_self_exe_path() — this process's own executable
+//   4. Empty path (not found)
 export inline const Path& find_lib_dir() {
     static Path result = []() -> Path {
-        // 1. Env var override
+        // 1. Explicit lib override
         if (const char* env = std::getenv("BAKE_LIB_DIR")) {
             Path p(env);
             if ((p / "libcxx" / "include").is_directory())
                 return p;
         }
-        // 2. Walk up from executable
-        std::string exe = get_self_exe_path();
-        if (!exe.empty()) {
-            Path dir = Path(exe).parent();
-            for (int i = 0; i < 6; i++) {
-                Path lib = dir / "lib";
-                if ((lib / "libcxx" / "include").is_directory())
-                    return lib;
-                if (dir == dir.parent()) break;
-                dir = dir.parent();
-            }
+        // 2. Real bake executable path (exported by build_with_build_cpp)
+        if (const char* exe = std::getenv("BAKE_EXE")) {
+            Path lib = find_lib_from_executable(exe);
+            if (!lib.string().empty()) return lib;
         }
+        // 3. Current process executable
+        Path lib = find_lib_from_executable(get_self_exe_path());
+        if (!lib.string().empty()) return lib;
+        // 4. Not found
         return Path();
     }();
     return result;
@@ -529,8 +544,8 @@ export std::vector<Path> glob(const Path& base, std::string_view pattern);
 namespace detail {
 
 inline bool glob_match(std::string_view text, std::string_view pattern) {
-    size_t ti = 0, pi = 0;
-    size_t star_t = std::string_view::npos, star_p = std::string_view::npos;
+    std::size_t ti = 0, pi = 0;
+    std::size_t star_t = std::string_view::npos, star_p = std::string_view::npos;
     while (ti < text.size() || pi < pattern.size()) {
         if (pi < pattern.size()) {
             if (pi + 1 < pattern.size() && pattern[pi] == '*' && pattern[pi + 1] == '*') {
@@ -621,7 +636,7 @@ inline ProcessResult run_process(const std::vector<std::string>& args,
 
     // Build command line string with proper quoting
     std::string cmdline;
-    for (size_t i = 0; i < args.size(); ++i) {
+    for (std::size_t i = 0; i < args.size(); ++i) {
         if (i > 0) cmdline += ' ';
         // Quote args containing spaces
         if (args[i].find(' ') != std::string::npos ||

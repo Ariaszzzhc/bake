@@ -39,7 +39,7 @@ public:
     }
     Target& sources(const char* pattern, const SourceOptions& opts) {
         std::vector<const char*> flags(opts.flags.size());
-        for (size_t i = 0; i < opts.flags.size(); ++i) flags[i] = opts.flags[i].c_str();
+        for (std::size_t i = 0; i < opts.flags.size(); ++i) flags[i] = opts.flags[i].c_str();
         bake_target_sources_with_flags(handle_, pattern, flags.data(),
                                        static_cast<int>(flags.size()));
         return *this;
@@ -184,7 +184,7 @@ public:
     bool option_bool(const char* name) const {
         return bake_builder_option_bool(handle_, name) != 0;
     }
-    int64_t option_int(const char* name) const {
+    std::int64_t option_int(const char* name) const {
         return bake_builder_option_int(handle_, name);
     }
     const char* option_str(const char* name) const {

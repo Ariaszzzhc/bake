@@ -1,7 +1,5 @@
 module;
 
-#include <toml.hpp>
-#include <nlohmann/json.hpp>
 #include <cerrno>
 #include <cstdlib>
 
@@ -24,6 +22,8 @@ import bake.project;
 import bake.compiler;
 import bake.engine;
 import bake.package;
+import nlohmann.json;
+import tomlplusplus;
 
 // ============================================================
 // bake.cli — multicall dispatch, argument parsing, commands
@@ -246,7 +246,7 @@ std::optional<std::vector<OptionOverride>> parse_option_overrides(
             return std::nullopt;
         }
 
-        const size_t equals = declaration.find('=');
+        const std::size_t equals = declaration.find('=');
         OptionOverride override;
         override.name = declaration.substr(0, equals);
         if (override.name.empty()) {
@@ -370,7 +370,7 @@ std::optional<std::map<std::string, BuildOption>> effective_build_options(
                              override.name);
                 return std::nullopt;
             }
-            int64_t value = 0;
+            std::int64_t value = 0;
             const char* first = override.value->data();
             const char* last = first + override.value->size();
             auto [end, error] = std::from_chars(first, last, value);
@@ -652,45 +652,6 @@ export int cmd_init(const ParsedArgs& args) {
 
 // ===== build.cpp compilation + execution =====
 
-// Generate std.cppm from the vendored libc++ source template.
-// std.cppm.in contains @LIBCXX_MODULE_STD_INCLUDE_SOURCES@ which gets
-// replaced by the concatenation of all modules/std/*.inc files.
-// This mirrors what libc++'s CMake would do at configure time.
-static Path generate_std_cppm(const Path& cache_dir) {
-    Path modules_dir = find_lib_dir() / "libcxx" / "modules";
-    Path cppm_in = modules_dir / "std.cppm.in";
-    if (!cppm_in.is_regular_file()) return Path();
-
-    auto in_content = read_file(cppm_in);
-    if (!in_content) return Path();
-
-    // Collect all .inc files (glob returns sorted results)
-    auto incs = glob(modules_dir / "std", "*.inc");
-    if (incs.empty()) return Path();
-
-    std::string inc_sources;
-    for (const auto& inc : incs) {
-        auto content = read_file(inc);
-        if (content) {
-            inc_sources += *content;
-            inc_sources += "\n";
-        }
-    }
-
-    // Replace the placeholder
-    std::string cppm = *in_content;
-    constexpr std::string_view placeholder = "@LIBCXX_MODULE_STD_INCLUDE_SOURCES@";
-    auto pos = cppm.find(placeholder);
-    if (pos == std::string::npos) return Path();
-    cppm.replace(pos, placeholder.size(), inc_sources);
-
-    // Write to cache
-    Path result = cache_dir / "std.cppm";
-    if (!write_file(result, cppm)) return Path();
-
-    return result;
-}
-
 // Curated libc++ source file list (from Zig's libcxx.zig).
 static const char* libcxx_base_files[] = {
     "algorithm.cpp", "any.cpp", "bind.cpp", "call_once.cpp", "charconv.cpp",
@@ -858,82 +819,17 @@ export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
     return objs;
 }
 
-// Ensure the libc++ std module PCM is built in this project's output tree.
-// Returns the path to std.pcm, or an empty Path on failure.
-// For Clang only — GCC handles import std via its gcm cache.
-export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
-    if (!tc.is_clang()) return Path();
-
-    // The global Bake cache is reserved for immutable downloaded sources.
-    Path pcm_cache = project_out / ".bmi" / ".std";
-    pcm_cache.mkdir_recursive();
-
-    // Cache key: hash of compiler path + version output
-    auto cxx_args = cxx_prefix(tc);
-    cxx_args.push_back("--version");
-    auto ver = run_process(cxx_args, Path(), true);
-    std::string key_data = tc.cxx_path + "\n" + ver.stdout_output;
-    std::string key = SHA256::hex(key_data).substr(0, 16);
-
-    Path std_pcm = pcm_cache / ("std-" + key + ".pcm");
-    if (std_pcm.is_regular_file()) return std_pcm;  // cached
-
-    // Locate std.cppm relative to the compiler: <prefix>/share/libc++/v1/std.cppm
-    Path cxx_dir = Path(tc.cxx_path).parent();       // bin/
-    Path prefix = cxx_dir.parent();                   // llvm/<ver>/
-    // For BakeSelf, the bake binary isn't in the LLVM installation tree.
-    // Use the LLVM prefix resolved at runtime.
-    if (tc.kind == CompilerKind::BakeSelf) {
-        Path llvm_prefix = find_llvm_prefix();
-        if (!llvm_prefix.string().empty())
-            prefix = llvm_prefix;
-    }
-    Path std_cppm = prefix / "share" / "libc++" / "v1" / "std.cppm";
-    if (!std_cppm.is_regular_file()) {
-        // Not installed — generate from vendored libc++ source template.
-        std_cppm = generate_std_cppm(pcm_cache);
-        if (std_cppm.string().empty()) return Path();
-    }
-
-    // libc++ include directory: prefer vendored source, fall back to install tree.
-    Path vendored_inc = find_lib_dir() / "libcxx" / "include";
-    Path libcxx_inc = vendored_inc.is_directory()
-        ? vendored_inc
-        : prefix / "include" / "c++" / "v1";
-
-    std::println("   Preparing standard library module");
-
-    std::vector<std::string> cmd;
-    for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
-    cmd.push_back("-std=c++23");
-    cmd.push_back("-stdlib=libc++");
-    cmd.push_back("-nostdinc++");
-    cmd.push_back("-I" + libcxx_inc.string());
-    cmd.push_back("-Wno-reserved-module-identifier");
-    cmd.push_back("-c");
-    cmd.push_back(std_cppm.string());
-    cmd.push_back("--precompile");
-    cmd.push_back("-o");
-    cmd.push_back(std_pcm.string());
-
-    auto result = run_process(cmd, Path(), true);
-    if (!result.success()) {
-        std::print(std::cerr, "{}", result.stderr_output);
-        std::println(std::cerr, "bake: failed to pre-build std module");
-        return Path();
-    }
-
-    return std_pcm;
-}
-
 // Inject statically-compiled libc++ + libc++abi objects into all C++ link
 // actions in a plan. Replaces dynamic -lc++ / libc++.1.dylib dependency.
 // For BakeSelf only: the in-process LLD has no system libc++.tbd.
+// Gates on a valid "std" entry in the standard-module map.
 export void inject_static_libcxx(BuildPlan& plan, const Toolchain& tc,
-                                  const Path& std_pcm) {
-    if (!tc.is_clang() || !std_pcm.is_regular_file())
-        return;
-    if (tc.kind != CompilerKind::BakeSelf)
+                                  const ModuleFileMap& standard_modules) {
+    if (!tc.is_clang()) return;
+    if (tc.kind != CompilerKind::BakeSelf) return;
+
+    auto it = standard_modules.find("std");
+    if (it == standard_modules.end() || !it->second.is_regular_file())
         return;
 
     auto libcxx_objs = ensure_libcxx_objects(tc);
@@ -993,8 +889,24 @@ export int build_with_build_cpp(
     write_file(wrapper_dst, *wrapper_content);
     write_file(cabi_dst, *cabi_content);
 
-    // Pre-build the libc++ std module PCM (one-time per project/compiler).
-    auto std_pcm = ensure_std_pcm(tc, layout.out_dir);
+    // Pre-build the libc++ std + std.compat module PCMs (per project/compiler).
+    auto standard_modules = ensure_std_modules(tc, layout.out_dir);
+
+    // Helper: append valid standard-module file flags to a command vector.
+    // std must precede std.compat so the dependency is satisfied.
+    auto append_std_module_flags = [&](std::vector<std::string>& cmd) {
+        if (!tc.is_clang()) return;
+        auto it_std = standard_modules.find("std");
+        if (it_std != standard_modules.end() && it_std->second.is_regular_file()) {
+            cmd.push_back("-fmodule-file=std=" + it_std->second.string());
+        }
+        auto it_compat = standard_modules.find("std.compat");
+        if (it_compat != standard_modules.end() &&
+            it_compat->second.is_regular_file()) {
+            cmd.push_back("-fmodule-file=std.compat=" +
+                          it_compat->second.string());
+        }
+    };
 
     // Step 1: Compile wrapper module → BMI + .o
     Path pcm = bake_dir / "bake.build.pcm";
@@ -1012,9 +924,7 @@ export int build_with_build_cpp(
         cmd.push_back("-x");
         cmd.push_back("c++-module");
         cmd.push_back("-I" + bake_dir.string());
-        if (tc.is_clang() && std_pcm.is_regular_file()) {
-            cmd.push_back("-fmodule-file=std=" + std_pcm.string());
-        }
+        append_std_module_flags(cmd);
         cmd.push_back("-fmodule-output=" + pcm.string());
         cmd.push_back(wrapper_dst.string());
         cmd.push_back("-o");
@@ -1040,10 +950,8 @@ export int build_with_build_cpp(
             cmd.push_back("-Wno-reserved-module-identifier");
         }
         cmd.push_back("-I" + bake_dir.string());
+        append_std_module_flags(cmd);
         if (tc.is_clang()) {
-            if (std_pcm.is_regular_file()) {
-                cmd.push_back("-fmodule-file=std=" + std_pcm.string());
-            }
             cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
         }
         cmd.push_back(build_cpp.string());
@@ -1072,7 +980,8 @@ export int build_with_build_cpp(
         cmd.push_back(wrapper_o.string());
         cmd.push_back(build_o.string());
         // BakeSelf: inject static libc++ objects (no -lc++ available).
-        if (tc.kind == CompilerKind::BakeSelf && std_pcm.is_regular_file()) {
+        if (tc.kind == CompilerKind::BakeSelf &&
+            standard_modules.contains("std")) {
             auto libcxx_objs = ensure_libcxx_objects(tc);
             if (!libcxx_objs.empty()) {
                 cmd.push_back("-nodefaultlibs");
@@ -1101,8 +1010,10 @@ export int build_with_build_cpp(
     }
 
     // Step 4: Run build_app → .bake/build.json
-    // Set BAKE_EXE so build_app's Toolchain::detect() uses the real bake
-    // binary (not build_app itself) for BakeSelf compile/link commands.
+    // Export the real bake binary path (BAKE_EXE) so build_app resolves
+    // resources (lib/, clang-scan-deps, std PCMs) relative to bake — not
+    // the temporary build_app executable. ScopedEnvironmentVariable
+    // restores the parent environment afterward.
     {
         ScopedBuildContext context(layout);
         if (!context.active()) {
@@ -1111,7 +1022,17 @@ export int build_with_build_cpp(
             return 1;
         }
         std::string self = get_self_exe_path();
-        if (!self.empty()) ::setenv("BAKE_EXE", self.c_str(), 1);
+        if (self.empty()) {
+            std::println(std::cerr,
+                         "bake: cannot locate bake executable for build script");
+            return 1;
+        }
+        ScopedEnvironmentVariable bake_exe("BAKE_EXE", self);
+        if (!bake_exe.active()) {
+            std::println(std::cerr,
+                         "bake: failed to set BAKE_EXE for build script");
+            return 1;
+        }
         auto result = run_process({build_app.string()}, root, true);
         if (!result.success()) {
             std::print(std::cerr, "{}", result.stderr_output);
@@ -1129,10 +1050,10 @@ export int build_with_build_cpp(
 
     auto plan = read_build_json(build_json, root);
 
-    // Inject import std; support into C++ compile actions.
-    // build.json was generated by bake_builder_build() which doesn't know
-    // about the std module — we add it here, same as the workspace path.
-    if (std_pcm.is_regular_file()) {
+    // Inject import std; and import std.compat; support into C++ compile
+    // actions. build.json was generated by bake_builder_build() which doesn't
+    // know about the standard modules — we add them here.
+    if (!standard_modules.empty()) {
         for (auto& action : plan.actions) {
             if (action.type != BuildAction::Type::Compile &&
                 action.type != BuildAction::Type::CompileModule)
@@ -1142,7 +1063,7 @@ export int build_with_build_cpp(
             for (auto& input : action.inputs)
                 if (input.is_c()) { is_c_source = true; break; }
             if (is_c_source) continue;
-            action.command.push_back("-fmodule-file=std=" + std_pcm.string());
+            append_std_module_flags(action.command);
             if (tc.is_clang()) {
                 action.command.push_back("-stdlib=libc++");
                 action.command.push_back("-Wno-reserved-module-identifier");
@@ -1151,7 +1072,7 @@ export int build_with_build_cpp(
     }
 
     // Inject static libc++ objects into C++ link actions.
-    inject_static_libcxx(plan, tc, std_pcm);
+    inject_static_libcxx(plan, tc, standard_modules);
 
     // Write compile_commands.json
     write_compile_commands(
@@ -1804,9 +1725,9 @@ export int cmd_build(const ParsedArgs& args) {
         };
         std::vector<BuiltMember> built;
 
-        // Build the std module lazily: an all-C workspace must not require a
-        // C++ standard library module at all.
-        Path std_pcm;
+        // Build the standard modules lazily: an all-C workspace must not
+        // require a C++ standard library module at all.
+        ModuleFileMap standard_modules;
 
         // Compute canonical paths of all workspace member directories so
         // path-meta-dependency collection can skip them. Workspace members
@@ -1869,8 +1790,8 @@ export int cmd_build(const ParsedArgs& args) {
             Path member_build_cpp = member_dir / "build.cpp";
             if (member_build_cpp.is_regular_file()) {
                 if (!is_c_standard(member_manifest->package->std_version)) {
-                    if (!std_pcm.is_regular_file())
-                        std_pcm = ensure_std_pcm(tc, layout.out_dir);
+                    if (standard_modules.empty())
+                        standard_modules = ensure_std_modules(tc, layout.out_dir);
                 }
 
                 if (int rc = build_with_build_cpp(layout, args); rc != 0) {
@@ -1907,21 +1828,23 @@ export int cmd_build(const ParsedArgs& args) {
                     *member_manifest, project_out, workspace_member_dirs);
             if (!member_package_requirements) return 1;
 
-            Path member_std_pcm;
+            ModuleFileMap member_standard_modules;
             if (!is_c_standard(member_manifest->package->std_version)) {
-                if (!std_pcm.is_regular_file())
-                    std_pcm = ensure_std_pcm(tc, layout.out_dir);
-                member_std_pcm = std_pcm;
+                if (standard_modules.empty())
+                    standard_modules = ensure_std_modules(tc, layout.out_dir);
+                member_standard_modules = standard_modules;
             }
 
             auto plan = create_convention_plan(*member_manifest, layout, tc,
                                                 member_manifest->options,
                                                 dep_sources, dep_include_dirs,
                                                 /*compile_path_deps=*/false,
-                                                member_std_pcm,
+                                                member_standard_modules,
                                                 *member_package_requirements);
 
-            // Inject external modules from built dependencies
+            // Inject external modules from built dependencies.
+            // Standard-module flags are injected by create_convention_plan;
+            // only workspace-member BMIs are appended here.
             for (auto& action : plan.actions) {
                 if (action.type != BuildAction::Type::Compile &&
                     action.type != BuildAction::Type::CompileModule) continue;
@@ -1935,20 +1858,6 @@ export int cmd_build(const ParsedArgs& args) {
                         }
                     }
                 }
-                // Also inject std PCM so transitive import std; resolves
-                // (C++ only — import std is meaningless in C files)
-                if (std_pcm.is_regular_file()) {
-                    bool is_c_source = false;
-                    for (auto& input : action.inputs)
-                        if (input.is_c()) { is_c_source = true; break; }
-                    if (!is_c_source) {
-                        action.command.push_back("-fmodule-file=std=" + std_pcm.string());
-                        if (tc.is_clang()) {
-                            action.command.push_back("-stdlib=libc++");
-                            action.command.push_back("-Wno-reserved-module-identifier");
-                        }
-                    }
-                }
             }
 
             // Inject library links from built dependencies
@@ -1957,7 +1866,7 @@ export int cmd_build(const ParsedArgs& args) {
 
                 // Clang needs -stdlib=libc++ when import std is in use,
                 // unless BakeSelf (which uses static libc++ objects instead).
-                if (std_pcm.is_regular_file() && tc.is_clang() &&
+                if (standard_modules.contains("std") && tc.is_clang() &&
                     tc.kind != CompilerKind::BakeSelf) {
                     auto prefix_len = cxx_prefix(tc).size();
                     action.command.insert(action.command.begin() + prefix_len, "-stdlib=libc++");
@@ -1978,7 +1887,7 @@ export int cmd_build(const ParsedArgs& args) {
             }
 
             // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
-            inject_static_libcxx(plan, tc, std_pcm);
+            inject_static_libcxx(plan, tc, standard_modules);
 
             int r = execute_plan(plan, jobs);
             if (r != 0) { result = r; break; }
@@ -2039,9 +1948,9 @@ export int cmd_build(const ParsedArgs& args) {
                  package_uses_c ? tc.cc_path : tc.cxx_path);
 
     // A pure C package must not depend on libc++'s std module.
-    Path std_pcm;
+    ModuleFileMap standard_modules;
     if (!package_uses_c) {
-        std_pcm = ensure_std_pcm(tc, layout.out_dir);
+        standard_modules = ensure_std_modules(tc, layout.out_dir);
     }
 
     // Extract dep sources + include dirs from lockfile
@@ -2060,11 +1969,11 @@ export int cmd_build(const ParsedArgs& args) {
     auto plan = create_convention_plan(*manifest, layout, tc, *options,
                                         dep_sources, dep_include_dirs,
                                         /*compile_path_deps=*/true,
-                                        std_pcm,
+                                        standard_modules,
                                         *package_requirements);
 
     // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
-    inject_static_libcxx(plan, tc, std_pcm);
+    inject_static_libcxx(plan, tc, standard_modules);
 
     // Write compile_commands.json
     write_compile_commands(plan, *root / "compile_commands.json");
@@ -2193,7 +2102,7 @@ export int cmd_add(const ParsedArgs& args) {
     } else {
         // Extract repo name from URL
         // e.g., https://github.com/fmtlib/fmt → fmt
-        size_t last_slash = url.find_last_of('/');
+        std::size_t last_slash = url.find_last_of('/');
         if (last_slash != std::string::npos) {
             name = url.substr(last_slash + 1);
             // Remove .git suffix
@@ -2242,7 +2151,7 @@ export int cmd_add(const ParsedArgs& args) {
     // Check if [dependencies] section exists
     if (contains(*content, "[dependencies]")) {
         // Insert after the [dependencies] line
-        size_t pos = content->find("[dependencies]");
+        std::size_t pos = content->find("[dependencies]");
         pos = content->find('\n', pos);
         if (pos == std::string::npos) pos = content->size();
         content->insert(pos + 1, dep_line);

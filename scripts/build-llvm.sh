@@ -88,11 +88,6 @@ echo "==> Installing LLVM to $INSTALL_LLVM"
 cmake --install "$BUILD_LLVM" --strip
 rm -rf "$BUILD_LLVM"
 
-# ── Copy libcxx headers from LLVM source ──────────────────────────────
-echo "==> Copying libcxx headers"
-mkdir -p "$INSTALL_LLVM/include/c++/v1"
-cp -R "$SRC_LLVM/libcxx/include/"* "$INSTALL_LLVM/include/c++/v1/"
-
 echo "==> Done. LLVM installed at: $INSTALL_LLVM"
 echo "    Size: $(du -sh "$INSTALL_LLVM" | cut -f1)"
 echo "    zlib:  $INSTALL_ZLIB"

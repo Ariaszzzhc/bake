@@ -1,11 +1,8 @@
-module;
-
-#include <toml.hpp>
-
 export module bake.project;
 
 import std;
 import bake.util;
+import tomlplusplus;
 
 // ============================================================
 // bake.project — bake.toml model, layout, project discovery
@@ -43,13 +40,13 @@ export struct BuildOption {
     enum class Type { Bool, Int, String };
     Type type = Type::String;
     bool bool_value = false;
-    int64_t int_value = 0;
+    std::int64_t int_value = 0;
     std::string str_value;
 
     static BuildOption from_bool(bool v) {
         BuildOption o; o.type = Type::Bool; o.bool_value = v; return o;
     }
-    static BuildOption from_int(int64_t v) {
+    static BuildOption from_int(std::int64_t v) {
         BuildOption o; o.type = Type::Int; o.int_value = v; return o;
     }
     static BuildOption from_string(std::string v) {
@@ -124,7 +121,7 @@ export struct Manifest {
                 return BuildOption::from_bool(*value.value<bool>());
             }
             if (value.is_integer()) {
-                return BuildOption::from_int(*value.value<int64_t>());
+                return BuildOption::from_int(*value.value<std::int64_t>());
             }
             if (value.is_string()) {
                 return BuildOption::from_string(*value.value<std::string>());
@@ -394,7 +391,7 @@ export struct Lockfile {
             content += "native           = " + std::string(node.native ? "true" : "false") + "\n";
 
             content += "dependencies     = [";
-            for (size_t i = 0; i < node.dependencies.size(); ++i) {
+            for (std::size_t i = 0; i < node.dependencies.size(); ++i) {
                 if (i > 0) content += ", ";
                 content += "\"" + node.dependencies[i] + "\"";
             }

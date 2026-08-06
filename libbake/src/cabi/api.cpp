@@ -9,9 +9,8 @@
 // thread-local error string retrievable via bake_last_error().
 // ============================================================
 
-#include <nlohmann/json.hpp>
-
 import std;
+import nlohmann.json;
 import bake.util;
 import bake.project;
 import bake.compiler;
@@ -373,10 +372,12 @@ BAKE_API bake_builder* bake_builder_new(void) noexcept {
                         b->configuration_errors.push_back(
                             "invalid .bake/options.json schema");
                     } else {
-                        for (auto& [name, value] : document["options"].items()) {
-                            auto option = b->manifest->options.find(name);
+                        for (auto& item : document["options"].items()) {
+                            auto option = b->manifest->options.find(item.key());
                             if (option == b->manifest->options.end()) continue;
 
+                            auto& name = item.key();
+                            auto& value = item.value();
                             switch (option->second.type) {
                                 case bake::BuildOption::Type::Bool:
                                     if (value.is_boolean()) {
@@ -390,7 +391,7 @@ BAKE_API bake_builder* bake_builder_new(void) noexcept {
                                 case bake::BuildOption::Type::Int:
                                     if (value.is_number_integer()) {
                                         option->second = bake::BuildOption::from_int(
-                                            value.get<int64_t>());
+                                            value.get<std::int64_t>());
                                     } else {
                                         b->configuration_errors.push_back(
                                             "option '" + name + "' has the wrong type");
@@ -519,6 +520,10 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         // in convention workspace builds).
         std::map<std::string, bake::Path> module_bmi;
         std::map<std::string, std::string> module_action;
+        // Package-wide import adjacency shared across targets so that a
+        // module compiled in an earlier target can contribute its closure
+        // to a module compiled in a later target.
+        std::map<std::string, std::vector<std::string>> module_imports;
         for (const auto& target : b->targets) {
             std::vector<std::string> compile_ids;
             std::vector<std::string> object_paths;
@@ -582,6 +587,12 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                     b->toolchain, src_set, target->std_ver, include_dirs);
             }
 
+            // Merge this target's scanned module imports into the
+            // package-wide adjacency map before generating any actions.
+            for (auto& [name, info] : mod_graph.modules) {
+                module_imports[name] = info.imports;
+            }
+
             // Helper to make a CompileConfig with common fields
             auto make_cc = [&](bake::Path src, std::string src_rel,
                                std::string obj_path) {
@@ -619,11 +630,22 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 bake::CompileConfig cc = make_cc(src, src_rel, object_path);
                 cc.is_module_interface = true;
                 cc.bmi_output = bmi;
-                nlohmann::json deps = nlohmann::json::array();
-                for (auto& imp : info.imports) {
+                // Inject the full transitive closure of imports as BMI
+                // dependencies. Clang's -fmodule-file does not resolve
+                // transitive module dependencies, so every reachable BMI
+                // must be listed explicitly.
+                auto closure = bake::module_import_closure(
+                    info.imports, module_imports);
+                for (auto& imp : closure) {
                     auto it = module_bmi.find(imp);
                     if (it != module_bmi.end())
                         cc.module_deps.push_back({imp, it->second});
+                }
+                // Action DAG edges: direct project-module dependencies only.
+                // Ordering propagates transitively through direct edges, so
+                // adding transitive edges here would be redundant.
+                nlohmann::json deps = nlohmann::json::array();
+                for (auto& imp : info.imports) {
                     auto ait = module_action.find(imp);
                     if (ait != module_action.end() && ait->second != comp_id)
                         deps.push_back(ait->second);
