@@ -55,11 +55,19 @@ done
 rm -rf "$ROOT/lib/libcxx/src"
 cp -R "$LLVM_SRC/libcxx/src" "$ROOT/lib/libcxx/src"
 
-# modules/ — only std.cppm.in + std/*.inc (not CMakeLists.txt, README, etc.)
+# modules/ — std.cppm.in + std/*.inc AND std.compat.cppm.in + std.compat/*.inc
+# (not CMakeLists.txt, README, etc.)
 rm -rf "$ROOT/lib/libcxx/modules"
-mkdir -p "$ROOT/lib/libcxx/modules/std"
-cp "$LLVM_SRC/libcxx/modules/std.cppm.in" "$ROOT/lib/libcxx/modules/"
-cp "$LLVM_SRC/libcxx/modules/std/"*.inc "$ROOT/lib/libcxx/modules/std/"
+mkdir -p "$ROOT/lib/libcxx/modules/std" \
+         "$ROOT/lib/libcxx/modules/std.compat"
+cp "$LLVM_SRC/libcxx/modules/std.cppm.in" \
+   "$LLVM_SRC/libcxx/modules/std.compat.cppm.in" \
+   "$ROOT/lib/libcxx/modules/"
+cp "$LLVM_SRC/libcxx/modules/std/"*.inc \
+   "$ROOT/lib/libcxx/modules/std/"
+cp "$LLVM_SRC/libcxx/modules/std.compat/"*.inc \
+   "$ROOT/lib/libcxx/modules/std.compat/"
+git -C "$LLVM_SRC" rev-parse HEAD > "$ROOT/lib/libcxx/LLVM_REVISION"
 
 # libc/ — curated subset matching Zig's distribution (119 files, ~700K)
 rm -rf "$ROOT/lib/libcxx/libc"

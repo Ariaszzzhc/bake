@@ -232,12 +232,15 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
     // Standard
     cmd.push_back("-std=" + cc.std_ver);
 
-    // When using import std;, Clang requires libc++.
-    // Detect this by checking if "std" is in module_deps.
+    // When using import std; or import std.compat;, Clang requires libc++.
+    // Detect this by checking if "std" or "std.compat" is in module_deps.
     bool needs_libcxx = false;
     if (!compile_as_c) {
         for (const auto& [mod_name, _] : cc.module_deps) {
-            if (mod_name == "std") { needs_libcxx = true; break; }
+            if (mod_name == "std" || mod_name == "std.compat") {
+                needs_libcxx = true;
+                break;
+            }
         }
     }
     if (needs_libcxx && tc.is_clang()) {
@@ -360,6 +363,163 @@ export std::vector<std::string> make_archive_command(const Toolchain& tc,
     }
 
     return cmd;
+}
+
+// ===== Standard module (std / std.compat) PCM management =====
+
+// Maps module name → prebuilt PCM path (e.g. {"std": ..., "std.compat": ...}).
+export using ModuleFileMap = std::map<std::string, Path>;
+
+// Generate a standard-module interface source from the vendored libc++
+// module template. Reads <lib>/libcxx/modules/<name>.cppm.in, concatenates
+// the sorted <name>/*.inc files, replaces exactly one placeholder, and writes
+// <cache_dir>/<name>.cppm. Returns an empty Path on failure.
+static Path generate_standard_module_source(
+        const Path& cache_dir,
+        std::string_view module_name,
+        std::string_view placeholder) {
+    Path modules_dir = find_lib_dir() / "libcxx" / "modules";
+    Path cppm_in = modules_dir / (std::string(module_name) + ".cppm.in");
+    if (!cppm_in.is_regular_file()) return Path();
+
+    auto in_content = read_file(cppm_in);
+    if (!in_content) return Path();
+
+    // Collect all .inc files (glob returns sorted results)
+    auto incs = glob(modules_dir / std::string(module_name), "*.inc");
+    if (incs.empty()) return Path();
+
+    std::string inc_sources;
+    for (const auto& inc : incs) {
+        auto content = read_file(inc);
+        if (content) {
+            inc_sources += *content;
+            inc_sources += "\n";
+        }
+    }
+
+    // Replace the placeholder
+    std::string cppm = *in_content;
+    auto pos = cppm.find(placeholder);
+    if (pos == std::string::npos) return Path();
+    cppm.replace(pos, placeholder.size(), inc_sources);
+
+    // Write to cache
+    Path result = cache_dir / (std::string(module_name) + ".cppm");
+    if (!write_file(result, cppm)) return Path();
+
+    return result;
+}
+
+// Ensure both the std and std.compat PCMs are built in this project's output
+// tree. Returns a map with "std" and "std.compat" entries on success, or an
+// empty map if either source generation or compile fails. For Clang only.
+export ModuleFileMap ensure_std_modules(
+        const Toolchain& tc, const Path& project_out) {
+    ModuleFileMap result;
+    if (!tc.is_clang()) return result;
+
+    // The project output cache keeps PCMs alongside other BMIs.
+    Path pcm_cache = project_out / ".bmi" / ".std";
+    pcm_cache.mkdir_recursive();
+
+    // Generate both module interface sources.
+    auto std_cppm = generate_standard_module_source(
+        pcm_cache, "std", "@LIBCXX_MODULE_STD_INCLUDE_SOURCES@");
+    if (std_cppm.string().empty()) return result;
+
+    auto compat_cppm = generate_standard_module_source(
+        pcm_cache, "std.compat",
+        "@LIBCXX_MODULE_STD_COMPAT_INCLUDE_SOURCES@");
+    if (compat_cppm.string().empty()) return result;
+
+    // Build a cache key from compiler identity + source hashes + LLVM revision.
+    auto cxx_args = cxx_prefix(tc);
+    cxx_args.push_back("--version");
+    auto ver = run_process(cxx_args, Path(), true);
+
+    auto std_hash = SHA256::hex_file(std_cppm);
+    auto compat_hash = SHA256::hex_file(compat_cppm);
+
+    Path rev_file = find_lib_dir() / "libcxx" / "LLVM_REVISION";
+    std::string revision;
+    if (auto rev_content = read_file(rev_file))
+        revision = *rev_content;
+
+    std::string key_data = "std-modules-v2\n" +
+        tc.cxx_path + "\n" +
+        ver.stdout_output + "\n" +
+        ver.stderr_output + "\n" +
+        std_hash + "\n" +
+        compat_hash + "\n" +
+        revision;
+    std::string key = SHA256::hex(key_data).substr(0, 16);
+
+    Path std_pcm = pcm_cache / ("std-" + key + ".pcm");
+    Path compat_pcm = pcm_cache / ("std.compat-" + key + ".pcm");
+
+    bool std_ok = std_pcm.is_regular_file();
+    bool compat_ok = compat_pcm.is_regular_file();
+
+    Path libcxx_inc = find_lib_dir() / "libcxx" / "include";
+
+    // Build std PCM if not cached.
+    if (!std_ok) {
+        std::println("   Preparing standard library module");
+
+        std::vector<std::string> cmd;
+        for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
+        cmd.push_back("-std=c++23");
+        cmd.push_back("-stdlib=libc++");
+        cmd.push_back("-nostdinc++");
+        cmd.push_back("-I" + libcxx_inc.string());
+        cmd.push_back("-Wno-reserved-module-identifier");
+        cmd.push_back("-c");
+        cmd.push_back(std_cppm.string());
+        cmd.push_back("--precompile");
+        cmd.push_back("-o");
+        cmd.push_back(std_pcm.string());
+
+        auto build_result = run_process(cmd, Path(), true);
+        if (!build_result.success()) {
+            std::print(std::cerr, "{}", build_result.stderr_output);
+            std::println(std::cerr, "bake: failed to pre-build std module");
+            return result;
+        }
+        std_ok = true;
+    }
+
+    // Build std.compat PCM if not cached (depends on std PCM).
+    if (!compat_ok) {
+        std::vector<std::string> cmd;
+        for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
+        cmd.push_back("-std=c++23");
+        cmd.push_back("-stdlib=libc++");
+        cmd.push_back("-nostdinc++");
+        cmd.push_back("-I" + libcxx_inc.string());
+        cmd.push_back("-Wno-reserved-module-identifier");
+        cmd.push_back("-fmodule-file=std=" + std_pcm.string());
+        cmd.push_back("-c");
+        cmd.push_back(compat_cppm.string());
+        cmd.push_back("--precompile");
+        cmd.push_back("-o");
+        cmd.push_back(compat_pcm.string());
+
+        auto build_result = run_process(cmd, Path(), true);
+        if (!build_result.success()) {
+            std::print(std::cerr, "{}", build_result.stderr_output);
+            std::println(std::cerr,
+                         "bake: failed to pre-build std.compat module");
+            return result;
+        }
+        compat_ok = true;
+    }
+
+    if (std_ok && compat_ok) {
+        result["std"] = std_pcm;
+        result["std.compat"] = compat_pcm;
+    }
+    return result;
 }
 
 // Determine the output library name based on type and platform
