@@ -290,6 +290,32 @@ static std::string &getMacosSdkPath() {
   return sdk_path;
 }
 
+/// Detect the running macOS product version via `sw_vers -productVersion`.
+/// Cached after first call. Returns empty string on non-Apple platforms.
+/// Used to set -mmacosx-version-min so the deployment target matches the
+/// running system, avoiding spurious LLD version-mismatch warnings.
+static std::string &getMacosVersion() {
+  static std::string version;
+  static bool initialized = false;
+  if (initialized) return version;
+  initialized = true;
+
+#ifdef __APPLE__
+  FILE *pipe = ::popen("sw_vers -productVersion 2>/dev/null", "r");
+  if (pipe) {
+    char buf[256];
+    if (fgets(buf, sizeof(buf), pipe)) {
+      size_t len = strlen(buf);
+      while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+        buf[--len] = '\0';
+      if (len > 0) version = buf;
+    }
+    pclose(pipe);
+  }
+#endif
+  return version;
+}
+
 //===----------------------------------------------------------------------===//
 // LLD link interception helpers
 //===----------------------------------------------------------------------===//
@@ -609,6 +635,28 @@ static int clang_main(int Argc, const char **Argv,
       Args.push_back(Saver.save(rd.c_str()).data());
     }
   }
+
+  // Set deployment target to match the running macOS version.
+  // Without this, clang defaults to <major>.0.0 (truncated from the Darwin
+  // kernel version), causing LLD warnings when system dylibs are newer.
+  // Skip if the user already specified a deployment target.
+#ifdef __APPLE__
+  {
+    const std::string& ver = getMacosVersion();
+    if (!ver.empty()) {
+      bool has_target = false;
+      for (const char *A : Args) {
+        if (A && (llvm::StringRef(A).starts_with("-mmacosx-version-min") ||
+                  llvm::StringRef(A).starts_with("-target")))
+          has_target = true;
+      }
+      if (!has_target) {
+        Args.push_back(
+            Saver.save(("-mmacosx-version-min=" + ver).c_str()).data());
+      }
+    }
+  }
+#endif
 
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));
 
