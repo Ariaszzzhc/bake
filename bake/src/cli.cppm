@@ -54,8 +54,8 @@ BuildScriptRuntime find_build_script_runtime() {
     // walks up from the executable to find lib/.
     Path ws = find_workspace_root();
     BuildScriptRuntime runtime{
-        ws / "libbake" / "public" / "bake.build.cppm",
-        ws / "libbake" / "src" / "cabi" / "bake_cabi.h",
+        ws / "core" / "public" / "bake.build.cppm",
+        ws / "core" / "src" / "cabi" / "bake_cabi.h",
         Path(get_self_exe_path()).parent()  // libbake lives next to bake
     };
 

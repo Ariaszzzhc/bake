@@ -405,6 +405,18 @@ export BuildPlan create_convention_plan(
             Path dep_public = dep_dir / "public";
             if (dep_public.is_directory()) {
                 include_dirs.push_back(dep_public);
+
+                // Discover public module interfaces (.cppm) from the
+                // dependency's public/ directory. These are compiled as
+                // part of this package's module graph — the scanner
+                // resolves their module names and import dependencies.
+                for (auto& entry : std::filesystem::recursive_directory_iterator(dep_public.fs())) {
+                    if (!entry.is_regular_file()) continue;
+                    Path p(entry.path());
+                    if (p.is_module_interface()) {
+                        sources.module_interfaces.push_back(p);
+                    }
+                }
             }
             if (compile_path_deps) {
                 // Discover path dep's source files for compilation + linking

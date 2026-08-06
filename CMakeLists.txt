@@ -65,35 +65,34 @@ add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE
     ${CMAKE_SOURCE_DIR}/third_party/nlohmann/public)
 
-# ---- libbake (shared library) ----
+# ---- core (shared library: compiler + engine + package + C ABI) ----
 
-add_library(libbake SHARED
-    libbake/src/cabi/api.cpp
-    libbake/src/compiler/bake_llvm.cpp
-    libbake/src/compiler/bake_clang_driver.cpp
-    libbake/src/compiler/bake_clang_cc1_main.cpp
+add_library(core SHARED
+    core/src/cabi/api.cpp
+    core/src/compiler/bake_llvm.cpp
+    core/src/compiler/bake_clang_driver.cpp
+    core/src/compiler/bake_clang_cc1_main.cpp
 )
 
-target_sources(libbake
+target_sources(core
     PUBLIC
         FILE_SET CXX_MODULES
         FILES
-            libbake/src/bake.util.cppm
-            libbake/src/nlohmann.json.cppm
-            libbake/src/tomlplusplus.cppm
-            libbake/src/bake.project.cppm
-            libbake/src/bake.compiler.cppm
-            libbake/src/bake.engine.cppm
-            libbake/src/bake.package.cppm
-            libbake/src/bake.cli.cppm
+            third_party/nlohmann/public/nlohmann.json.cppm
+            third_party/tomlplusplus/public/tomlplusplus.cppm
+            core/src/bake.util.cppm
+            core/src/bake.project.cppm
+            core/src/bake.compiler.cppm
+            core/src/bake.engine.cppm
+            core/src/bake.package.cppm
 )
 
-set_target_properties(libbake PROPERTIES OUTPUT_NAME "bake")
+set_target_properties(core PROPERTIES OUTPUT_NAME "bake")
 
 # Use @rpath in install_name so the binary works from any location
 # (build tree, install tree, or packaged distribution).
 if(APPLE)
-    set_target_properties(libbake PROPERTIES
+    set_target_properties(core PROPERTIES
         BUILD_INSTALL_NAME_DIR "@rpath"
         INSTALL_NAME_DIR "@rpath"
     )
@@ -104,7 +103,7 @@ file(GLOB BAKE_LLVM_STATIC_LIBS  "${LLVM_PREFIX}/lib/libLLVM*.a")
 file(GLOB BAKE_CLANG_STATIC_LIBS "${LLVM_PREFIX}/lib/libclang*.a")
 file(GLOB BAKE_LLD_STATIC_LIBS   "${LLVM_PREFIX}/lib/liblld*.a")
 
-target_link_libraries(libbake PRIVATE
+target_link_libraries(core PRIVATE
     tomlplusplus nlohmann_json
     ${BAKE_CLANG_STATIC_LIBS}
     ${BAKE_LLD_STATIC_LIBS}
@@ -119,30 +118,31 @@ find_library(ZLIB_STATIC_LIB NAMES libz.a
 find_library(ZSTD_STATIC_LIB NAMES libzstd.a
   PATHS ${CMAKE_SOURCE_DIR}/external/zstd-install/lib
   NO_DEFAULT_PATH REQUIRED)
-target_link_libraries(libbake PRIVATE ${ZLIB_STATIC_LIB} ${ZSTD_STATIC_LIB})
+target_link_libraries(core PRIVATE ${ZLIB_STATIC_LIB} ${ZSTD_STATIC_LIB})
 
 # dead_strip removes unreferenced code from the final binary.
 if(APPLE)
-    target_link_options(libbake PRIVATE -Wl,-dead_strip)
+    target_link_options(core PRIVATE -Wl,-dead_strip)
 endif()
-target_include_directories(libbake PRIVATE
+target_include_directories(core PRIVATE
     ${LLVM_INCLUDE_DIRS}
     ${CLANG_INCLUDE_DIRS}
     ${LLD_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus/public
     ${CMAKE_SOURCE_DIR}/third_party/nlohmann/public
-    ${CMAKE_SOURCE_DIR}/libbake/src/cabi
+    ${CMAKE_SOURCE_DIR}/core/src/cabi
 )
-target_compile_definitions(libbake PRIVATE
+target_compile_definitions(core PRIVATE
     BAKE_VERSION="${PROJECT_VERSION}"
 )
 
-# On Windows, libbake exports symbols; consumers import them.
+# On Windows, core exports symbols; consumers import them.
 if(WIN32)
-    target_compile_definitions(libbake PRIVATE BAKE_BUILDING_DLL)
+    target_compile_definitions(core PRIVATE BAKE_BUILDING_DLL)
 endif()
 
-target_compile_features(libbake PRIVATE cxx_std_23)
+target_compile_features(core PRIVATE cxx_std_23)
+set_target_properties(core PROPERTIES CXX_MODULE_STD ON)
 
 # LLVM headers expect -fno-rtti (LLVM is built with RTTI disabled).
 # Apply only to the LLVM-interfacing C++ source files that instantiate
@@ -150,14 +150,23 @@ target_compile_features(libbake PRIVATE cxx_std_23)
 # bake_clang_driver.cpp is excluded: it imports bake.util (which has RTTI
 # enabled), and doesn't use typeid/dynamic_cast on LLVM types.
 set_property(SOURCE
-    libbake/src/compiler/bake_llvm.cpp
-    libbake/src/compiler/bake_clang_cc1_main.cpp
+    core/src/compiler/bake_llvm.cpp
+    core/src/compiler/bake_clang_cc1_main.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
 
-# ---- bake (executable) ----
+# ---- bake (executable: CLI + main) ----
 
 add_executable(bake bake/src/main.cpp)
-target_link_libraries(bake PRIVATE libbake)
+target_link_libraries(bake PRIVATE core)
+target_compile_features(bake PRIVATE cxx_std_23)
+set_target_properties(bake PROPERTIES CXX_MODULE_STD ON)
+
+target_sources(bake
+    PUBLIC
+        FILE_SET CXX_MODULES
+        FILES
+            bake/src/cli.cppm
+)
 
 # Platform-specific runtime library search path
 # Include both bake's build dir and the self-built LLVM lib dir.
@@ -177,14 +186,14 @@ endif()
 # ---- Installation ----
 
 include(GNUInstallDirs)
-install(TARGETS bake libbake
+install(TARGETS bake core
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(FILES
-    libbake/public/bake.build.cppm
-    libbake/src/cabi/bake_cabi.h
+    core/public/bake.build.cppm
+    core/src/cabi/bake_cabi.h
     DESTINATION ${CMAKE_INSTALL_DATADIR}/bake
 )
 

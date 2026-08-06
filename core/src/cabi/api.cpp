@@ -590,6 +590,37 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 }
             }
 
+            // Auto-discover public module interfaces from path dependencies.
+            // This mirrors convention mode's path-dep scanning: a package
+            // declaring dep = { path = "../other" } gets other's public/*.cppm
+            // compiled as part of its own module graph, without needing to
+            // manually list them in build.cpp sources().
+            if (b->manifest) {
+                for (const auto& [dep_name, dep] : b->manifest->dependencies) {
+                    if (!dep.is_path_dep) continue;
+                    bake::Path dep_public =
+                        b->layout.root / dep.path / "public";
+                    if (!dep_public.is_directory()) continue;
+                    for (auto& entry :
+                             std::filesystem::recursive_directory_iterator(
+                                 dep_public.fs())) {
+                        if (!entry.is_regular_file()) continue;
+                        bake::Path p(entry.path());
+                        if (p.is_module_interface()) {
+                            // Avoid duplicates if already listed in sources
+                            bool already = false;
+                            for (auto& existing : src_set.module_interfaces) {
+                                if (existing == p) { already = true; break; }
+                            }
+                            if (!already) {
+                                src_set.module_interfaces.push_back(p);
+                                has_cxx_sources = true;
+                            }
+                        }
+                    }
+                }
+            }
+
             bake::ModuleGraph mod_graph;
             if (!src_set.module_interfaces.empty() || !src_set.cpp_files.empty()) {
                 b->layout.bmi_dir.mkdir_recursive();
@@ -815,7 +846,7 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 bake::LinkConfig lc;
                 for (const auto& obj : object_paths)
                     lc.inputs.push_back(bake::Path(obj));
-                // Add outputs of linked targets (e.g. bake links libbake)
+                // Add outputs of linked targets (e.g. bake links core)
                 for (const auto* linked : target->linked_targets) {
                     if (!linked->output_path.empty())
                         lc.inputs.push_back(bake::Path(linked->output_path));

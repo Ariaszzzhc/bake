@@ -5,4 +5,4 @@ type = "executable"
 std = "c++23"
 
 [dependencies]
-libbake = { path = "../libbake" }
+core = { path = "../core" }

@@ -33,15 +33,15 @@ Requires: CMake ≥ 3.30, Ninja, Clang ≥ 19 with libc++ (Homebrew `llvm` formu
 - **`import std;`** — all standard library access is via `import std;`, not `#include`. The only `#include` directives in module files are for third-party headers (`<toml.hpp>`, `<nlohmann/json.hpp>`) and platform/OS headers (`<errno.h>`, `<sys/wait.h>`, `<windows.h>`), which go in the **global module fragment** (`module;` before `export module`).
 - **I/O**: use `std::println(...)` for stdout, `std::println(std::cerr, ...)` for stderr, `std::print(...)` without trailing newline. Use `{}` format placeholders, not printf `%s`. Drop `.c_str()` — `std::format` handles `std::string` natively. Do NOT use `fprintf`, `printf`, or the bare `stderr`/`stdout` macros.
 - **Module naming**: `bake.<subsystem>` (e.g. `bake.util`, `bake.engine`). File name mirrors module name: `bake.<name>.cppm`.
-- **Module dependency chain**: `bake.util` → `bake.project` → `bake.compiler` → `bake.engine` / `bake.package` → `bake.cli`.
+- **Module dependency chain**: `bake.util` → `bake.project` → `bake.compiler` → `bake.engine` / `bake.package` → `bake.cli`. Third-party modules (`nlohmann.json`, `tomlplusplus`) are consumed by core modules; `bake.cli` is in the `bake` executable, not `core`.
 
 ## Directory Layout
 
 ```
 bake/                     workspace root
-├── bake.toml             [workspace] members = ["libbake", "bake"]
+├── bake.toml             [workspace] members = ["core", "bake"]
 ├── CMakeLists.txt        Stage 0 bootstrap (permanent, not temporary)
-├── libbake/              shared library — all bake logic
+├── core/                 shared library — compiler + engine + package + C ABI
 │   ├── public/
 │   │   └── bake.build.cppm    public API for build.cpp scripts (C ABI wrapper)
 │   └── src/
@@ -50,21 +50,28 @@ bake/                     workspace root
 │       ├── bake.compiler.cppm Toolchain detection, compile/link command gen
 │       ├── bake.engine.cppm   source discovery, module scanning (P1689), DAG, executor
 │       ├── bake.package.cppm  Resolver, Fetcher, Cache, lockfile
-│       ├── bake.cli.cppm      CLI dispatch, all commands (init/build/add/update/run/clean)
 │       └── cabi/
 │           ├── bake_cabi.h    C ABI header (opaque handles, extern "C")
 │           └── api.cpp        C ABI implementation
-├── bake/                 executable — thin main() entry
-│   └── src/main.cpp      import bake.cli; → bake::cli::main()
+├── bake/                 executable — CLI + main
+│   └── src/
+│       ├── main.cpp           import bake.cli; → bake::cli::main()
+│       └── cli.cppm           CLI dispatch, all commands (init/build/add/update/run/clean)
 ├── tests/
 │   ├── test_runner.cpp   custom test framework (C++17), spawns bake binary
 │   └── projects/         fixture projects (simple_app, static_lib, path_dep, etc.)
 └── third_party/          vendored header-only (toml++, nlohmann/json)
+    ├── nlohmann/
+    │   ├── public/nlohmann/json.hpp
+    │   └── modules/json.cppm         official C++ module wrapper
+    └── tomlplusplus/
+        ├── public/toml++/toml.hpp
+        └── modules/tomlplusplus.cppm  official C++ module wrapper
 ```
 
 ## Architecture
 
-- **C ABI** (`bake_cabi.h` / `api.cpp`): opaque handles (`bake_builder*`, `bake_target*`, etc.) with `extern "C"` functions. All functions are `noexcept` — exceptions caught internally, converted to return codes + thread-local `bake_last_error()`. This ABI exists so user `build.cpp` scripts can link `libbake` without consuming C++23 modules.
+- **C ABI** (`bake_cabi.h` / `api.cpp`): opaque handles (`bake_builder*`, `bake_target*`, etc.) with `extern "C"` functions. All functions are `noexcept` — exceptions caught internally, converted to return codes + thread-local `bake_last_error()`. This ABI exists so user `build.cpp` scripts can link `libbake` (the core shared library, output name `bake`) without consuming C++23 modules.
 - **bake.build.cppm**: thin C++ wrapper over the C ABI. Distributed as source, compiled fresh per project by the engine when a `build.cpp` is present.
 - **Engine build flow**: discover sources → scan with `clang-scan-deps` (P1689) → build module DAG → topological sort → compile module interfaces → compile sources → link.
 - **import std support**: the compiler module pre-builds both `std.pcm` and `std.compat.pcm` from vendored libc++ sources (`ensure_std_modules()` in `bake.compiler`), caches them in the project output tree (`out/.bmi/.std/`), and injects `-fmodule-file=std=` / `-fmodule-file=std.compat=` into all C++ compile actions. The cache key incorporates compiler identity, content hashes of both generated `.cppm` sources, and the vendored `LLVM_REVISION`.

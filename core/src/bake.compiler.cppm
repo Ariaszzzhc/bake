@@ -44,7 +44,7 @@ export struct Toolchain {
         // 0. Self-spawn: if bake was built with LLVM, use bake c++ as the compiler
         if (bake_has_llvm()) {
             tc.kind = CompilerKind::BakeSelf;
-            // When running inside build_app (linked to libbake), get_self_exe_path()
+            // When running inside build_app (linked to core), get_self_exe_path()
             // returns build_app's path, not bake's. Use BAKE_EXE env var if set.
             std::string self;
             if (const char* bake_exe = std::getenv("BAKE_EXE")) {

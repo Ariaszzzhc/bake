@@ -1,2 +1,2 @@
 [workspace]
-members = ["libbake", "bake"]
+members = ["core", "bake"]

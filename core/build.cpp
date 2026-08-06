@@ -1,5 +1,5 @@
-// build.cpp — libbake custom build script (Stage 1 self-hosting).
-// Replaces convention mode for libbake because it needs LLVM static linking
+// build.cpp — core custom build script (Stage 1 self-hosting).
+// Replaces convention mode for core because it needs LLVM static linking
 // and special include paths that bake.toml cannot express.
 import bake.build;
 import std;
@@ -32,7 +32,7 @@ std::string q(const std::string& s) {
 int main() {
     bake::Builder b;
 
-    // cwd is libbake/ (the member directory).
+    // cwd is core/ (the member directory).
     namespace fs = std::filesystem;
     std::string here = fs::current_path().string();
     // Workspace root is one level up.
@@ -46,18 +46,15 @@ int main() {
     auto lld_libs   = glob_static_libs(llvm_lib, "liblld");
     auto llvm_libs  = glob_static_libs(llvm_lib, "libLLVM");
 
-    // Target name "bake" → library_name produces "libbake.dylib" (not "liblibbake")
-    auto& libbake = b.shared_lib("bake");
-    libbake.std("c++23")
+    // Target name "bake" → library_name produces "libbake.dylib" (not "libcore")
+    auto& core = b.shared_lib("bake");
+    core.std("c++23")
         .sources({
             "src/bake.util.cppm",
-            "src/nlohmann.json.cppm",
-            "src/tomlplusplus.cppm",
             "src/bake.project.cppm",
             "src/bake.compiler.cppm",
             "src/bake.engine.cppm",
             "src/bake.package.cppm",
-            "src/bake.cli.cppm",
             "src/cabi/api.cpp",
         })
         // LLVM-interfacing sources: LLVM is built with -fno-rtti, these must match.
@@ -75,11 +72,11 @@ int main() {
         .define("BAKE_VERSION", q("0.1.0").c_str());
 
     // Link all LLVM/Clang/LLD static libs in dependency order + zlib + zstd.
-    for (auto& lib : clang_libs) libbake.link_system(lib.c_str());
-    for (auto& lib : lld_libs)   libbake.link_system(lib.c_str());
-    for (auto& lib : llvm_libs)  libbake.link_system(lib.c_str());
-    libbake.link_system((ws + "/external/zlib-install/lib/libz.a").c_str());
-    libbake.link_system((ws + "/external/zstd-install/lib/libzstd.a").c_str());
+    for (auto& lib : clang_libs) core.link_system(lib.c_str());
+    for (auto& lib : lld_libs)   core.link_system(lib.c_str());
+    for (auto& lib : llvm_libs)  core.link_system(lib.c_str());
+    core.link_system((ws + "/external/zlib-install/lib/libz.a").c_str());
+    core.link_system((ws + "/external/zstd-install/lib/libzstd.a").c_str());
 
     return b.build();
 }

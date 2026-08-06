@@ -82,7 +82,7 @@ static CmdResult run_bake(const std::string& args, const fs::path& cwd,
         env_prefix += ' ';
     }
 #ifdef __APPLE__
-    // Ensure the test binary can find libbake at runtime.
+    // Ensure the test binary can find libbake (core) at runtime.
     fs::path lib_dir = fs::path(g_bake_bin).parent_path();
     env_prefix += "DYLD_LIBRARY_PATH=" + lib_dir.string() + " ";
 #endif
