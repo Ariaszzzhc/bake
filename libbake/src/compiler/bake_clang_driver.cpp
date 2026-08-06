@@ -67,6 +67,8 @@
 #include <system_error>
 #include <vector>
 
+import bake.util;
+
 using namespace clang;
 using namespace clang::driver;
 using namespace llvm::opt;
@@ -360,9 +362,9 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
         OwnedStrings.push_back("-F" + sdk + "/System/Library/Frameworks");
       } else {
         // Vendored mode: use our own libSystem.tbd.
-#ifdef BAKE_DARWIN_LIB
-        OwnedStrings.push_back(std::string("-L") + BAKE_DARWIN_LIB);
-#endif
+        const std::string& lib = bake::find_lib_dir().string();
+        if (!lib.empty())
+          OwnedStrings.push_back("-L" + lib + "/libc/darwin");
       }
       for (auto &S : OwnedStrings)
         LldArgs.push_back(S.c_str());
@@ -563,20 +565,29 @@ static int clang_main(int Argc, const char **Argv,
   if (IsCxx)
     Args.push_back(Saver.save("-nostdinc++").data());
   // 1. libc++ headers (C++ wrappers that must shadow C builtins)
-#ifdef BAKE_LIBCXX_INC
-  Args.push_back(Saver.save("-isystem").data());
-  Args.push_back(Saver.save(BAKE_LIBCXX_INC).data());
-#endif
+  {
+    const std::string lib = bake::find_lib_dir().string();
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save((lib + "/libcxx/include").c_str()).data());
+    }
+  }
   // 2. Clang builtin headers (stdarg.h, stddef.h — the real definitions)
-#ifdef BAKE_RESOURCE_DIR
-  Args.push_back(Saver.save("-isystem").data());
-  Args.push_back(Saver.save(BAKE_RESOURCE_DIR "/include").data());
-#endif
+  {
+    const std::string rd = bake::find_clang_resource_dir().string();
+    if (!rd.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save((rd + "/include").c_str()).data());
+    }
+  }
   // 3. Darwin C library headers (stdio.h, stdlib.h, etc.)
-#ifdef BAKE_DARWIN_INC
-  Args.push_back(Saver.save("-isystem").data());
-  Args.push_back(Saver.save(BAKE_DARWIN_INC).data());
-#endif
+  {
+    const std::string lib = bake::find_lib_dir().string();
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save((lib + "/libc/darwin/include").c_str()).data());
+    }
+  }
   // 4. macOS framework headers (CoreFoundation.h, AppKit.h, etc.)
   //    Detected via xcrun — framework headers only exist in the SDK.
   //    This does NOT affect libc++ or libSystem (those are vendored).
@@ -591,11 +602,13 @@ static int clang_main(int Argc, const char **Argv,
 
   // Inject -resource-dir so Clang finds its builtin headers (stdarg.h,
   // stddef.h, etc.) from the vendored LLVM build tree, not a system Clang.
-  // This replaces the old lib/clang symlink hack.
-#ifdef BAKE_RESOURCE_DIR
-  Args.push_back(Saver.save("-resource-dir").data());
-  Args.push_back(Saver.save(BAKE_RESOURCE_DIR).data());
-#endif
+  {
+    const std::string rd = bake::find_clang_resource_dir().string();
+    if (!rd.empty()) {
+      Args.push_back(Saver.save("-resource-dir").data());
+      Args.push_back(Saver.save(rd.c_str()).data());
+    }
+  }
 
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));
 

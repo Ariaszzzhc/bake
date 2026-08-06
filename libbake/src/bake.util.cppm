@@ -420,6 +420,88 @@ export inline std::string get_self_exe_path() {
 #endif
 }
 
+// ===== Runtime resource path resolution =====
+//
+// All paths are resolved at runtime relative to the executable, eliminating
+// compile-time defines that break when the binary is relocated or packaged.
+// Mirrors Zig's approach: find lib/ by walking up from the exe.
+
+// Returns the bake resource directory (the "lib/" folder).
+// Resolution order:
+//   1. BAKE_LIB_DIR env var (explicit override)
+//   2. Walk up from executable looking for lib/libcxx/include
+//   3. Empty path (not found)
+export inline const Path& find_lib_dir() {
+    static Path result = []() -> Path {
+        // 1. Env var override
+        if (const char* env = std::getenv("BAKE_LIB_DIR")) {
+            Path p(env);
+            if ((p / "libcxx" / "include").is_directory())
+                return p;
+        }
+        // 2. Walk up from executable
+        std::string exe = get_self_exe_path();
+        if (!exe.empty()) {
+            Path dir = Path(exe).parent();
+            for (int i = 0; i < 6; i++) {
+                Path lib = dir / "lib";
+                if ((lib / "libcxx" / "include").is_directory())
+                    return lib;
+                if (dir == dir.parent()) break;
+                dir = dir.parent();
+            }
+        }
+        return Path();
+    }();
+    return result;
+}
+
+// Returns the workspace root (parent of lib/).
+export inline const Path& find_workspace_root() {
+    static Path result = []() -> Path {
+        const Path& lib = find_lib_dir();
+        if (lib.string().empty()) return Path();
+        return lib.parent();
+    }();
+    return result;
+}
+
+// Returns the clang resource directory (builtin headers: stdarg.h, stddef.h).
+export inline const Path& find_clang_resource_dir() {
+    static Path result = []() -> Path {
+        if (const char* env = std::getenv("BAKE_RESOURCE_DIR"))
+            return Path(env);
+        const Path& root = find_workspace_root();
+        if (!root.string().empty()) {
+            namespace fs = std::filesystem;
+            fs::path base = root.fs() / "external" / "llvm-install" / "lib" / "clang";
+            if (fs::is_directory(base)) {
+                for (auto& entry : fs::directory_iterator(base))
+                    if (entry.is_directory())
+                        return Path(entry.path());
+            }
+        }
+        return Path();
+    }();
+    return result;
+}
+
+// Returns the LLVM prefix (for finding clang-scan-deps, etc.).
+export inline const Path& find_llvm_prefix() {
+    static Path result = []() -> Path {
+        if (const char* env = std::getenv("BAKE_LLVM_PREFIX"))
+            return Path(env);
+        const Path& root = find_workspace_root();
+        if (!root.string().empty()) {
+            Path p = root / "external" / "llvm-install";
+            if (p.is_directory())
+                return p;
+        }
+        return Path();
+    }();
+    return result;
+}
+
 // ===== Process =====
 
 export struct ProcessResult {

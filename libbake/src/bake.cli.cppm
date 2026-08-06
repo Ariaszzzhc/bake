@@ -33,14 +33,6 @@ import bake.package;
 #define BAKE_VERSION "0.1.0"
 #endif
 
-#ifndef BAKE_SRC_DIR
-#define BAKE_SRC_DIR "."
-#endif
-
-#ifndef BAKE_LIB_DIR
-#define BAKE_LIB_DIR "."
-#endif
-
 // Phase 5: LLVM compiler integration — C ABI
 extern "C" {
     int bake_clang_main(int argc, const char** argv);
@@ -51,33 +43,6 @@ namespace bake::cli {
 
 namespace {
 
-Path running_executable() {
-#ifdef __APPLE__
-    uint32_t size = 0;
-    (void)_NSGetExecutablePath(nullptr, &size);
-    if (size == 0) return {};
-    std::vector<char> buffer(size);
-    if (_NSGetExecutablePath(buffer.data(), &size) != 0) return {};
-    std::error_code ec;
-    auto canonical = std::filesystem::weakly_canonical(buffer.data(), ec);
-    return ec ? Path(buffer.data()) : Path(canonical);
-#elif defined(_WIN32)
-    std::vector<wchar_t> buffer(32768);
-    DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
-                                      static_cast<DWORD>(buffer.size()));
-    if (length == 0 || length == buffer.size()) return {};
-    return Path(std::filesystem::path(buffer.data(), buffer.data() + length));
-#elif defined(__linux__)
-    std::vector<char> buffer(4096);
-    ssize_t length = readlink("/proc/self/exe", buffer.data(), buffer.size() - 1);
-    if (length <= 0) return {};
-    buffer[static_cast<size_t>(length)] = '\0';
-    return Path(buffer.data());
-#else
-    return {};
-#endif
-}
-
 struct BuildScriptRuntime {
     Path wrapper;
     Path cabi_header;
@@ -85,13 +50,17 @@ struct BuildScriptRuntime {
 };
 
 BuildScriptRuntime find_build_script_runtime() {
-    const Path fallback_source(BAKE_SRC_DIR);
+    // Fallback: source-tree layout (dev builds). find_workspace_root()
+    // walks up from the executable to find lib/.
+    Path ws = find_workspace_root();
     BuildScriptRuntime runtime{
-        fallback_source / "libbake" / "public" / "bake.build.cppm",
-        fallback_source / "libbake" / "src" / "cabi" / "bake_cabi.h",
-        Path(BAKE_LIB_DIR)};
+        ws / "libbake" / "public" / "bake.build.cppm",
+        ws / "libbake" / "src" / "cabi" / "bake_cabi.h",
+        Path(get_self_exe_path()).parent()  // libbake lives next to bake
+    };
 
-    Path executable = running_executable();
+    // Check installed layout: <prefix>/share/bake/ + <prefix>/lib/
+    Path executable(get_self_exe_path());
     if (executable.string().empty()) return runtime;
 
     Path prefix = executable.parent().parent();
@@ -688,8 +657,7 @@ export int cmd_init(const ParsedArgs& args) {
 // replaced by the concatenation of all modules/std/*.inc files.
 // This mirrors what libc++'s CMake would do at configure time.
 static Path generate_std_cppm(const Path& cache_dir) {
-#ifdef BAKE_LIBCXX_MODULES_DIR
-    Path modules_dir(BAKE_LIBCXX_MODULES_DIR);
+    Path modules_dir = find_lib_dir() / "libcxx" / "modules";
     Path cppm_in = modules_dir / "std.cppm.in";
     if (!cppm_in.is_regular_file()) return Path();
 
@@ -721,9 +689,6 @@ static Path generate_std_cppm(const Path& cache_dir) {
     if (!write_file(result, cppm)) return Path();
 
     return result;
-#else
-    return Path();
-#endif
 }
 
 // Curated libc++ source file list (from Zig's libcxx.zig).
@@ -768,11 +733,8 @@ static const char* libcxxabi_files[] = {
 export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
     if (!tc.is_clang()) return {};
 
-#ifdef BAKE_SRC_DIR
-    std::string src(BAKE_SRC_DIR);
-#else
-    return {};
-#endif
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return {};
 
     // Global cache: ~/.cache/bake/libcxx-objects/
     Path cache_root = get_cache_dir().parent() / "libcxx-objects";
@@ -796,10 +758,10 @@ export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
     cache_dir.mkdir_recursive();
     std::println("   Compiling libc++ + libc++abi from source (cached)");
 
-    std::string libcxxabi_inc = src + "/lib/libcxxabi/include";
-    std::string libcxx_src    = src + "/lib/libcxx/src";
-    std::string libcxxabi_src = src + "/lib/libcxxabi/src";
-    std::string libc_inc      = src + "/lib/libcxx/libc";
+    std::string libcxxabi_inc = lib.string() + "/libcxxabi/include";
+    std::string libcxx_src    = lib.string() + "/libcxx/src";
+    std::string libcxxabi_src = lib.string() + "/libcxxabi/src";
+    std::string libc_inc      = lib.string() + "/libcxx/libc";
 
     // Common compile flags. bake's driver already injects vendored header
     // paths (libcxx_inc, builtins, darwin). We add:
@@ -919,12 +881,13 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     // Locate std.cppm relative to the compiler: <prefix>/share/libc++/v1/std.cppm
     Path cxx_dir = Path(tc.cxx_path).parent();       // bin/
     Path prefix = cxx_dir.parent();                   // llvm/<ver>/
-#ifdef BAKE_LLVM_PREFIX
     // For BakeSelf, the bake binary isn't in the LLVM installation tree.
-    // Use the LLVM prefix recorded at build time.
-    if (tc.kind == CompilerKind::BakeSelf)
-        prefix = Path(BAKE_LLVM_PREFIX);
-#endif
+    // Use the LLVM prefix resolved at runtime.
+    if (tc.kind == CompilerKind::BakeSelf) {
+        Path llvm_prefix = find_llvm_prefix();
+        if (!llvm_prefix.string().empty())
+            prefix = llvm_prefix;
+    }
     Path std_cppm = prefix / "share" / "libc++" / "v1" / "std.cppm";
     if (!std_cppm.is_regular_file()) {
         // Not installed — generate from vendored libc++ source template.
@@ -933,11 +896,10 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     }
 
     // libc++ include directory: prefer vendored source, fall back to install tree.
-#ifdef BAKE_LIBCXX_INC
-    Path libcxx_inc = Path(BAKE_LIBCXX_INC);
-#else
-    Path libcxx_inc = prefix / "include" / "c++" / "v1";
-#endif
+    Path vendored_inc = find_lib_dir() / "libcxx" / "include";
+    Path libcxx_inc = vendored_inc.is_directory()
+        ? vendored_inc
+        : prefix / "include" / "c++" / "v1";
 
     std::println("   Preparing standard library module");
 

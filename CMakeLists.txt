@@ -124,14 +124,6 @@ target_include_directories(libbake PRIVATE
 )
 target_compile_definitions(libbake PRIVATE
     BAKE_VERSION="${PROJECT_VERSION}"
-    BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
-    BAKE_LIB_DIR="${CMAKE_BINARY_DIR}"
-    BAKE_LLVM_PREFIX="${LLVM_PREFIX}"
-    BAKE_RESOURCE_DIR="${LLVM_PREFIX}/lib/clang/${LLVM_VERSION_MAJOR}"
-    BAKE_DARWIN_INC="${CMAKE_SOURCE_DIR}/lib/libc/darwin/include"
-    BAKE_DARWIN_LIB="${CMAKE_SOURCE_DIR}/lib/libc/darwin"
-    BAKE_LIBCXX_INC="${CMAKE_SOURCE_DIR}/lib/libcxx/include"
-    BAKE_LIBCXX_MODULES_DIR="${CMAKE_SOURCE_DIR}/lib/libcxx/modules"
 )
 
 # On Windows, libbake exports symbols; consumers import them.
@@ -142,10 +134,12 @@ endif()
 target_compile_features(libbake PRIVATE cxx_std_23)
 
 # LLVM headers expect -fno-rtti (LLVM is built with RTTI disabled).
-# Apply only to the LLVM-interfacing C++ source files (which use #include, not import std).
+# Apply only to the LLVM-interfacing C++ source files that instantiate
+# LLVM templates (which use #include, not import std).
+# bake_clang_driver.cpp is excluded: it imports bake.util (which has RTTI
+# enabled), and doesn't use typeid/dynamic_cast on LLVM types.
 set_property(SOURCE
     libbake/src/compiler/bake_llvm.cpp
-    libbake/src/compiler/bake_clang_driver.cpp
     libbake/src/compiler/bake_clang_cc1_main.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
 

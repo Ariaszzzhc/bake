@@ -55,24 +55,33 @@ export struct Toolchain {
             if (self.empty()) self = "bake";  // graceful fallback
             tc.cxx_path = self;
             tc.cc_path = self;
-#ifdef BAKE_LLVM_PREFIX
-            // Use the vendored clang-scan-deps for P1689 module scanning.
-            Path scanner = Path(BAKE_LLVM_PREFIX) / "bin" / "clang-scan-deps";
-            if (scanner.is_regular_file())
-                tc.scanner_path = scanner.string();
-#endif
+            // clang-scan-deps from LLVM prefix (runtime resolution).
+            {
+                Path llvm_prefix = find_llvm_prefix();
+                if (!llvm_prefix.string().empty()) {
+                    Path scanner = llvm_prefix / "bin" / "clang-scan-deps";
+                    if (scanner.is_regular_file())
+                        tc.scanner_path = scanner.string();
+                }
+            }
             // The scanner bypasses bake's driver, so repeat the vendored
             // header search paths here (same order as bake_clang_driver.cpp).
-#ifdef BAKE_LIBCXX_INC
-            tc.scan_include_dirs.push_back(BAKE_LIBCXX_INC);
-#endif
-#ifdef BAKE_RESOURCE_DIR
-            tc.scan_include_dirs.push_back(
-                std::string(BAKE_RESOURCE_DIR) + "/include");
-#endif
-#if defined(BAKE_DARWIN_INC) && defined(__APPLE__)
-            tc.scan_include_dirs.push_back(BAKE_DARWIN_INC);
-#endif
+            {
+                Path lib = find_lib_dir();
+                if (!lib.string().empty()) {
+                    Path libcxx = lib / "libcxx" / "include";
+                    if (libcxx.is_directory())
+                        tc.scan_include_dirs.push_back(libcxx.string());
+                    Path darwin_inc = lib / "libc" / "darwin" / "include";
+                    if (darwin_inc.is_directory())
+                        tc.scan_include_dirs.push_back(darwin_inc.string());
+                }
+            }
+            {
+                Path rd = find_clang_resource_dir();
+                if (!rd.string().empty())
+                    tc.scan_include_dirs.push_back(rd.string() + "/include");
+            }
             tc.ar_path = "ar";     // still use system ar for now (bake ar is Phase 6)
             return tc;
         }

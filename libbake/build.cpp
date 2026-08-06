@@ -59,22 +59,18 @@ int main() {
             "src/cabi/api.cpp",
         })
         // LLVM-interfacing sources: LLVM is built with -fno-rtti, these must match.
-        .sources("src/compiler/*.cpp", { .flags = {"-fno-rtti"} })
+        // bake_clang_driver.cpp is excluded: it imports bake.util (which has RTTI
+        // enabled), and doesn't use typeid/dynamic_cast on LLVM types.
+        .sources("src/compiler/bake_llvm.cpp", { .flags = {"-fno-rtti"} })
+        .sources("src/compiler/bake_clang_cc1_main.cpp", { .flags = {"-fno-rtti"} })
+        .sources("src/compiler/bake_clang_driver.cpp")
         .include_dirs({
             "../external/llvm-install/include",
             "../third_party/tomlplusplus/public",
             "../third_party/nlohmann/public",
             "src/cabi",
         })
-        .define("BAKE_VERSION", q("0.1.0").c_str())
-        .define("BAKE_SRC_DIR", q(ws).c_str())
-        .define("BAKE_LIB_DIR", q(b.build_dir()).c_str())
-        .define("BAKE_LLVM_PREFIX", q(llvm_dir).c_str())
-        .define("BAKE_RESOURCE_DIR", q(llvm_dir + "/lib/clang/22").c_str())
-        .define("BAKE_DARWIN_INC", q(ws + "/lib/libc/darwin/include").c_str())
-        .define("BAKE_DARWIN_LIB", q(ws + "/lib/libc/darwin").c_str())
-        .define("BAKE_LIBCXX_INC", q(ws + "/lib/libcxx/include").c_str())
-        .define("BAKE_LIBCXX_MODULES_DIR", q(ws + "/lib/libcxx/modules").c_str());
+        .define("BAKE_VERSION", q("0.1.0").c_str());
 
     // Link all LLVM/Clang/LLD static libs in dependency order + zlib + zstd.
     for (auto& lib : clang_libs) libbake.link_system(lib.c_str());
