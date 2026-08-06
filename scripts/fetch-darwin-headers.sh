@@ -46,13 +46,12 @@ echo "    Copied $HEADER_COUNT headers"
 echo "==> Copying libSystem.tbd..."
 cp "$SDK/usr/lib/libSystem.tbd" "$DEST/libSystem.tbd"
 
-# 3. Create SDKSettings.json with the SDK version
+# 3. Create SDKSettings.json (matches Zig's format: MinimalDisplayName only)
 SDK_VERSION=$(plutil -extract DefaultProperties.MACOSX_DEPLOYMENT_TARGET raw \
   "$SDK/SDKSettings.json" 2>/dev/null || echo "13.0")
-# Extract just the major.minor for MinimalDisplayName
 SDK_DISPLAY=$(echo "$SDK_VERSION" | cut -d. -f1-2)
 cat > "$DEST/SDKSettings.json" << EOF
-{"MinimalDisplayName":"$SDK_DISPLAY","Version":"$SDK_VERSION"}
+{"MinimalDisplayName":"$SDK_DISPLAY"}
 EOF
 echo "    SDK version: $SDK_DISPLAY"
 

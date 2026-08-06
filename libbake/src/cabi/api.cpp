@@ -349,6 +349,12 @@ BAKE_API bake_builder* bake_builder_new(void) noexcept {
                     "' does not match manifest package '" +
                     b->manifest->package->name + "'");
             }
+        } else if (configured_out && *configured_out) {
+            // Workspace member: output goes under the workspace root's out/.
+            // configured_out = ws_root/out, so ws_root = parent.
+            bake::Path ws_root(configured_out);
+            ws_root = ws_root.parent();
+            b->layout = bake::Layout::detect(*root, ws_root);
         } else {
             b->layout = bake::Layout::detect(*root);
         }

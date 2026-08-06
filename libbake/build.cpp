@@ -1,5 +1,6 @@
-// build.cpp — bake self-hosting build script.
-// This replaces CMakeLists.txt for Stage 1: bake builds itself.
+// build.cpp — libbake custom build script (Stage 1 self-hosting).
+// Replaces convention mode for libbake because it needs LLVM static linking
+// and special include paths that bake.toml cannot express.
 import bake.build;
 import std;
 
@@ -31,9 +32,12 @@ std::string q(const std::string& s) {
 int main() {
     bake::Builder b;
 
-    // build_app runs with cwd = project root.
-    std::string src = std::filesystem::current_path().string();
-    std::string llvm_dir = src + "/external/llvm-install";
+    // cwd is libbake/ (the member directory).
+    namespace fs = std::filesystem;
+    std::string here = fs::current_path().string();
+    // Workspace root is one level up.
+    std::string ws = (fs::path(here) / "..").lexically_normal().string();
+    std::string llvm_dir = ws + "/external/llvm-install";
     std::string llvm_lib = llvm_dir + "/lib";
 
     // Collect LLVM/Clang/LLD static libraries in dependency order:
@@ -46,44 +50,38 @@ int main() {
     auto& libbake = b.shared_lib("libbake");
     libbake.std("c++23")
         .sources({
-            "libbake/src/bake.util.cppm",
-            "libbake/src/bake.project.cppm",
-            "libbake/src/bake.compiler.cppm",
-            "libbake/src/bake.engine.cppm",
-            "libbake/src/bake.package.cppm",
-            "libbake/src/bake.cli.cppm",
-            "libbake/src/cabi/api.cpp",
+            "src/bake.util.cppm",
+            "src/bake.project.cppm",
+            "src/bake.compiler.cppm",
+            "src/bake.engine.cppm",
+            "src/bake.package.cppm",
+            "src/bake.cli.cppm",
+            "src/cabi/api.cpp",
         })
         // LLVM-interfacing sources: LLVM is built with -fno-rtti, these must match.
-        .sources("libbake/src/compiler/*.cpp", { .flags = {"-fno-rtti"} })
+        .sources("src/compiler/*.cpp", { .flags = {"-fno-rtti"} })
         .include_dirs({
-            "external/llvm-install/include",
-            "third_party/tomlplusplus/public",
-            "third_party/nlohmann/public",
-            "libbake/src/cabi",
+            "../external/llvm-install/include",
+            "../third_party/tomlplusplus/public",
+            "../third_party/nlohmann/public",
+            "src/cabi",
         })
         .define("BAKE_VERSION", q("0.1.0").c_str())
-        .define("BAKE_SRC_DIR", q(src).c_str())
+        .define("BAKE_SRC_DIR", q(ws).c_str())
         .define("BAKE_LIB_DIR", q(b.build_dir()).c_str())
         .define("BAKE_LLVM_PREFIX", q(llvm_dir).c_str())
         .define("BAKE_RESOURCE_DIR", q(llvm_dir + "/lib/clang/22").c_str())
-        .define("BAKE_DARWIN_INC", q(src + "/lib/bake/libc/darwin/include").c_str())
-        .define("BAKE_DARWIN_LIB", q(src + "/lib/bake/libc/darwin").c_str())
+        .define("BAKE_DARWIN_INC", q(ws + "/lib/bake/libc/darwin/include").c_str())
+        .define("BAKE_DARWIN_LIB", q(ws + "/lib/bake/libc/darwin").c_str())
         .define("BAKE_LIBCXX_INC", q(llvm_dir + "/include/c++/v1").c_str())
-        .define("BAKE_LIBCXX_MODULES_DIR", q(src + "/external/llvm-project/libcxx/modules").c_str());
+        .define("BAKE_LIBCXX_MODULES_DIR", q(ws + "/external/llvm-project/libcxx/modules").c_str());
 
     // Link all LLVM/Clang/LLD static libs in dependency order + zlib + zstd.
     for (auto& lib : clang_libs) libbake.link_system(lib.c_str());
     for (auto& lib : lld_libs)   libbake.link_system(lib.c_str());
     for (auto& lib : llvm_libs)  libbake.link_system(lib.c_str());
-    libbake.link_system((src + "/external/zlib-install/lib/libz.a").c_str());
-    libbake.link_system((src + "/external/zstd-install/lib/libzstd.a").c_str());
-
-    // ── bake (executable) ─────────────────────────────────────────
-    auto& bake_exe = b.executable("bake");
-    bake_exe.std("c++23")
-        .sources("bake/src/main.cpp")
-        .link(libbake);
+    libbake.link_system((ws + "/external/zlib-install/lib/libz.a").c_str());
+    libbake.link_system((ws + "/external/zstd-install/lib/libzstd.a").c_str());
 
     return b.build();
 }

@@ -960,6 +960,37 @@ export Path ensure_std_pcm(const Toolchain& tc, const Path& project_out) {
     return std_pcm;
 }
 
+// Inject statically-compiled libc++ + libc++abi objects into all C++ link
+// actions in a plan. Replaces dynamic -lc++ / libc++.1.dylib dependency.
+// For BakeSelf only: the in-process LLD has no system libc++.tbd.
+export void inject_static_libcxx(BuildPlan& plan, const Toolchain& tc,
+                                  const Path& std_pcm) {
+    if (!tc.is_clang() || !std_pcm.is_regular_file())
+        return;
+    if (tc.kind != CompilerKind::BakeSelf)
+        return;
+
+    auto libcxx_objs = ensure_libcxx_objects(tc);
+    if (libcxx_objs.empty())
+        return;
+
+    for (auto& action : plan.actions) {
+        if (action.type != BuildAction::Type::Link) continue;
+
+        // Detect C++ link by checking if the compiler is invoked as "c++"
+        bool is_cxx = false;
+        for (auto& arg : action.command) {
+            if (arg == "c++") { is_cxx = true; break; }
+        }
+        if (!is_cxx) continue;
+
+        action.command.push_back("-nodefaultlibs");
+        for (auto& obj : libcxx_objs)
+            action.command.push_back(obj.string());
+        action.command.push_back("-lsystem");
+    }
+}
+
 
 export int build_with_build_cpp(
         const Layout& layout, const ParsedArgs& args,
@@ -1069,11 +1100,21 @@ export int build_with_build_cpp(
     {
         std::vector<std::string> cmd;
         for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
-        if (tc.is_clang()) {
+        if (tc.is_clang() && tc.kind != CompilerKind::BakeSelf) {
             cmd.push_back("-stdlib=libc++");
         }
         cmd.push_back(wrapper_o.string());
         cmd.push_back(build_o.string());
+        // BakeSelf: inject static libc++ objects (no -lc++ available).
+        if (tc.kind == CompilerKind::BakeSelf && std_pcm.is_regular_file()) {
+            auto libcxx_objs = ensure_libcxx_objects(tc);
+            if (!libcxx_objs.empty()) {
+                cmd.push_back("-nodefaultlibs");
+                for (auto& obj : libcxx_objs)
+                    cmd.push_back(obj.string());
+                cmd.push_back("-lsystem");
+            }
+        }
 #ifdef _WIN32
         // Windows: link against the import library directly
         cmd.push_back((runtime.library_dir / "bake.lib").string());
@@ -1138,36 +1179,8 @@ export int build_with_build_cpp(
         }
     }
 
-    // Inject static libc++ objects into C++ link actions (replaces -stdlib=libc++).
-    // This eliminates the dynamic dependency on libc++.1.dylib — libc++ and
-    // libc++abi are compiled from vendored source and linked as .o files.
-    if (tc.is_clang() && std_pcm.is_regular_file()) {
-        auto libcxx_objs = ensure_libcxx_objects(tc);
-        if (!libcxx_objs.empty()) {
-            for (auto& action : plan.actions) {
-                if (action.type != BuildAction::Type::Link) continue;
-                // Detect C++ link by checking if the compiler is invoked as "c++"
-                bool is_cxx = false;
-                for (auto& arg : action.command) {
-                    if (arg == "c++") { is_cxx = true; break; }
-                }
-                if (is_cxx) {
-                    // Replace default libs with explicit list:
-                    // - libc++ comes from our static .o files
-                    // - libc++abi from vendored TBD (macOS system provides it)
-                    // - libSystem for kernel interface
-                    // -nodefaultlibs prevents linking system libc++/libc++abi.
-                    //   libc++   → our static .o files
-                    //   libc++abi → our static .o files
-                    //   libSystem → vendored TBD (kernel + C library, no libc++abi)
-                    action.command.push_back("-nodefaultlibs");
-                    for (auto& obj : libcxx_objs)
-                        action.command.push_back(obj.string());
-                    action.command.push_back("-lsystem");
-                }
-            }
-        }
-    }
+    // Inject static libc++ objects into C++ link actions.
+    inject_static_libcxx(plan, tc, std_pcm);
 
     // Write compile_commands.json
     write_compile_commands(
@@ -1344,7 +1357,8 @@ bool valid_package_output_name(std::string_view name) {
 int collect_path_meta_dependencies(
     const Manifest& manifest,
     const std::vector<std::string>& parent_path,
-    PathMetaGraph& graph) {
+    PathMetaGraph& graph,
+    const std::set<std::string>& skip_dirs = {}) {
     for (const auto& [name, dep] : manifest.dependencies) {
         if (!dep.is_path_dep) continue;
 
@@ -1360,6 +1374,10 @@ int collect_path_meta_dependencies(
         const std::string key = ec
             ? std::filesystem::absolute(dep_root.fs()).lexically_normal().string()
             : canonical.string();
+
+        // Skip dependencies that are workspace members — they are built
+        // by the workspace loop, not through .pkgs/.
+        if (skip_dirs.contains(key)) continue;
 
         if (!validate_dependency_options(*dep_manifest, dep.options)) return 1;
 
@@ -1439,12 +1457,14 @@ int collect_path_meta_dependencies(
 int build_path_meta_dependencies(
         const std::vector<const Manifest*>& manifests,
         const ParsedArgs& args,
-        const Path& project_out) {
+        const Path& project_out,
+        const std::set<std::string>& skip_dirs = {}) {
     PathMetaGraph graph;
     for (const Manifest* manifest : manifests) {
         if (!manifest) continue;
         if (int rc = collect_path_meta_dependencies(
-                *manifest, {manifest_package_name(*manifest)}, graph); rc != 0) {
+                *manifest, {manifest_package_name(*manifest)}, graph,
+                skip_dirs); rc != 0) {
             return rc;
         }
     }
@@ -1486,7 +1506,8 @@ int build_path_meta_dependencies(const Manifest& manifest,
 
 std::optional<std::vector<PackageUsageRequirements>>
 load_path_meta_package_requirements(const Manifest& manifest,
-                                    const Path& project_out) {
+                                    const Path& project_out,
+                                    const std::set<std::string>& skip_dirs = {}) {
     std::vector<PackageUsageRequirements> result;
 
     for (const auto& [name, dependency] : manifest.dependencies) {
@@ -1500,6 +1521,14 @@ load_path_meta_package_requirements(const Manifest& manifest,
         // workspace builder today. A package with build.cpp, however, must be
         // consumed through its exported metadata and never recompiled here.
         if (!(dependency_root / "build.cpp").is_regular_file()) continue;
+
+        // Skip workspace members — they are built by the workspace loop.
+        std::error_code ec;
+        auto canonical = std::filesystem::weakly_canonical(dependency_root.fs(), ec);
+        const std::string key = ec
+            ? std::filesystem::absolute(dependency_root.fs()).lexically_normal().string()
+            : canonical.string();
+        if (skip_dirs.contains(key)) continue;
 
         const std::string package_name =
             manifest_package_name(*dependency_manifest);
@@ -1736,16 +1765,6 @@ export int cmd_build(const ParsedArgs& args) {
         std::println("   Building workspace {}", workspace_name);
     }
 
-    // Check for build.cpp (escape hatch mode)
-    Path build_cpp = *root / "build.cpp";
-    if (build_cpp.is_regular_file()) {
-        auto layout = Layout::detect(*root);
-        if (int rc = build_path_meta_dependencies(
-                *manifest, args, layout.out_dir); rc != 0)
-            return rc;
-        return build_with_build_cpp(layout, args);
-    }
-
     // Handle workspace: build all members with inter-member deps
     if (manifest->is_workspace()) {
         int result = 0;
@@ -1818,6 +1837,19 @@ export int cmd_build(const ParsedArgs& args) {
         // C++ standard library module at all.
         Path std_pcm;
 
+        // Compute canonical paths of all workspace member directories so
+        // path-meta-dependency collection can skip them. Workspace members
+        // are built by the loop below, never through .pkgs/.
+        std::set<std::string> workspace_member_dirs;
+        for (const auto& member : manifest->workspace->members) {
+            Path member_dir = *root / member;
+            std::error_code ec;
+            auto canonical = std::filesystem::weakly_canonical(member_dir.fs(), ec);
+            workspace_member_dirs.insert(ec
+                ? std::filesystem::absolute(member_dir.fs()).lexically_normal().string()
+                : canonical.string());
+        }
+
         // A workspace owns one dependency package graph. Collect every
         // selected member's requests before building any path meta package so
         // one package cannot be overwritten by a later member's options.
@@ -1836,7 +1868,8 @@ export int cmd_build(const ParsedArgs& args) {
         for (const auto& selected : selected_member_manifests)
             selected_member_refs.push_back(&selected);
         if (int rc = build_path_meta_dependencies(
-                selected_member_refs, args, project_out); rc != 0) {
+                selected_member_refs, args, project_out,
+                workspace_member_dirs); rc != 0) {
             return rc;
         }
 
@@ -1853,15 +1886,56 @@ export int cmd_build(const ParsedArgs& args) {
                 if (*p != member_manifest->package->name) continue;
             }
 
-            auto member_package_requirements =
-                load_path_meta_package_requirements(
-                    *member_manifest, project_out);
-            if (!member_package_requirements) return 1;
-
             std::println("  Compiling {}",
                          manifest_package_label(*member_manifest));
             auto layout = Layout::detect(member_dir, *root);
             auto tc = Toolchain::detect();
+
+            // ── build.cpp escape hatch ──
+            // A member with build.cpp is built by its own script instead of
+            // convention mode. The output is recorded in `built` so that
+            // downstream workspace members can link against it.
+            Path member_build_cpp = member_dir / "build.cpp";
+            if (member_build_cpp.is_regular_file()) {
+                if (!is_c_standard(member_manifest->package->std_version)) {
+                    if (!std_pcm.is_regular_file())
+                        std_pcm = ensure_std_pcm(tc, layout.out_dir);
+                }
+
+                if (int rc = build_with_build_cpp(layout, args); rc != 0) {
+                    result = rc; break;
+                }
+
+                // Record this member for dependents
+                BuiltMember bm;
+                bm.name = member_manifest->package->name;
+                bm.bmi_dir = layout.bmi_dir;
+
+                // Read primary output from build.json
+                Path build_json = layout.bake_dir / "build.json";
+                if (build_json.is_regular_file()) {
+                    auto bp = read_build_json(build_json, member_dir);
+                    bm.lib_path = bp.primary_output;
+                }
+
+                // Collect module names from BMI directory
+                if (bm.bmi_dir.is_directory()) {
+                    for (auto& entry : std::filesystem::directory_iterator(bm.bmi_dir.fs())) {
+                        if (entry.path().extension() == ".pcm") {
+                            bm.module_names.push_back(entry.path().stem().string());
+                        }
+                    }
+                }
+                built.push_back(std::move(bm));
+                continue;
+            }
+
+            // ── convention mode ──
+            auto member_package_requirements =
+                load_path_meta_package_requirements(
+                    *member_manifest, project_out, workspace_member_dirs);
+            if (!member_package_requirements) return 1;
+
             Path member_std_pcm;
             if (!is_c_standard(member_manifest->package->std_version)) {
                 if (!std_pcm.is_regular_file())
@@ -1905,10 +1979,10 @@ export int cmd_build(const ParsedArgs& args) {
             for (auto& action : plan.actions) {
                 if (action.type != BuildAction::Type::Link) continue;
 
-                // Clang needs -stdlib=libc++ when import std is in use
-                if (std_pcm.is_regular_file() && tc.is_clang()) {
-                    // Insert after the executable prefix (1 for normal compilers,
-                    // 2 for BakeSelf where prefix is [bake, c++]).
+                // Clang needs -stdlib=libc++ when import std is in use,
+                // unless BakeSelf (which uses static libc++ objects instead).
+                if (std_pcm.is_regular_file() && tc.is_clang() &&
+                    tc.kind != CompilerKind::BakeSelf) {
                     auto prefix_len = cxx_prefix(tc).size();
                     action.command.insert(action.command.begin() + prefix_len, "-stdlib=libc++");
                 }
@@ -1928,6 +2002,9 @@ export int cmd_build(const ParsedArgs& args) {
 #endif
                 }
             }
+
+            // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
+            inject_static_libcxx(plan, tc, std_pcm);
 
             int r = execute_plan(plan, jobs);
             if (r != 0) { result = r; break; }
@@ -1960,6 +2037,16 @@ export int cmd_build(const ParsedArgs& args) {
     if (!manifest->has_package()) {
         std::println(std::cerr, "bake: no [package] section in bake.toml");
         return 1;
+    }
+
+    // Check for build.cpp (single-package escape hatch)
+    Path build_cpp = *root / "build.cpp";
+    if (build_cpp.is_regular_file()) {
+        auto layout = Layout::detect(*root);
+        if (int rc = build_path_meta_dependencies(
+                *manifest, args, layout.out_dir); rc != 0)
+            return rc;
+        return build_with_build_cpp(layout, args);
     }
 
     auto layout = Layout::detect(*root);
@@ -2001,6 +2088,9 @@ export int cmd_build(const ParsedArgs& args) {
                                         /*compile_path_deps=*/true,
                                         std_pcm,
                                         *package_requirements);
+
+    // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
+    inject_static_libcxx(plan, tc, std_pcm);
 
     // Write compile_commands.json
     write_compile_commands(plan, *root / "compile_commands.json");
@@ -2053,30 +2143,38 @@ export int cmd_run(const ParsedArgs& args) {
 
     Path exe_path;
 
-    // If build.cpp was used, read primary output from build.json
-    auto root_layout = Layout::detect(*root);
-    Path build_json = root_layout.bake_dir / "build.json";
-    Path build_cpp = *root / "build.cpp";
-    if (build_cpp.is_regular_file() && build_json.is_regular_file()) {
-        auto plan = read_build_json(build_json, *root);
-        if (plan.primary_output.string() != "") {
-            exe_path = plan.primary_output.fs().is_absolute()
-                ? plan.primary_output
-                : *root / plan.primary_output;
-        }
+    auto manifest = Manifest::load(*root);
+    if (!manifest) {
+        std::println(std::cerr, "bake: failed to load bake.toml");
+        return 1;
     }
 
-    // Convention mode fallback
-    if (exe_path.string() == "") {
-        auto manifest = Manifest::load(*root);
-        if (!manifest || !manifest->has_package()) return 1;
+    // Workspace: find the executable member's output in out/bin/
+    if (manifest->is_workspace()) {
+        auto layout = Layout::detect(*root);
+        for (auto& member : manifest->workspace->members) {
+            auto member_manifest = Manifest::load(*root / member);
+            if (!member_manifest || !member_manifest->has_package()) continue;
+            if (member_manifest->package->type == PackageType::Executable) {
+                // Check -p flag
+                if (auto p = args.get_option("p")) {
+                    if (*p != member_manifest->package->name) continue;
+                }
+                std::string exe_name = library_name(
+                    member_manifest->package->name, PackageType::Executable);
+                exe_path = layout.bin_dir / exe_name;
+                break;
+            }
+        }
+    } else if (manifest->has_package()) {
+        // Single package: convention mode
+        auto layout = Layout::detect(*root);
 
         if (manifest->package->type != PackageType::Executable) {
             std::println(std::cerr, "bake: cannot run non-executable package");
             return 1;
         }
 
-        auto layout = Layout::detect(*root);
         std::string exe_name = library_name(manifest->package->name, PackageType::Executable);
         exe_path = layout.bin_dir / exe_name;
     }

@@ -650,8 +650,10 @@ export BuildPlan create_convention_plan(
             for (const auto& input : package_link_inputs)
                 link_action.inputs.push_back(input);
 
-            // Ensure libc++ at link time when import std is in use
-            if (lc.use_cxx_linker && !std_module_pcm.string().empty() && tc.is_clang()) {
+            // Ensure libc++ at link time when import std is in use.
+            // BakeSelf uses static libc++ objects instead (injected by caller).
+            if (lc.use_cxx_linker && !std_module_pcm.string().empty() &&
+                tc.is_clang() && tc.kind != CompilerKind::BakeSelf) {
                 // Insert after the executable prefix (1 for normal compilers,
                 // 2 for BakeSelf where prefix is [bake, c++]).
                 auto prefix_len = cxx_prefix(tc).size();

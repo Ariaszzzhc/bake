@@ -246,6 +246,49 @@ static int ExecuteCC1Tool(SmallVectorImpl<const char *> &ArgV,
 }
 
 //===----------------------------------------------------------------------===//
+// macOS SDK detection (for framework support only)
+//===----------------------------------------------------------------------===//
+
+/// Detect the macOS SDK path via `xcrun --show-sdk-path`.
+/// Cached after first call. Returns empty string if not found.
+/// Used ONLY for framework header/link paths — never for libc++ or libSystem.
+static std::string &getMacosSdkPath() {
+  static std::string sdk_path;
+  static bool initialized = false;
+  if (initialized) return sdk_path;
+  initialized = true;
+
+#ifdef __APPLE__
+  // Try xcrun first (works with both Xcode and CommandLineTools).
+  FILE *pipe = ::popen("xcrun --show-sdk-path 2>/dev/null", "r");
+  if (pipe) {
+    char buf[4096];
+    if (fgets(buf, sizeof(buf), pipe)) {
+      size_t len = strlen(buf);
+      while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
+        buf[--len] = '\0';
+      if (len > 0) sdk_path = buf;
+    }
+    pclose(pipe);
+  }
+  // Fallback: check known paths.
+  if (sdk_path.empty()) {
+    const char *candidates[] = {
+      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+      nullptr
+    };
+    for (auto *p = candidates; *p; ++p) {
+      if (llvm::sys::fs::exists(*p)) {
+        sdk_path = *p;
+        break;
+      }
+    }
+  }
+#endif
+  return sdk_path;
+}
+
+//===----------------------------------------------------------------------===//
 // LLD link interception helpers
 //===----------------------------------------------------------------------===//
 
@@ -305,19 +348,22 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     for (const char *Arg : Cmd->getArguments())
       LldArgs.push_back(Arg);
 
-    // On macOS, add the vendored libSystem.tbd directory to library search
-    // path so LLD can find libSystem without the system SDK.
+    // macOS library/framework search paths.
+    // Follows Zig's model: when SDK is detected, use SDK's libSystem.tbd
+    // (always up-to-date with the system). When no SDK, fall back to
+    // vendored libSystem.tbd. libc++ is NEVER linked dynamically regardless.
     if (Flavor == BAKE_LLD_MACHO) {
-#ifdef BAKE_DARWIN_LIB
-      OwnedStrings.push_back(std::string("-L") + BAKE_DARWIN_LIB);
-#else
-      // Fallback: SDKROOT env or system SDK.
-      if (const char *SdkRoot = ::getenv("SDKROOT")) {
-        OwnedStrings.push_back(std::string("-L") + SdkRoot + "/usr/lib");
+      auto &sdk = getMacosSdkPath();
+      if (!sdk.empty()) {
+        // SDK mode: libSystem.tbd + frameworks from SDK.
+        OwnedStrings.push_back("-L" + sdk + "/usr/lib");
+        OwnedStrings.push_back("-F" + sdk + "/System/Library/Frameworks");
       } else {
-        OwnedStrings.push_back("-L/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib");
-      }
+        // Vendored mode: use our own libSystem.tbd.
+#ifdef BAKE_DARWIN_LIB
+        OwnedStrings.push_back(std::string("-L") + BAKE_DARWIN_LIB);
 #endif
+      }
       for (auto &S : OwnedStrings)
         LldArgs.push_back(S.c_str());
     }
@@ -531,6 +577,16 @@ static int clang_main(int Argc, const char **Argv,
   Args.push_back(Saver.save("-isystem").data());
   Args.push_back(Saver.save(BAKE_DARWIN_INC).data());
 #endif
+  // 4. macOS framework headers (CoreFoundation.h, AppKit.h, etc.)
+  //    Detected via xcrun — framework headers only exist in the SDK.
+  //    This does NOT affect libc++ or libSystem (those are vendored).
+  {
+    auto &sdk = getMacosSdkPath();
+    if (!sdk.empty()) {
+      Args.push_back(Saver.save("-iframework").data());
+      Args.push_back(Saver.save((sdk + "/System/Library/Frameworks").c_str()).data());
+    }
+  }
 #endif
 
   // Inject -resource-dir so Clang finds its builtin headers (stdarg.h,
