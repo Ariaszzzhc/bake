@@ -1931,12 +1931,17 @@ export int cmd_build(const ParsedArgs& args) {
                     }
                 }
                 // Also inject std PCM so transitive import std; resolves
+                // (C++ only — import std is meaningless in C files)
                 if (std_pcm.is_regular_file()) {
-                    action.command.push_back("-fmodule-file=std=" + std_pcm.string());
-                    // Clang needs libc++ for import std
-                    if (tc.is_clang()) {
-                        action.command.push_back("-stdlib=libc++");
-                        action.command.push_back("-Wno-reserved-module-identifier");
+                    bool is_c_source = false;
+                    for (auto& input : action.inputs)
+                        if (input.is_c()) { is_c_source = true; break; }
+                    if (!is_c_source) {
+                        action.command.push_back("-fmodule-file=std=" + std_pcm.string());
+                        if (tc.is_clang()) {
+                            action.command.push_back("-stdlib=libc++");
+                            action.command.push_back("-Wno-reserved-module-identifier");
+                        }
                     }
                 }
             }
