@@ -67,7 +67,7 @@ bake/                     workspace root
 - **C ABI** (`bake_cabi.h` / `api.cpp`): opaque handles (`bake_builder*`, `bake_target*`, etc.) with `extern "C"` functions. All functions are `noexcept` — exceptions caught internally, converted to return codes + thread-local `bake_last_error()`. This ABI exists so user `build.cpp` scripts can link `libbake` without consuming C++23 modules.
 - **bake.build.cppm**: thin C++ wrapper over the C ABI. Distributed as source, compiled fresh per project by the engine when a `build.cpp` is present.
 - **Engine build flow**: discover sources → scan with `clang-scan-deps` (P1689) → build module DAG → topological sort → compile module interfaces → compile sources → link.
-- **import std support**: the engine pre-builds `std.pcm` from libc++ (`ensure_std_pcm()`), caches it in `~/.cache/bake/`, and injects `-fmodule-file=std=<path>` into all C++ compile actions.
+- **import std support**: the compiler module pre-builds both `std.pcm` and `std.compat.pcm` from vendored libc++ sources (`ensure_std_modules()` in `bake.compiler`), caches them in the project output tree (`out/.bmi/.std/`), and injects `-fmodule-file=std=` / `-fmodule-file=std.compat=` into all C++ compile actions. The cache key incorporates compiler identity, content hashes of both generated `.cppm` sources, and the vendored `LLVM_REVISION`.
 - **Workspace**: multi-package projects like Cargo. Each member is a separate package with its own `bake.toml`. The root `bake.toml` declares `[workspace] members = [...]`.
 - **External source builds**: bake has no built-in CMake/Meson integration and never infers a foreign build graph. `bake add` resolves source; `build.cpp` explicitly describes how that source is compiled.
 

@@ -1,0 +1,5 @@
+[package]
+name = "std-compat-convention"
+version = "0.1.0"
+type = "executable"
+std = "c++23"

@@ -926,6 +926,97 @@ TestResult test_build_cpp_options() {
     return {};
 }
 
+// Module interfaces compiled by build.cpp need BMI paths for the complete
+// import closure. A direct-only mapping makes the third module unable to load
+// declarations exported through the second module.
+TestResult test_build_cpp_transitive_modules() {
+    // clang-scan-deps reports canonical paths; keep the fixture root canonical
+    // too so macOS's /var -> /private/var alias does not hide module sources.
+    auto dir = fs::weakly_canonical(
+        make_temp_dir("build_cpp_transitive_modules"));
+    copy_fixture("build_cpp_transitive_modules", dir);
+
+    auto build = run_bake("build", dir);
+    CHECK(build.success(),
+          "build.cpp could not compile transitive module imports: " +
+              build.stdout);
+
+    fs::path exe = dir / "out" / "bin" / "transitive-modules";
+    CHECK(fs::exists(exe), "transitive module executable was not produced");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK(run.success(), "transitive module executable returned a failure");
+
+    return {};
+}
+
+// Convention build must provide std.compat so end-user C++ can use global
+// compatibility names (size_t, uintmax_t) via `import std.compat;`.
+TestResult test_std_compat_convention() {
+    auto dir = make_temp_dir("std_compat_convention");
+    copy_fixture("std_compat_convention", dir);
+
+    auto build = run_bake("build", dir);
+    CHECK(build.success(),
+          "convention build with import std.compat failed: " + build.stdout);
+
+    fs::path exe = dir / "out" / "bin" / "std-compat-convention";
+    CHECK(fs::exists(exe), "std.compat convention executable was not produced");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK(run.success(), "std.compat convention executable returned failure");
+
+    // Both std and std.compat PCMs must exist.
+    fs::path std_cache = dir / "out" / ".bmi" / ".std";
+    bool has_std = false, has_compat = false;
+    if (fs::exists(std_cache)) {
+        for (auto& e : fs::directory_iterator(std_cache)) {
+            std::string name = e.path().filename().string();
+            if (name.starts_with("std-") && name.ends_with(".pcm")) has_std = true;
+            if (name.starts_with("std.compat-") && name.ends_with(".pcm")) has_compat = true;
+        }
+    }
+    CHECK(has_std, "std PCM not found in out/.bmi/.std");
+    CHECK(has_compat, "std.compat PCM not found in out/.bmi/.std");
+
+    // compile_commands.json must reference both module mappings.
+    auto cc = read_file(dir / "compile_commands.json");
+    CHECK(cc.find("-fmodule-file=std=") != std::string::npos,
+          "compile_commands missing -fmodule-file=std=");
+    CHECK(cc.find("-fmodule-file=std.compat=") != std::string::npos,
+          "compile_commands missing -fmodule-file=std.compat=");
+
+    return {};
+}
+
+// build.cpp path must also provide std.compat.
+TestResult test_std_compat_build_cpp() {
+    auto dir = make_temp_dir("std_compat_build_cpp");
+    copy_fixture("std_compat_build_cpp", dir);
+
+    auto build = run_bake("build", dir);
+    CHECK(build.success(),
+          "build.cpp with import std.compat failed: " + build.stdout);
+
+    fs::path exe = dir / "out" / "bin" / "std-compat-build-cpp";
+    CHECK(fs::exists(exe), "std.compat build.cpp executable was not produced");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK(run.success(), "std.compat build.cpp executable returned failure");
+
+    // Both std and std.compat PCMs must exist.
+    fs::path std_cache = dir / "out" / ".bmi" / ".std";
+    bool has_std = false, has_compat = false;
+    if (fs::exists(std_cache)) {
+        for (auto& e : fs::directory_iterator(std_cache)) {
+            std::string name = e.path().filename().string();
+            if (name.starts_with("std-") && name.ends_with(".pcm")) has_std = true;
+            if (name.starts_with("std.compat-") && name.ends_with(".pcm")) has_compat = true;
+        }
+    }
+    CHECK(has_std, "std PCM not found in build.cpp out/.bmi/.std");
+    CHECK(has_compat, "std.compat PCM not found in build.cpp out/.bmi/.std");
+
+    return {};
+}
+
 // Remote dependency archives must extract with the platform tar. This uses a
 // local file:// Git repository and archive, so it exercises the real resolver
 // without relying on the network. In particular, macOS bsdtar does not support
@@ -1089,6 +1180,9 @@ static std::vector<TestCase> all_tests = {
     {"workspace_member_filter",       test_workspace_member_filter},
     {"convention_meta_dependency",    test_convention_meta_dependency},
     {"build_cpp_options",             test_build_cpp_options},
+    {"build_cpp_transitive_modules",  test_build_cpp_transitive_modules},
+    {"std_compat_convention",         test_std_compat_convention},
+    {"std_compat_build_cpp",          test_std_compat_build_cpp},
     {"remote_archive_extract",        test_remote_archive_extract},
 };
 
