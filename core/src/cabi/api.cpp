@@ -534,6 +534,21 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
             if (!pcm.string().empty() && pcm.is_regular_file())
                 module_bmi[name] = pcm;
         }
+
+        // Pre-build dependency packages' public module interfaces.
+        // Each path dependency's public/*.cppm is compiled independently
+        // to its own BMI directory before any target builds run. The
+        // resulting PCMs seed module_bmi so consumer code can import them.
+        bake::ModuleFileMap dep_module_pcms;
+        if (b->manifest) {
+            dep_module_pcms = bake::build_dependency_modules(
+                b->toolchain, *b->manifest, b->layout.out_dir, standard_modules);
+            for (const auto& [mod_name, pcm] : dep_module_pcms) {
+                if (pcm.is_regular_file())
+                    module_bmi[mod_name] = pcm;
+            }
+        }
+
         for (const auto& target : b->targets) {
             std::vector<std::string> compile_ids;
             std::vector<std::string> object_paths;
@@ -587,37 +602,6 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                     has_cxx_sources = true;
                 } else {
                     src_set.c_files.push_back(src);
-                }
-            }
-
-            // Auto-discover public module interfaces from path dependencies.
-            // This mirrors convention mode's path-dep scanning: a package
-            // declaring dep = { path = "../other" } gets other's public/*.cppm
-            // compiled as part of its own module graph, without needing to
-            // manually list them in build.cpp sources().
-            if (b->manifest) {
-                for (const auto& [dep_name, dep] : b->manifest->dependencies) {
-                    if (!dep.is_path_dep) continue;
-                    bake::Path dep_public =
-                        b->layout.root / dep.path / "public";
-                    if (!dep_public.is_directory()) continue;
-                    for (auto& entry :
-                             std::filesystem::recursive_directory_iterator(
-                                 dep_public.fs())) {
-                        if (!entry.is_regular_file()) continue;
-                        bake::Path p(entry.path());
-                        if (p.is_module_interface()) {
-                            // Avoid duplicates if already listed in sources
-                            bool already = false;
-                            for (auto& existing : src_set.module_interfaces) {
-                                if (existing == p) { already = true; break; }
-                            }
-                            if (!already) {
-                                src_set.module_interfaces.push_back(p);
-                                has_cxx_sources = true;
-                            }
-                        }
-                    }
                 }
             }
 
@@ -1022,6 +1006,16 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
             }
             package_json["uses_cxx"] = exported->uses_cxx;
         }
+
+        // Export dependency module PCM paths so workspace consumers can
+        // resolve transitive imports (e.g. core imports tomlplusplus;
+        // bake imports core → needs tomlplusplus PCM too).
+        nlohmann::json dep_modules = nlohmann::json::array();
+        for (const auto& [mod_name, pcm_path] : dep_module_pcms) {
+            dep_modules.push_back({{"module", mod_name},
+                                   {"pcm", pcm_path.string()}});
+        }
+        package_json["dependency_modules"] = dep_modules;
 
         bake::Path package_path = b->layout.package_file;
         if (!bake::write_file(package_path, package_json.dump(2))) {

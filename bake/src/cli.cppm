@@ -822,14 +822,14 @@ export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
 // Inject statically-compiled libc++ + libc++abi objects into all C++ link
 // actions in a plan. Replaces dynamic -lc++ / libc++.1.dylib dependency.
 // For BakeSelf only: the in-process LLD has no system libc++.tbd.
-// Gates on a valid "std" entry in the standard-module map.
+// Gates on a valid "std" entry in the prebuilt-module map.
 export void inject_static_libcxx(BuildPlan& plan, const Toolchain& tc,
-                                  const ModuleFileMap& standard_modules) {
+                                  const ModuleFileMap& prebuilt_modules) {
     if (!tc.is_clang()) return;
     if (tc.kind != CompilerKind::BakeSelf) return;
 
-    auto it = standard_modules.find("std");
-    if (it == standard_modules.end() || !it->second.is_regular_file())
+    auto it = prebuilt_modules.find("std");
+    if (it == prebuilt_modules.end() || !it->second.is_regular_file())
         return;
 
     auto libcxx_objs = ensure_libcxx_objects(tc);
@@ -1034,6 +1034,8 @@ export int build_with_build_cpp(
             return 1;
         }
         auto result = run_process({build_app.string()}, root, true);
+        // build_app outputs progress (dependency compilation, etc.) to stdout.
+        std::print("{}", result.stdout_output);
         if (!result.success()) {
             std::print(std::cerr, "{}", result.stderr_output);
             std::println(std::cerr, "bake: build_app failed");
@@ -1704,6 +1706,10 @@ export int cmd_build(const ParsedArgs& args) {
             Path bmi_dir;
             Path lib_path;
             std::vector<std::string> module_names;
+            // PCM paths for modules that this member's dependencies built
+            // (e.g. tomlplusplus.pcm, nlohmann.json.pcm). These must be
+            // passed to downstream members so transitive imports resolve.
+            std::map<std::string, Path> dep_pcms;
         };
         std::vector<BuiltMember> built;
 
@@ -1800,6 +1806,26 @@ export int cmd_build(const ParsedArgs& args) {
                         }
                     }
                 }
+
+                // Collect dependency module PCMs from package.json so
+                // downstream members can resolve transitive imports.
+                Path pkg_json = layout.bake_dir / "package.json";
+                auto pkg_content = read_file(pkg_json);
+                if (pkg_content) {
+                    try {
+                        auto pkg = nlohmann::json::parse(*pkg_content);
+                        if (pkg.contains("dependency_modules")) {
+                            for (const auto& entry : pkg["dependency_modules"]) {
+                                std::string mod = entry["module"].get<std::string>();
+                                std::string pcm_str = entry["pcm"].get<std::string>();
+                                Path pcm(pcm_str);
+                                if (pcm.is_regular_file())
+                                    bm.dep_pcms[mod] = pcm;
+                            }
+                        }
+                    } catch (...) {}
+                }
+
                 built.push_back(std::move(bm));
                 continue;
             }
@@ -1810,18 +1836,34 @@ export int cmd_build(const ParsedArgs& args) {
                     *member_manifest, project_out, workspace_member_dirs);
             if (!member_package_requirements) return 1;
 
-            ModuleFileMap member_standard_modules;
+            ModuleFileMap member_prebuilt;
             if (!is_c_standard(member_manifest->package->std_version)) {
                 if (standard_modules.empty())
                     standard_modules = ensure_std_modules(tc, layout.out_dir);
-                member_standard_modules = standard_modules;
+                member_prebuilt = standard_modules;
+
+                // Pre-build dependency packages' public module interfaces.
+                auto dep_pcms = build_dependency_modules(
+                    tc, *member_manifest, project_out, standard_modules);
+                for (const auto& [name, pcm] : dep_pcms)
+                    member_prebuilt[name] = pcm;
+
+                // Pull in dependency PCMs from earlier workspace members
+                // so transitive imports resolve (e.g. bake imports core
+                // which imports tomlplusplus — bake needs tomlplusplus PCM).
+                for (const auto& bm : built) {
+                    for (const auto& [mod_name, pcm] : bm.dep_pcms) {
+                        if (pcm.is_regular_file())
+                            member_prebuilt[mod_name] = pcm;
+                    }
+                }
             }
 
             auto plan = create_convention_plan(*member_manifest, layout, tc,
                                                 member_manifest->options,
                                                 dep_sources, dep_include_dirs,
                                                 /*compile_path_deps=*/false,
-                                                member_standard_modules,
+                                                member_prebuilt,
                                                 *member_package_requirements);
 
             // Inject external modules from built dependencies.
@@ -1848,7 +1890,7 @@ export int cmd_build(const ParsedArgs& args) {
 
                 // Clang needs -stdlib=libc++ when import std is in use,
                 // unless BakeSelf (which uses static libc++ objects instead).
-                if (standard_modules.contains("std") && tc.is_clang() &&
+                if (member_prebuilt.contains("std") && tc.is_clang() &&
                     tc.kind != CompilerKind::BakeSelf) {
                     auto prefix_len = cxx_prefix(tc).size();
                     action.command.insert(action.command.begin() + prefix_len, "-stdlib=libc++");
@@ -1869,7 +1911,7 @@ export int cmd_build(const ParsedArgs& args) {
             }
 
             // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
-            inject_static_libcxx(plan, tc, standard_modules);
+            inject_static_libcxx(plan, tc, member_prebuilt);
 
             int r = execute_plan(plan, jobs);
             if (r != 0) { result = r; break; }
@@ -1888,6 +1930,15 @@ export int cmd_build(const ParsedArgs& args) {
                     }
                 }
             }
+
+            // Propagate dependency PCMs (std, std.compat, and any dep modules
+            // from earlier members) so downstream members inherit them.
+            for (const auto& [name, pcm] : member_prebuilt) {
+                if (name == "std" || name == "std.compat") continue;
+                if (pcm.is_regular_file())
+                    bm.dep_pcms[name] = pcm;
+            }
+
             built.push_back(std::move(bm));
         }
         if (result == 0) {
@@ -1930,9 +1981,15 @@ export int cmd_build(const ParsedArgs& args) {
                  package_uses_c ? tc.cc_path : tc.cxx_path);
 
     // A pure C package must not depend on libc++'s std module.
-    ModuleFileMap standard_modules;
+    ModuleFileMap prebuilt_modules;
     if (!package_uses_c) {
-        standard_modules = ensure_std_modules(tc, layout.out_dir);
+        prebuilt_modules = ensure_std_modules(tc, layout.out_dir);
+
+        // Pre-build dependency packages' public module interfaces.
+        auto dep_pcms = build_dependency_modules(
+            tc, *manifest, layout.out_dir, prebuilt_modules);
+        for (const auto& [name, pcm] : dep_pcms)
+            prebuilt_modules[name] = pcm;
     }
 
     // Extract dep sources + include dirs from lockfile
@@ -1951,11 +2008,11 @@ export int cmd_build(const ParsedArgs& args) {
     auto plan = create_convention_plan(*manifest, layout, tc, *options,
                                         dep_sources, dep_include_dirs,
                                         /*compile_path_deps=*/true,
-                                        standard_modules,
+                                        prebuilt_modules,
                                         *package_requirements);
 
     // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
-    inject_static_libcxx(plan, tc, standard_modules);
+    inject_static_libcxx(plan, tc, prebuilt_modules);
 
     // Write compile_commands.json
     write_compile_commands(plan, *root / "compile_commands.json");

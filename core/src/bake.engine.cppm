@@ -325,6 +325,98 @@ export std::vector<std::string> module_import_closure(
     return std::vector<std::string>(visited.begin(), visited.end());
 }
 
+// Scan a dependency's public/ directory for module interface files (.cppm).
+export std::vector<Path> discover_dep_module_interfaces(const Path& dep_public) {
+    std::vector<Path> result;
+    if (!dep_public.is_directory()) return result;
+    for (auto& entry : std::filesystem::recursive_directory_iterator(dep_public.fs())) {
+        if (!entry.is_regular_file()) continue;
+        Path p(entry.path());
+        if (p.is_module_interface())
+            result.push_back(p);
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+// Pre-build dependency packages' public module interfaces into PCMs.
+// Each path dependency's public/*.cppm is compiled independently to its own
+// BMI directory before the consuming package builds. The resulting PCMs are
+// returned so the consumer can seed its module_bmi map — dependency modules
+// are never absorbed into the consumer's module graph.
+export std::map<std::string, Path> build_dependency_modules(
+        const Toolchain& tc,
+        const Manifest& manifest,
+        const Path& ws_out_dir,
+        const ModuleFileMap& prebuilt_modules) {
+    std::map<std::string, Path> result;
+
+    for (const auto& [dep_name, dep] : manifest.dependencies) {
+        if (!dep.is_path_dep) continue;
+
+        Path dep_dir = manifest.project_dir / dep.path;
+        Path dep_public = dep_dir / "public";
+        auto cppm_files = discover_dep_module_interfaces(dep_public);
+        if (cppm_files.empty()) continue;
+
+        Path dep_bmi_dir = ws_out_dir / ".bmi" / dep_name;
+        dep_bmi_dir.mkdir_recursive();
+
+        SourceSet dep_sources;
+        dep_sources.module_interfaces = cppm_files;
+        ModuleGraph dep_graph = ModuleGraph::build(
+            tc, dep_sources, "c++23", {dep_public});
+
+        std::println("  Compiling {} (dependency)", dep_name);
+
+        std::map<std::string, std::vector<std::string>> dep_imports;
+        for (auto& [n, info] : dep_graph.modules)
+            dep_imports[n] = info.imports;
+
+        for (const auto& mod_name : dep_graph.sorted) {
+            auto& info = dep_graph.modules[mod_name];
+            Path src(info.source_path);
+            Path pcm = dep_bmi_dir / (mod_name + ".pcm");
+            Path obj = dep_bmi_dir / (mod_name + ".o");
+
+            CompileConfig cc;
+            cc.source = src;
+            cc.output = obj;
+            cc.std_ver = "c++23";
+            cc.include_dirs = {dep_public};
+            cc.is_module_interface = true;
+            cc.bmi_output = pcm;
+
+            for (const auto& [name, pcm_path] : prebuilt_modules)
+                if (!pcm_path.string().empty() && pcm_path.is_regular_file())
+                    cc.module_deps.push_back({name, pcm_path});
+
+            auto closure = module_import_closure(info.imports, dep_imports);
+            for (const auto& imp : closure) {
+                if (imp == mod_name) continue;
+                auto it = result.find(imp);
+                if (it != result.end())
+                    cc.module_deps.push_back({imp, it->second});
+            }
+
+            auto cmd = make_compile_command(tc, cc);
+            auto pr = run_process(cmd, Path(), true);
+            if (!pr.success()) {
+                std::print(std::cerr, "{}", pr.stderr_output);
+                std::println(std::cerr,
+                    "bake: failed to compile dependency module '{}'", mod_name);
+                return {};
+            }
+
+            std::println("    [dep] {}: {}", dep_name,
+                         std::filesystem::relative(src.fs(), dep_dir.fs()).string());
+            result[mod_name] = pcm;
+        }
+    }
+
+    return result;
+}
+
 // Create a build plan using convention rules
 export BuildPlan create_convention_plan(
         const Manifest& manifest,
@@ -334,7 +426,7 @@ export BuildPlan create_convention_plan(
         const std::vector<DepSourceEntry>& dep_sources = {},
         const std::vector<Path>& dep_include_dirs = {},
         bool compile_path_deps = true,
-        const ModuleFileMap& standard_modules = {},
+        const ModuleFileMap& prebuilt_modules = {},
         const std::vector<PackageUsageRequirements>& package_requirements = {}) {
 
     BuildPlan plan;
@@ -405,18 +497,6 @@ export BuildPlan create_convention_plan(
             Path dep_public = dep_dir / "public";
             if (dep_public.is_directory()) {
                 include_dirs.push_back(dep_public);
-
-                // Discover public module interfaces (.cppm) from the
-                // dependency's public/ directory. These are compiled as
-                // part of this package's module graph — the scanner
-                // resolves their module names and import dependencies.
-                for (auto& entry : std::filesystem::recursive_directory_iterator(dep_public.fs())) {
-                    if (!entry.is_regular_file()) continue;
-                    Path p(entry.path());
-                    if (p.is_module_interface()) {
-                        sources.module_interfaces.push_back(p);
-                    }
-                }
             }
             if (compile_path_deps) {
                 // Discover path dep's source files for compilation + linking
@@ -441,9 +521,9 @@ export BuildPlan create_convention_plan(
 
     // Helper: inject all valid standard-module PCMs into a CompileConfig.
     // Ensures import std; and import std.compat; resolve in ALL C++ sources.
-    auto ensure_std_dep = [&](CompileConfig& cc) {
+    auto ensure_prebuilt_deps = [&](CompileConfig& cc) {
         if (cc.source.is_c()) return;
-        for (const auto& [mod_name, pcm_path] : standard_modules) {
+        for (const auto& [mod_name, pcm_path] : prebuilt_modules) {
             if (pcm_path.string().empty() || !pcm_path.is_regular_file())
                 continue;
             bool already = false;
@@ -467,7 +547,7 @@ export BuildPlan create_convention_plan(
     // import std.compat; resolve. Prebuilt modules have no project
     // compile action — they must NOT be added to ModuleGraph::modules.
     std::map<std::string, Path> module_bmi;
-    for (const auto& [mod_name, pcm_path] : standard_modules) {
+    for (const auto& [mod_name, pcm_path] : prebuilt_modules) {
         if (!pcm_path.string().empty() && pcm_path.is_regular_file())
             module_bmi[mod_name] = pcm_path;
     }
@@ -509,7 +589,7 @@ export BuildPlan create_convention_plan(
                 cc.module_deps.push_back({imp, it->second});
             }
         }
-        ensure_std_dep(cc);
+        ensure_prebuilt_deps(cc);
 
         BuildAction action;
         action.type = BuildAction::Type::CompileModule;
@@ -576,7 +656,7 @@ export BuildPlan create_convention_plan(
         }
 
         // Ensure import std; resolves even without a module graph
-        ensure_std_dep(cc);
+        ensure_prebuilt_deps(cc);
 
         BuildAction action;
         action.type = BuildAction::Type::Compile;
@@ -620,7 +700,7 @@ export BuildPlan create_convention_plan(
         cc.include_dirs = include_dirs;
         cc.defines = package_defines;
         cc.use_pic = (pkg.type == PackageType::SharedLib);
-        ensure_std_dep(cc);
+        ensure_prebuilt_deps(cc);
 
         BuildAction action;
         action.type = BuildAction::Type::Compile;
@@ -698,7 +778,7 @@ export BuildPlan create_convention_plan(
 
             // Ensure libc++ at link time when import std is in use.
             // BakeSelf uses static libc++ objects instead (injected by caller).
-            if (lc.use_cxx_linker && standard_modules.contains("std") &&
+            if (lc.use_cxx_linker && prebuilt_modules.contains("std") &&
                 tc.is_clang() && tc.kind != CompilerKind::BakeSelf) {
                 // Insert after the executable prefix (1 for normal compilers,
                 // 2 for BakeSelf where prefix is [bake, c++]).
