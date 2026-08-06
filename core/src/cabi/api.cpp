@@ -535,17 +535,31 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
                 module_bmi[name] = pcm;
         }
 
-        // Pre-build dependency packages' public module interfaces.
-        // Each path dependency's public/*.cppm is compiled independently
-        // to its own BMI directory before any target builds run. The
-        // resulting PCMs seed module_bmi so consumer code can import them.
-        bake::ModuleFileMap dep_module_pcms;
+        // Plan dependency packages' public module interfaces.
+        // These are added as compile actions at the front of build.json so
+        // execute_plan() compiles them before consumer code. Their PCM
+        // paths seed module_bmi for -fmodule-file injection.
         if (b->manifest) {
-            dep_module_pcms = bake::build_dependency_modules(
+            auto dep_result = bake::plan_dependency_modules(
                 b->toolchain, *b->manifest, b->layout.out_dir, standard_modules);
-            for (const auto& [mod_name, pcm] : dep_module_pcms) {
-                if (pcm.is_regular_file())
-                    module_bmi[mod_name] = pcm;
+            for (const auto& [mod_name, pcm] : dep_result.module_pcms)
+                module_bmi[mod_name] = pcm;
+            for (const auto& action : dep_result.actions) {
+                nlohmann::json a;
+                a["type"]       = "compile_module";
+                a["id"]         = action.id;
+                a["description"] = action.description;
+                a["owner"]      = action.owner;
+                a["inputs"]     = to_json_array(
+                    {std::filesystem::relative(
+                        action.inputs[0].fs(), b->layout.root.fs()).string()});
+                std::vector<std::string> outputs;
+                for (auto& o : action.outputs)
+                    outputs.push_back(o.string());
+                a["outputs"]    = nlohmann::json(outputs);
+                a["command"]    = to_json_array(action.command);
+                a["depends_on"] = nlohmann::json::array();
+                actions.push_back(std::move(a));
             }
         }
 
@@ -1010,8 +1024,11 @@ BAKE_API int bake_builder_build(bake_builder* b) noexcept {
         // Export dependency module PCM paths so workspace consumers can
         // resolve transitive imports (e.g. core imports tomlplusplus;
         // bake imports core → needs tomlplusplus PCM too).
+        // Exclude standard modules (std, std.compat) — those are rebuilt
+        // per-project via ensure_std_modules().
         nlohmann::json dep_modules = nlohmann::json::array();
-        for (const auto& [mod_name, pcm_path] : dep_module_pcms) {
+        for (const auto& [mod_name, pcm_path] : module_bmi) {
+            if (mod_name == "std" || mod_name == "std.compat") continue;
             dep_modules.push_back({{"module", mod_name},
                                    {"pcm", pcm_path.string()}});
         }

@@ -1842,20 +1842,12 @@ export int cmd_build(const ParsedArgs& args) {
                     standard_modules = ensure_std_modules(tc, layout.out_dir);
                 member_prebuilt = standard_modules;
 
-                // Pre-build dependency packages' public module interfaces.
-                auto dep_pcms = build_dependency_modules(
-                    tc, *member_manifest, project_out, standard_modules);
-                for (const auto& [name, pcm] : dep_pcms)
-                    member_prebuilt[name] = pcm;
-
                 // Pull in dependency PCMs from earlier workspace members
                 // so transitive imports resolve (e.g. bake imports core
                 // which imports tomlplusplus — bake needs tomlplusplus PCM).
                 for (const auto& bm : built) {
-                    for (const auto& [mod_name, pcm] : bm.dep_pcms) {
-                        if (pcm.is_regular_file())
-                            member_prebuilt[mod_name] = pcm;
-                    }
+                    for (const auto& [mod_name, pcm] : bm.dep_pcms)
+                        member_prebuilt[mod_name] = pcm;
                 }
             }
 
@@ -1984,13 +1976,8 @@ export int cmd_build(const ParsedArgs& args) {
     ModuleFileMap prebuilt_modules;
     if (!package_uses_c) {
         prebuilt_modules = ensure_std_modules(tc, layout.out_dir);
-
-        // Pre-build dependency packages' public module interfaces.
-        auto dep_pcms = build_dependency_modules(
-            tc, *manifest, layout.out_dir, prebuilt_modules);
-        for (const auto& [name, pcm] : dep_pcms)
-            prebuilt_modules[name] = pcm;
     }
+    // Dependency module planning is handled inside create_convention_plan.
 
     // Extract dep sources + include dirs from lockfile
     std::vector<DepSourceEntry> dep_sources;

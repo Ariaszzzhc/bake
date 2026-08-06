@@ -233,6 +233,10 @@ export struct BuildAction {
     std::string id;
     // User-facing progress text. Cosmetic changes must not invalidate cache.
     std::string description;
+    // Package that owns this action (e.g. "nlohmann_json", "core").
+    // Empty means inherit the plan's package. execute_plan groups output
+    // by owner so dependency modules appear under their own header.
+    std::string owner;
     std::vector<Path> inputs;
     std::vector<Path> outputs;
     std::vector<std::string> command;
@@ -339,17 +343,23 @@ export std::vector<Path> discover_dep_module_interfaces(const Path& dep_public) 
     return result;
 }
 
-// Pre-build dependency packages' public module interfaces into PCMs.
-// Each path dependency's public/*.cppm is compiled independently to its own
-// BMI directory before the consuming package builds. The resulting PCMs are
-// returned so the consumer can seed its module_bmi map — dependency modules
-// are never absorbed into the consumer's module graph.
-export std::map<std::string, Path> build_dependency_modules(
+// Dependency module compilation result: actions to insert into a BuildPlan,
+// plus the module-name → PCM-path map that consumers need for -fmodule-file.
+export struct DependencyModuleResult {
+    std::vector<BuildAction> actions;
+    std::map<std::string, Path> module_pcms;
+};
+
+// Discover and create build actions for dependency packages' public module
+// interfaces. Does NOT execute anything — the returned actions are inserted
+// into the consumer's BuildPlan so execute_plan() handles ordering, caching,
+// and output uniformly.
+export DependencyModuleResult plan_dependency_modules(
         const Toolchain& tc,
         const Manifest& manifest,
         const Path& ws_out_dir,
         const ModuleFileMap& prebuilt_modules) {
-    std::map<std::string, Path> result;
+    DependencyModuleResult result;
 
     for (const auto& [dep_name, dep] : manifest.dependencies) {
         if (!dep.is_path_dep) continue;
@@ -367,11 +377,11 @@ export std::map<std::string, Path> build_dependency_modules(
         ModuleGraph dep_graph = ModuleGraph::build(
             tc, dep_sources, "c++23", {dep_public});
 
-        std::println("  Compiling {} (dependency)", dep_name);
-
         std::map<std::string, std::vector<std::string>> dep_imports;
         for (auto& [n, info] : dep_graph.modules)
             dep_imports[n] = info.imports;
+
+        std::map<std::string, Path> dep_bmi;
 
         for (const auto& mod_name : dep_graph.sorted) {
             auto& info = dep_graph.modules[mod_name];
@@ -394,23 +404,25 @@ export std::map<std::string, Path> build_dependency_modules(
             auto closure = module_import_closure(info.imports, dep_imports);
             for (const auto& imp : closure) {
                 if (imp == mod_name) continue;
-                auto it = result.find(imp);
-                if (it != result.end())
+                auto it = dep_bmi.find(imp);
+                if (it != dep_bmi.end())
                     cc.module_deps.push_back({imp, it->second});
             }
 
-            auto cmd = make_compile_command(tc, cc);
-            auto pr = run_process(cmd, Path(), true);
-            if (!pr.success()) {
-                std::print(std::cerr, "{}", pr.stderr_output);
-                std::println(std::cerr,
-                    "bake: failed to compile dependency module '{}'", mod_name);
-                return {};
-            }
+            BuildAction action;
+            action.type = BuildAction::Type::CompileModule;
+            action.id = "dep-module:" + dep_name + ":" + mod_name;
+            action.description = "module " + mod_name;
+            action.owner = dep_name;
+            action.inputs = {src};
+            for (auto& [name, bmi] : cc.module_deps)
+                action.inputs.push_back(bmi);
+            action.outputs = {obj, pcm};
+            action.command = make_compile_command(tc, cc);
 
-            std::println("    [dep] {}: {}", dep_name,
-                         std::filesystem::relative(src.fs(), dep_dir.fs()).string());
-            result[mod_name] = pcm;
+            result.actions.push_back(std::move(action));
+            dep_bmi[mod_name] = pcm;
+            result.module_pcms[mod_name] = pcm;
         }
     }
 
@@ -524,7 +536,7 @@ export BuildPlan create_convention_plan(
     auto ensure_prebuilt_deps = [&](CompileConfig& cc) {
         if (cc.source.is_c()) return;
         for (const auto& [mod_name, pcm_path] : prebuilt_modules) {
-            if (pcm_path.string().empty() || !pcm_path.is_regular_file())
+            if (pcm_path.string().empty())
                 continue;
             bool already = false;
             for (const auto& [existing, _] : cc.module_deps) {
@@ -548,9 +560,21 @@ export BuildPlan create_convention_plan(
     // compile action — they must NOT be added to ModuleGraph::modules.
     std::map<std::string, Path> module_bmi;
     for (const auto& [mod_name, pcm_path] : prebuilt_modules) {
-        if (!pcm_path.string().empty() && pcm_path.is_regular_file())
+        if (!pcm_path.string().empty())
             module_bmi[mod_name] = pcm_path;
     }
+
+    // Plan dependency packages' public module interfaces. These actions
+    // are inserted at the front of the plan so execute_plan() compiles
+    // them before any consumer code. Their PCM paths seed module_bmi so
+    // the consumer's module graph can resolve `import tomlplusplus;` etc.
+    auto dep_result = plan_dependency_modules(
+        tc, manifest, layout.out_dir, prebuilt_modules);
+    for (const auto& [mod_name, pcm] : dep_result.module_pcms)
+        module_bmi[mod_name] = pcm;
+    // Insert dependency actions before any project actions.
+    for (auto& action : dep_result.actions)
+        plan.actions.push_back(std::move(action));
 
     // Import adjacency for transitive-closure computation. Clang's
     // -fmodule-file does not resolve transitive module dependencies, so
@@ -928,12 +952,42 @@ export int execute_plan(BuildPlan& plan, int jobs) {
     // Track completion
     std::vector<int> status(plan.actions.size(), 0);  // 0=pending, 1=done, -1=failed
     std::mutex output_mutex;
-    int actions_started = 0;
+
+    // Group actions by owner for progress display. Each owner group gets
+    // its own "Compiling <owner>" header and independent [N/total] counter.
+    // Actions with empty owner inherit the plan's package name.
+    auto resolve_owner = [&](const BuildAction& action) -> const std::string& {
+        return action.owner.empty() ? plan.package_name : action.owner;
+    };
+
+    // Pre-compute per-owner pending counts for the subset that needs rebuild.
+    std::map<std::string, int> owner_pending;
+    std::map<std::string, int> owner_started;
+    for (std::size_t i = 0; i < plan.actions.size(); ++i) {
+        if (rebuild[i]) {
+            owner_pending[resolve_owner(plan.actions[i])]++;
+        }
+    }
+
+    std::string current_owner;  // currently printed header
+    auto print_owner_header = [&](const std::string& owner) {
+        if (owner == current_owner) return;
+        current_owner = owner;
+        // Skip header for the plan's own package — the caller already
+        // printed "Compiling <package>" before calling execute_plan.
+        if (owner == plan.package_name) return;
+        auto it = owner_pending.find(owner);
+        if (it == owner_pending.end() || it->second == 0) return;
+        std::println("  Compiling {} (dependency)", owner);
+    };
+
     auto announce = [&](const BuildAction& action) {
         std::lock_guard<std::mutex> lock(output_mutex);
-        ++actions_started;
-        std::println("    [{}/{}] {}", actions_started, pending_total,
-                     action.description);
+        const std::string& owner = resolve_owner(action);
+        print_owner_header(owner);
+        int started = ++owner_started[owner];
+        int total = owner_pending[owner];
+        std::println("    [{}/{}] {}", started, total, action.description);
     };
 
     // Execute module interfaces and compiles
@@ -1110,6 +1164,7 @@ export BuildPlan read_build_json(const Path& json_path, const Path& project_root
         BuildAction action;
         action.id = jaction.value("id", "");
         action.description = jaction.value("description", action.id);
+        action.owner = jaction.value("owner", "");
 
         std::string type_str = jaction.value("type", "compile");
         if (type_str == "compile") action.type = BuildAction::Type::Compile;
