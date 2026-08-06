@@ -42,12 +42,9 @@ fi
 HEADER_COUNT=$(find "$DEST/include" -name '*.h' | wc -l | tr -d ' ')
 echo "    Copied $HEADER_COUNT headers"
 
-# 2. Copy libSystem.tbd and libc++ stubs
-echo "==> Copying library stubs..."
+# 2. Copy libSystem.tbd (only — libc++/libc++abi are compiled from source)
+echo "==> Copying libSystem.tbd..."
 cp "$SDK/usr/lib/libSystem.tbd" "$DEST/libSystem.tbd"
-for tbd in libc++.tbd libc++.1.tbd libc++abi.tbd; do
-  [[ -f "$SDK/usr/lib/$tbd" ]] && cp "$SDK/usr/lib/$tbd" "$DEST/$tbd"
-done
 
 # 3. Create SDKSettings.json with the SDK version
 SDK_VERSION=$(plutil -extract DefaultProperties.MACOSX_DEPLOYMENT_TARGET raw \
