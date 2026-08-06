@@ -261,7 +261,6 @@ static std::string &getMacosSdkPath() {
   initialized = true;
 
 #ifdef __APPLE__
-  // Try xcrun first (works with both Xcode and CommandLineTools).
   FILE *pipe = ::popen("xcrun --show-sdk-path 2>/dev/null", "r");
   if (pipe) {
     char buf[4096];
@@ -272,19 +271,6 @@ static std::string &getMacosSdkPath() {
       if (len > 0) sdk_path = buf;
     }
     pclose(pipe);
-  }
-  // Fallback: check known paths.
-  if (sdk_path.empty()) {
-    const char *candidates[] = {
-      "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-      nullptr
-    };
-    for (auto *p = candidates; *p; ++p) {
-      if (llvm::sys::fs::exists(*p)) {
-        sdk_path = *p;
-        break;
-      }
-    }
   }
 #endif
   return sdk_path;

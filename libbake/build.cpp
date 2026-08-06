@@ -46,8 +46,8 @@ int main() {
     auto lld_libs   = glob_static_libs(llvm_lib, "liblld");
     auto llvm_libs  = glob_static_libs(llvm_lib, "libLLVM");
 
-    // ── libbake (shared library) ──────────────────────────────────
-    auto& libbake = b.shared_lib("libbake");
+    // Target name "bake" → library_name produces "libbake.dylib" (not "liblibbake")
+    auto& libbake = b.shared_lib("bake");
     libbake.std("c++23")
         .sources({
             "src/bake.util.cppm",

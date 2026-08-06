@@ -1955,14 +1955,12 @@ export int cmd_build(const ParsedArgs& args) {
 
                 for (auto& bm : built) {
                     if (bm.lib_path.string().empty()) continue;
+                    // Link by full path — avoids name mismatch between
+                    // package name and library file name.
+                    action.command.insert(action.command.end() - 2,
+                        bm.lib_path.string());
+#ifndef _WIN32
                     Path lib_dir = bm.lib_path.parent();
-#ifdef _WIN32
-                    // Windows: link the .lib directly
-                    action.command.insert(action.command.end() - 2,
-                        (lib_dir / (bm.name + ".lib")).string());
-#else
-                    action.command.insert(action.command.end() - 2,
-                        {"-L" + lib_dir.string(), "-l" + bm.name});
                     action.command.insert(action.command.end() - 2,
                         "-Wl,-rpath," + lib_dir.string());
 #endif
