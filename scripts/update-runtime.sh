@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# vendor-runtime.sh — Vendor libc++, libc++abi, libunwind, compiler-rt into lib/
+# update-runtime.sh — Update libc++, libc++abi, libunwind, compiler-rt in lib/
 #
 # Run after updating the external/llvm-project submodule (and building LLVM via
-# build-llvm.sh). This script refreshes the vendored runtime source in lib/ so
+# build-llvm.sh). This script refreshes the runtime source in lib/ so
 # the final bake distribution is self-contained — matching Zig's model.
 #
 # Usage:
-#   ./scripts/vendor-runtime.sh          # vendor everything
-#   ./scripts/vendor-runtime.sh --clean  # remove vendored dirs first
+#   ./scripts/update-runtime.sh          # update everything
+#   ./scripts/update-runtime.sh --clean  # remove runtime dirs first
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -28,7 +28,7 @@ fi
 
 # ── Clean ────────────────────────────────────────────────────────────
 if [[ "${1:-}" == "--clean" ]]; then
-  echo "==> Removing vendored runtime source"
+  echo "==> Removing runtime source"
   rm -rf "$ROOT/lib/libcxx" "$ROOT/lib/libcxxabi" \
          "$ROOT/lib/libunwind" "$ROOT/lib/compiler-rt"
 fi
@@ -36,7 +36,7 @@ fi
 # ═══════════════════════════════════════════════════════════════════════
 # libcxx
 # ═══════════════════════════════════════════════════════════════════════
-echo "==> Vendoring libcxx"
+echo "==> Updating libcxx"
 
 # include/ — C++ standard headers from source + generated files from install
 mkdir -p "$ROOT/lib/libcxx"
@@ -154,7 +154,7 @@ cp -R "$LLVM_SRC/libc/src/__support/CPP/type_traits" \
 # ═══════════════════════════════════════════════════════════════════════
 # libcxxabi
 # ═══════════════════════════════════════════════════════════════════════
-echo "==> Vendoring libcxxabi"
+echo "==> Updating libcxxabi"
 rm -rf "$ROOT/lib/libcxxabi"
 mkdir -p "$ROOT/lib/libcxxabi"
 cp -R "$LLVM_SRC/libcxxabi/src" "$ROOT/lib/libcxxabi/src"
@@ -164,7 +164,7 @@ rm -f "$ROOT/lib/libcxxabi/include/CMakeLists.txt"
 # ═══════════════════════════════════════════════════════════════════════
 # libunwind
 # ═══════════════════════════════════════════════════════════════════════
-echo "==> Vendoring libunwind"
+echo "==> Updating libunwind"
 rm -rf "$ROOT/lib/libunwind"
 mkdir -p "$ROOT/lib/libunwind"
 cp -R "$LLVM_SRC/libunwind/src" "$ROOT/lib/libunwind/src"
@@ -173,7 +173,7 @@ cp -R "$LLVM_SRC/libunwind/include" "$ROOT/lib/libunwind/include"
 # ═══════════════════════════════════════════════════════════════════════
 # compiler-rt (builtins — aarch64 only for now)
 # ═══════════════════════════════════════════════════════════════════════
-echo "==> Vendoring compiler-rt builtins"
+echo "==> Updating compiler-rt builtins"
 rm -rf "$ROOT/lib/compiler-rt"
 mkdir -p "$ROOT/lib/compiler-rt/lib"
 cp -R "$LLVM_SRC/compiler-rt/lib/builtins" "$ROOT/lib/compiler-rt/lib/builtins"
@@ -186,7 +186,7 @@ done
 # Summary
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
-echo "==> Done. Vendored runtime source:"
+echo "==> Done. Updated runtime source:"
 for d in libc/libc/darwin libcxx libcxxabi libunwind compiler-rt; do
   if [ -d "$ROOT/lib/$d" ]; then
     printf "    %-30s %s\n" "$d" "$(du -sh "$ROOT/lib/$d" | cut -f1)"
