@@ -726,6 +726,176 @@ static Path generate_std_cppm(const Path& cache_dir) {
 #endif
 }
 
+// Curated libc++ source file list (from Zig's libcxx.zig).
+static const char* libcxx_base_files[] = {
+    "algorithm.cpp", "any.cpp", "bind.cpp", "call_once.cpp", "charconv.cpp",
+    "chrono.cpp", "error_category.cpp", "exception.cpp", "expected.cpp",
+    "filesystem/directory_entry.cpp", "filesystem/directory_iterator.cpp",
+    "filesystem/filesystem_clock.cpp", "filesystem/filesystem_error.cpp",
+    "filesystem/int128_builtins.cpp", "filesystem/operations.cpp",
+    "filesystem/path.cpp", "fstream.cpp", "functional.cpp", "hash.cpp",
+    "ios.cpp", "ios.instantiations.cpp", "iostream.cpp", "locale.cpp",
+    "memory.cpp", "memory_resource.cpp", "new.cpp", "new_handler.cpp",
+    "new_helpers.cpp", "optional.cpp", "ostream.cpp", "print.cpp",
+    "random.cpp", "random_shuffle.cpp", "regex.cpp",
+    "ryu/d2fixed.cpp", "ryu/d2s.cpp", "ryu/f2s.cpp",
+    "stdexcept.cpp", "string.cpp", "strstream.cpp", "system_error.cpp",
+    "typeinfo.cpp", "valarray.cpp", "variant.cpp", "vector.cpp",
+    "verbose_abort.cpp", "mutex_destructor.cpp", "condition_variable_destructor.cpp",
+};
+// Thread-related files — only needed when multi-threaded (always on macOS).
+static const char* libcxx_thread_files[] = {
+    "atomic.cpp", "barrier.cpp", "condition_variable.cpp", "future.cpp",
+    "mutex.cpp", "shared_mutex.cpp", "thread.cpp",
+};
+
+// Curated libc++abi source file list.
+static const char* libcxxabi_files[] = {
+    "abort_message.cpp", "cxa_aux_runtime.cpp", "cxa_default_handlers.cpp",
+    "cxa_demangle.cpp", "cxa_exception.cpp", "cxa_exception_storage.cpp",
+    "cxa_guard.cpp", "cxa_handlers.cpp", "cxa_noexception.cpp",
+    "cxa_personality.cpp", "cxa_thread_atexit.cpp", "cxa_vector.cpp",
+    "cxa_virtual.cpp", "fallback_malloc.cpp", "private_typeinfo.cpp",
+    "stdlib_exception.cpp", "stdlib_new_delete.cpp", "stdlib_stdexcept.cpp",
+    "stdlib_typeinfo.cpp",
+};
+
+// Compile libc++ + libc++abi sources from the vendored LLVM tree into .o files.
+// Results are cached globally. Returns the list of object file paths.
+// This replaces dynamic linking against libc++.1.dylib with static linkage.
+// Approach mirrors Zig's libcxx.zig: curated file lists, specific defines,
+// libcxx/src as include path for internal headers.
+export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
+    if (!tc.is_clang()) return {};
+
+#ifdef BAKE_SRC_DIR
+    std::string src(BAKE_SRC_DIR);
+#else
+    return {};
+#endif
+
+    // Global cache: ~/.cache/bake/libcxx-objects/
+    Path cache_root = get_cache_dir().parent() / "libcxx-objects";
+    std::string key = "v1-arm64-apple";
+    Path cache_dir = cache_root / key;
+
+    // Check if already built (sentinel file)
+    Path sentinel = cache_dir / ".done";
+    if (sentinel.is_regular_file()) {
+        std::vector<Path> objs;
+        namespace fs = std::filesystem;
+        if (fs::exists(cache_dir.fs())) {
+            for (auto& entry : fs::directory_iterator(cache_dir.fs()))
+                if (entry.path().extension() == ".o")
+                    objs.push_back(Path(entry.path()));
+        }
+        std::sort(objs.begin(), objs.end());
+        if (!objs.empty()) return objs;
+    }
+
+    cache_dir.mkdir_recursive();
+    std::println("   Compiling libc++ + libc++abi from source (cached)");
+
+    std::string libcxxabi_inc = src + "/external/llvm-project/libcxxabi/include";
+    std::string libcxx_src    = src + "/external/llvm-project/libcxx/src";
+    std::string libcxxabi_src = src + "/external/llvm-project/libcxxabi/src";
+    std::string libc_inc      = src + "/external/llvm-project/libc";
+
+    // Common compile flags. bake's driver already injects vendored header
+    // paths (libcxx_inc, builtins, darwin). We add:
+    //   -I libcxxabi/include  (for __cxxabi_config.h etc.)
+    //   -I libcxx/src         (for internal headers: include/atomic_support.h)
+    //   -I libc               (for shared/fp_bits.h used by charconv)
+    auto make_flags = [&](bool for_abi) {
+        std::vector<std::string> flags;
+        for (auto& a : cxx_prefix(tc)) flags.push_back(a);
+        flags.push_back("-c");
+        flags.push_back("-std=c++23");
+        flags.push_back("-DNDEBUG");
+        flags.push_back("-I" + libcxxabi_inc);
+        flags.push_back("-I" + libcxx_src);
+        flags.push_back("-I" + libc_inc);
+        flags.push_back("-fPIC");
+        flags.push_back("-Os");
+        flags.push_back("-D_LIBCPP_BUILDING_LIBRARY");
+        flags.push_back("-DLIBCXX_BUILDING_LIBCXXABI");
+        flags.push_back("-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS");
+        flags.push_back("-fvisibility=hidden");
+        flags.push_back("-fvisibility-inlines-hidden");
+        flags.push_back("-faligned-allocation");
+        if (for_abi)
+            flags.push_back("-D_LIBCXXABI_BUILDING_LIBRARY");
+        return flags;
+    };
+
+    auto compile_file = [&](const std::string& dir, const std::string& filename,
+                            const std::string& prefix,
+                            const std::vector<std::string>& flags) -> bool {
+        std::string stem = filename.substr(0, filename.rfind('.'));
+        // Flatten path separators in stem (e.g. "filesystem/dir" → "filesystem__dir")
+        for (auto& c : stem) if (c == '/') c = '_';
+        Path obj = cache_dir / (prefix + "__" + stem + ".o");
+        if (obj.is_regular_file()) return true;
+
+        std::vector<std::string> cmd = flags;
+        cmd.push_back(dir + "/" + filename);
+        cmd.push_back("-o");
+        cmd.push_back(obj.string());
+
+        auto result = run_process(cmd, Path(), true);
+        if (!result.success()) {
+            std::print(std::cerr, "{}", result.stderr_output);
+            std::println(std::cerr, "bake: failed to compile {}: {}", prefix, stem);
+            return false;
+        }
+        return true;
+    };
+
+    auto base_flags = make_flags(false);
+    auto abi_flags  = make_flags(true);
+    int total = 0;
+
+    // libc++ base files
+    for (auto* f : libcxx_base_files) {
+        if (!compile_file(libcxx_src, f, "libcxx", base_flags)) return {};
+        ++total;
+    }
+    // libc++ thread files (skip duplicates already in base)
+    std::set<std::string> base_set(std::begin(libcxx_base_files),
+                                   std::end(libcxx_base_files));
+    for (auto* f : libcxx_thread_files) {
+        if (base_set.count(f)) continue;
+        if (!compile_file(libcxx_src, f, "libcxx", base_flags)) return {};
+        ++total;
+    }
+    // libc++abi — compiled on all platforms. On non-WASI, skip cxa_noexception
+    // (conflicts with cxa_exception.cpp — both define __getExceptionClass etc.)
+    for (auto* f : libcxxabi_files) {
+        std::string fname = std::string("src/") + f;
+        if (fname == "src/cxa_noexception.cpp") continue;  // only for WASI
+        if (!compile_file(libcxxabi_src, f, "libcxxabi", abi_flags)) return {};
+        ++total;
+    }
+
+    std::println("   Compiled {} sources", total);
+    write_file(sentinel, "");
+
+    // Collect .o files (libc++abi first, matching Zig's link order)
+    std::vector<Path> objs;
+    namespace fs = std::filesystem;
+    for (auto& entry : fs::directory_iterator(cache_dir.fs())) {
+        auto name = entry.path().filename().string();
+        if (name.starts_with("libcxxabi__") && entry.path().extension() == ".o")
+            objs.push_back(Path(entry.path()));
+    }
+    for (auto& entry : fs::directory_iterator(cache_dir.fs())) {
+        auto name = entry.path().filename().string();
+        if (name.starts_with("libcxx__") && entry.path().extension() == ".o")
+            objs.push_back(Path(entry.path()));
+    }
+    return objs;
+}
+
 // Ensure the libc++ std module PCM is built in this project's output tree.
 // Returns the path to std.pcm, or an empty Path on failure.
 // For Clang only — GCC handles import std via its gcm cache.
@@ -968,22 +1138,33 @@ export int build_with_build_cpp(
         }
     }
 
-    // Inject -stdlib=libc++ into C++ link actions too.
+    // Inject static libc++ objects into C++ link actions (replaces -stdlib=libc++).
+    // This eliminates the dynamic dependency on libc++.1.dylib — libc++ and
+    // libc++abi are compiled from vendored source and linked as .o files.
     if (tc.is_clang() && std_pcm.is_regular_file()) {
-        for (auto& action : plan.actions) {
-            if (action.type != BuildAction::Type::Link) continue;
-            // Only for C++ targets — detect by checking if any .cpp/.cppm input
-            bool is_cxx = false;
-            for (auto& input : action.inputs) {
-                if (Path(input).is_cpp() || Path(input).has_extension(".cppm")) {
-                    is_cxx = true;
-                    break;
+        auto libcxx_objs = ensure_libcxx_objects(tc);
+        if (!libcxx_objs.empty()) {
+            for (auto& action : plan.actions) {
+                if (action.type != BuildAction::Type::Link) continue;
+                // Detect C++ link by checking if the compiler is invoked as "c++"
+                bool is_cxx = false;
+                for (auto& arg : action.command) {
+                    if (arg == "c++") { is_cxx = true; break; }
                 }
-            }
-            if (is_cxx) {
-                auto prefix_len = cxx_prefix(tc).size();
-                action.command.insert(action.command.begin() + prefix_len,
-                                      "-stdlib=libc++");
+                if (is_cxx) {
+                    // Replace default libs with explicit list:
+                    // - libc++ comes from our static .o files
+                    // - libc++abi from vendored TBD (macOS system provides it)
+                    // - libSystem for kernel interface
+                    // -nodefaultlibs prevents linking system libc++/libc++abi.
+                    //   libc++   → our static .o files
+                    //   libc++abi → our static .o files
+                    //   libSystem → vendored TBD (kernel + C library, no libc++abi)
+                    action.command.push_back("-nodefaultlibs");
+                    for (auto& obj : libcxx_objs)
+                        action.command.push_back(obj.string());
+                    action.command.push_back("-lsystem");
+                }
             }
         }
     }

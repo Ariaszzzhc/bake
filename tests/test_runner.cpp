@@ -856,7 +856,7 @@ TestResult test_build_cpp_options() {
               initial.stdout);
     CHECK(fs::is_directory(dir / "out" / ".bmi" / ".std"),
           "std module was not built in the project-local out/.bmi tree");
-    CHECK(!fs::exists(test_home / ".cache" / "bake") &&
+    CHECK(!fs::exists(test_home / ".cache" / "bake" / "src") &&
               !fs::exists(test_home / "bake"),
           "build artifacts leaked into the global Bake source cache");
 
