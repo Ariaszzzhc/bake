@@ -59,7 +59,7 @@ endif()
 
 add_library(tomlplusplus INTERFACE)
 target_include_directories(tomlplusplus INTERFACE
-    ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus)
+    ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus/public)
 
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE
@@ -79,6 +79,8 @@ target_sources(libbake
         FILE_SET CXX_MODULES
         FILES
             libbake/src/bake.util.cppm
+            libbake/src/nlohmann.json.cppm
+            libbake/src/tomlplusplus.cppm
             libbake/src/bake.project.cppm
             libbake/src/bake.compiler.cppm
             libbake/src/bake.engine.cppm
@@ -87,6 +89,15 @@ target_sources(libbake
 )
 
 set_target_properties(libbake PROPERTIES OUTPUT_NAME "bake")
+
+# Use @rpath in install_name so the binary works from any location
+# (build tree, install tree, or packaged distribution).
+if(APPLE)
+    set_target_properties(libbake PROPERTIES
+        BUILD_INSTALL_NAME_DIR "@rpath"
+        INSTALL_NAME_DIR "@rpath"
+    )
+endif()
 
 # Static linking against all LLVM/Clang/LLD libraries.
 file(GLOB BAKE_LLVM_STATIC_LIBS  "${LLVM_PREFIX}/lib/libLLVM*.a")
