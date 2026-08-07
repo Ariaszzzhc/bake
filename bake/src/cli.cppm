@@ -3,15 +3,17 @@ module;
 #include <cerrno>
 #include <cstdlib>
 
-#ifdef __APPLE__
-#include <mach-o/dyld.h>
-#elif defined(_WIN32)
+#ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
-#elif defined(__linux__)
+#else
 #include <unistd.h>
+#endif
+
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
 #endif
 
 export module bake.cli;
@@ -19,15 +21,13 @@ export module bake.cli;
 import std;
 import bake.util;
 import bake.project;
+import bake.moid;
+import bake.graph;
 import bake.compiler;
 import bake.engine;
 import bake.package;
 import nlohmann.json;
 import tomlplusplus;
-
-// ============================================================
-// bake.cli — multicall dispatch, argument parsing, commands
-// ============================================================
 
 #ifndef BAKE_VERSION
 #define BAKE_VERSION "0.1.0"
@@ -43,48 +43,30 @@ namespace bake::cli {
 
 namespace {
 
-struct BuildScriptRuntime {
-    Path wrapper;
-    Path cabi_header;
-    Path library_dir;
-};
-
-BuildScriptRuntime find_build_script_runtime() {
-    // Fallback: source-tree layout (dev builds). find_workspace_root()
-    // walks up from the executable to find lib/.
+// Find bake.build.cppm source — distributed alongside the bake binary.
+Path find_bake_build_source() {
+    // 1. Source-tree layout (dev builds): <ws>/lib/bake/bake.build.cppm
     Path ws = find_workspace_root();
-    BuildScriptRuntime runtime{
-        ws / "core" / "public" / "bake.build.cppm",
-        ws / "core" / "src" / "cabi" / "bake_cabi.h",
-        Path(get_self_exe_path()).parent()  // libbake lives next to bake
-    };
-
-    // Check installed layout: <prefix>/share/bake/ + <prefix>/lib/
-    Path executable(get_self_exe_path());
-    if (executable.string().empty()) return runtime;
-
-    Path prefix = executable.parent().parent();
-    Path share = prefix / "share" / "bake";
-    Path installed_wrapper = share / "bake.build.cppm";
-    Path installed_header = share / "bake_cabi.h";
-    Path installed_lib_dir = prefix / "lib";
-
-    bool has_library =
-        (installed_lib_dir / "libbake.dylib").is_regular_file() ||
-        (installed_lib_dir / "libbake.so").is_regular_file() ||
-        (installed_lib_dir / "bake.lib").is_regular_file();
-    if (installed_wrapper.is_regular_file() &&
-        installed_header.is_regular_file() && has_library) {
-        runtime.wrapper = installed_wrapper;
-        runtime.cabi_header = installed_header;
-        runtime.library_dir = installed_lib_dir;
+    if (!ws.string().empty()) {
+        Path p = ws / "lib" / "bake" / "bake.build.cppm";
+        if (p.is_regular_file()) return p;
     }
-    return runtime;
+    // 2. Installed layout: <prefix>/lib/bake/bake.build.cppm
+    Path exe(get_self_exe_path());
+    if (!exe.string().empty()) {
+        Path prefix = exe.parent().parent();
+        Path installed = prefix / "lib" / "bake" / "bake.build.cppm";
+        if (installed.is_regular_file()) return installed;
+        // 3. <prefix>/share/bake/bake.build.cppm (legacy)
+        Path shared = prefix / "share" / "bake" / "bake.build.cppm";
+        if (shared.is_regular_file()) return shared;
+    }
+    return {};
 }
 
-class ScopedEnvironmentVariable {
+class ScopedEnv {
 public:
-    ScopedEnvironmentVariable(std::string name, const std::string& value)
+    ScopedEnv(std::string name, const std::string& value)
         : name_(std::move(name)) {
         if (const char* previous = std::getenv(name_.c_str()))
             previous_ = previous;
@@ -94,50 +76,83 @@ public:
         active_ = ::setenv(name_.c_str(), value.c_str(), 1) == 0;
 #endif
     }
-
-    ScopedEnvironmentVariable(const ScopedEnvironmentVariable&) = delete;
-    ScopedEnvironmentVariable& operator=(const ScopedEnvironmentVariable&) = delete;
-
-    ~ScopedEnvironmentVariable() {
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+    ~ScopedEnv() {
         if (!active_) return;
 #ifdef _WIN32
         (void)_putenv_s(name_.c_str(), previous_ ? previous_->c_str() : "");
 #else
-        if (previous_)
-            (void)::setenv(name_.c_str(), previous_->c_str(), 1);
-        else
-            (void)::unsetenv(name_.c_str());
+        if (previous_) (void)::setenv(name_.c_str(), previous_->c_str(), 1);
+        else (void)::unsetenv(name_.c_str());
 #endif
     }
-
-    bool active() const { return active_; }
-
 private:
     std::string name_;
     std::optional<std::string> previous_;
     bool active_ = false;
 };
 
-class ScopedBuildContext {
-public:
-    explicit ScopedBuildContext(const Layout& layout)
-        : source_root_("BAKE_INTERNAL_SOURCE_ROOT",
-                       layout.root.absolute().string()),
-          project_out_("BAKE_INTERNAL_PROJECT_OUT",
-                       layout.out_dir.absolute().string()),
-          package_name_("BAKE_INTERNAL_PACKAGE_NAME",
-                        layout.dependency_layout ? layout.package_name : "") {}
-
-    bool active() const {
-        return source_root_.active() && project_out_.active() &&
-               package_name_.active();
+// Serialise build options as repeated name-length:value-length:name-value
+// records. Length prefixes preserve newlines and separators in string values.
+std::string serialize_options(const std::map<std::string, BuildOption>& opts) {
+    std::string out;
+    for (const auto& [name, opt] : opts) {
+        std::string value;
+        switch (opt.type) {
+            case BuildOption::Type::Bool:
+                value = opt.bool_value ? "true" : "false";
+                break;
+            case BuildOption::Type::Int:
+                value = std::to_string(opt.int_value);
+                break;
+            case BuildOption::Type::String:
+                value = opt.str_value;
+                break;
+        }
+        out += std::to_string(name.size()) + ":" +
+               std::to_string(value.size()) + ":" + name + value;
     }
+    return out;
+}
 
-private:
-    ScopedEnvironmentVariable source_root_;
-    ScopedEnvironmentVariable project_out_;
-    ScopedEnvironmentVariable package_name_;
-};
+nlohmann::json declaration_options_json(
+        const std::map<std::string, BuildOption>& options) {
+    nlohmann::json document = nlohmann::json::object();
+    for (const auto& [name, option] : options) {
+        switch (option.type) {
+            case BuildOption::Type::Bool:
+                document[name] = option.bool_value;
+                break;
+            case BuildOption::Type::Int:
+                document[name] = option.int_value;
+                break;
+            case BuildOption::Type::String:
+                document[name] = option.str_value;
+                break;
+        }
+    }
+    return document;
+}
+
+std::string serialize_declaration_dependencies(
+        const std::vector<MoidEdge>& edges) {
+    nlohmann::json dependencies = nlohmann::json::array();
+    for (const auto& edge : edges) {
+        dependencies.push_back({
+            {"alias", edge.alias},
+            {"id", edge.target.value},
+            {"options", declaration_options_json(edge.options)},
+        });
+    }
+    return dependencies.dump();
+}
+
+Path moid_declaration_path(const Path& out_dir, std::string_view id) {
+    const std::string identity_key =
+        SHA256::hex(id).substr(0, 24);
+    return out_dir / ".bake" / (identity_key + ".moid.json");
+}
 
 } // namespace
 
@@ -269,178 +284,96 @@ std::optional<bool> parse_bool_option(std::string_view value) {
     return std::nullopt;
 }
 
-std::string_view build_option_type_name(BuildOption::Type type) {
-    switch (type) {
-        case BuildOption::Type::Bool: return "boolean";
-        case BuildOption::Type::Int: return "integer";
-        case BuildOption::Type::String: return "string";
-    }
-    return "unknown";
-}
-
-std::string build_option_value(const BuildOption& option) {
-    switch (option.type) {
-        case BuildOption::Type::Bool:
-            return option.bool_value ? "true" : "false";
-        case BuildOption::Type::Int:
-            return std::to_string(option.int_value);
-        case BuildOption::Type::String:
-            return nlohmann::json(option.str_value).dump();
-    }
-    return "<unknown>";
-}
-
-bool validate_dependency_options(
-        const Manifest& manifest,
-        const std::map<std::string, BuildOption>& dependency_options) {
-    const std::string package_name =
-        manifest.package && !manifest.package->name.empty()
-            ? manifest.package->name
-            : manifest.project_dir.string();
-
-    for (const auto& [name, configured] : dependency_options) {
-        auto declared = manifest.options.find(name);
-        if (declared == manifest.options.end()) {
-            std::println(
-                std::cerr,
-                "bake: dependency option '{}' is not declared by package '{}'",
-                name, package_name);
-            return false;
+std::optional<BuildOption> parse_root_option_value(
+        const OptionOverride& override, const BuildOption& declared) {
+    if (declared.type == BuildOption::Type::Bool) {
+        if (!override.value) return BuildOption::from_bool(true);
+        auto value = parse_bool_option(*override.value);
+        if (!value) {
+            std::println(std::cerr,
+                         "bake: option '{}' expects a boolean, got '{}'",
+                         override.name, *override.value);
+            return std::nullopt;
         }
-        if (declared->second.type != configured.type) {
-            std::println(
-                std::cerr,
-                "bake: dependency option '{}' for package '{}' expects {}, got {}",
-                name, package_name,
-                build_option_type_name(declared->second.type),
-                build_option_type_name(configured.type));
-            return false;
-        }
+        return BuildOption::from_bool(*value);
     }
-    return true;
-}
 
-std::optional<std::map<std::string, BuildOption>> effective_build_options(
-        const Manifest& manifest,
-        const std::map<std::string, BuildOption>& dependency_options,
-        const ParsedArgs* cli_args) {
-    auto options = manifest.options;
+    if (declared.type == BuildOption::Type::Int) {
+        if (!override.value || override.value->empty()) {
+            std::println(std::cerr,
+                         "bake: option '{}' expects an integer value",
+                         override.name);
+            return std::nullopt;
+        }
+        std::int64_t value = 0;
+        const char* first = override.value->data();
+        const char* last = first + override.value->size();
+        auto [end, error] = std::from_chars(first, last, value);
+        if (error != std::errc{} || end != last) {
+            std::println(std::cerr,
+                         "bake: option '{}' expects an integer, got '{}'",
+                         override.name, *override.value);
+            return std::nullopt;
+        }
+        return BuildOption::from_int(value);
+    }
 
-    // A parent configures this package only through the options nested in its
-    // dependency declaration. Validate those values against this package's
-    // own [options] schema before evaluating its recipe.
-    if (!validate_dependency_options(manifest, dependency_options))
+    if (!override.value) {
+        std::println(std::cerr,
+                     "bake: option '{}' expects a string value",
+                     override.name);
         return std::nullopt;
-    for (const auto& [name, configured] : dependency_options) {
-        auto it = options.find(name);
-        it->second = configured;
+    }
+    return BuildOption::from_string(*override.value);
+}
+
+std::optional<std::map<std::string, BuildOption>> parse_root_options(
+        const Manifest& root, const ParsedArgs& args,
+        const std::optional<std::string>& selected_member) {
+    auto overrides = parse_option_overrides(args);
+    if (!overrides) return std::nullopt;
+    if (overrides->empty()) return std::map<std::string, BuildOption>{};
+
+    std::vector<Manifest> selected_roots;
+    if (root.is_workspace()) {
+        if (selected_member) {
+            auto manifest = Manifest::load(
+                root.project_dir / selected_member->c_str());
+            if (manifest && manifest->has_moid()) {
+                selected_roots.push_back(std::move(*manifest));
+            }
+        } else {
+            for (const auto& member : root.workspace->members) {
+                auto manifest = Manifest::load(
+                    root.project_dir / member.c_str());
+                if (!manifest || !manifest->has_moid()) continue;
+                selected_roots.push_back(std::move(*manifest));
+            }
+        }
+    } else if (root.has_moid()) {
+        selected_roots.push_back(root);
     }
 
-    if (!cli_args) return options;
+    if (selected_roots.empty()) {
+        std::println(std::cerr,
+                     "bake: cannot apply build options without a selected root moid");
+        return std::nullopt;
+    }
 
-    auto overrides = parse_option_overrides(*cli_args);
-    if (!overrides) return std::nullopt;
+    std::map<std::string, BuildOption> result;
     for (const auto& override : *overrides) {
-        auto it = options.find(override.name);
-        if (it == options.end()) {
+        auto declared = selected_roots.front().options.find(override.name);
+        if (declared == selected_roots.front().options.end()) {
             std::println(std::cerr,
                          "bake: unknown build option '{}' (declare it in [options])",
                          override.name);
             return std::nullopt;
         }
-
-        const auto type = it->second.type;
-        if (type == BuildOption::Type::Bool) {
-            if (!override.value) {
-                it->second = BuildOption::from_bool(true);
-                continue;
-            }
-            auto value = parse_bool_option(*override.value);
-            if (!value) {
-                std::println(std::cerr,
-                             "bake: option '{}' expects a boolean, got '{}'",
-                             override.name, *override.value);
-                return std::nullopt;
-            }
-            it->second = BuildOption::from_bool(*value);
-        } else if (type == BuildOption::Type::Int) {
-            if (!override.value || override.value->empty()) {
-                std::println(std::cerr,
-                             "bake: option '{}' expects an integer value",
-                             override.name);
-                return std::nullopt;
-            }
-            std::int64_t value = 0;
-            const char* first = override.value->data();
-            const char* last = first + override.value->size();
-            auto [end, error] = std::from_chars(first, last, value);
-            if (error != std::errc{} || end != last) {
-                std::println(std::cerr,
-                             "bake: option '{}' expects an integer, got '{}'",
-                             override.name, *override.value);
-                return std::nullopt;
-            }
-            it->second = BuildOption::from_int(value);
-        } else {
-            if (!override.value) {
-                std::println(std::cerr,
-                             "bake: option '{}' expects a string value",
-                             override.name);
-                return std::nullopt;
-            }
-            it->second = BuildOption::from_string(*override.value);
-        }
+        auto value = parse_root_option_value(override, declared->second);
+        if (!value) return std::nullopt;
+        result[override.name] = std::move(*value);
     }
-    return options;
-}
-
-bool validate_option_names(const Manifest& manifest, const ParsedArgs& args) {
-    auto overrides = parse_option_overrides(args);
-    if (!overrides) return false;
-
-    for (const auto& override : *overrides) {
-        if (!manifest.options.contains(override.name)) {
-            std::println(std::cerr,
-                         "bake: unknown build option '{}' (declare it in [options])",
-                         override.name);
-            return false;
-        }
-    }
-    return true;
-}
-
-bool write_effective_options(const Layout& layout, const Manifest& manifest,
-                             const ParsedArgs& args,
-                             const std::map<std::string, BuildOption>&
-                                 dependency_options,
-                             bool apply_cli_options) {
-    auto options = effective_build_options(
-        manifest, dependency_options, apply_cli_options ? &args : nullptr);
-    if (!options) return false;
-
-    nlohmann::json document;
-    document["schema"] = 1;
-    document["options"] = nlohmann::json::object();
-    for (const auto& [name, option] : *options) {
-        switch (option.type) {
-            case BuildOption::Type::Bool:
-                document["options"][name] = option.bool_value;
-                break;
-            case BuildOption::Type::Int:
-                document["options"][name] = option.int_value;
-                break;
-            case BuildOption::Type::String:
-                document["options"][name] = option.str_value;
-                break;
-        }
-    }
-
-    const Path path = layout.bake_dir / "options.json";
-    if (!atomic_write_file(path, document.dump(2))) {
-        std::println(std::cerr, "bake: failed to write {}", path.string());
-        return false;
-    }
-    return true;
+    return result;
 }
 
 } // namespace
@@ -499,7 +432,7 @@ export void print_command_help(std::string_view cmd) {
             "    bake init [name] [options]\n"
             "\n"
             "OPTIONS:\n"
-            "    --type <executable|static-lib|shared-lib>  Package type (default: executable)\n"
+            "    --type <executable|lib|dylib>  Moid type (default: executable)\n"
             "    --std <c11|c17|c23|c++17|c++20|c++23>      Language standard (default: c++20)\n"
             "\n"
             "If [name] is omitted, scaffolds in the current directory."
@@ -548,15 +481,15 @@ export int cmd_init(const ParsedArgs& args) {
         }
     }
 
-    // Determine package type
-    PackageType pkg_type = PackageType::Executable;
+    // Determine Moid type
+    MoidType moid_type = MoidType::Executable;
     if (auto type_str = args.get_option("type")) {
-        if (auto t = parse_package_type(*type_str)) {
-            pkg_type = *t;
-        } else {
-            std::println(std::cerr, "bake: unknown package type '{}'", *type_str);
+        auto parsed_type = parse_moid_type(*type_str);
+        if (!parsed_type) {
+            std::println(std::cerr, "bake: {}", parsed_type.error());
             return 1;
         }
+        moid_type = *parsed_type;
     }
 
     // Determine std version
@@ -585,17 +518,17 @@ export int cmd_init(const ParsedArgs& args) {
     (target_dir / "tests").mkdir_recursive();
 
     // Write bake.toml
-    std::string toml_content = std::string("[package]\n")
+    std::string toml_content = std::string("[moid]\n")
         + "name = \"" + project_name + "\"\n"
         + "version = \"0.1.0\"\n"
-        + "type = \"" + std::string(package_type_str(pkg_type)) + "\"\n"
+        + "type = \"" + std::string(moid_type_str(moid_type)) + "\"\n"
         + "std = \"" + std_ver + "\"\n\n";
 
     write_file(target_dir / "bake.toml", toml_content);
 
     // Write source file. A C standard requests a genuine C scaffold.
     const bool use_c = is_c_standard(std_ver);
-    if (pkg_type == PackageType::Executable) {
+    if (moid_type == MoidType::Executable) {
         if (use_c) {
             std::string main_c = std::string(
                 "#include <stdio.h>\n\n"
@@ -822,30 +755,23 @@ export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
 // Inject statically-compiled libc++ + libc++abi objects into all C++ link
 // actions in a plan. Replaces dynamic -lc++ / libc++.1.dylib dependency.
 // For BakeSelf only: the in-process LLD has no system libc++.tbd.
-// Gates on a valid "std" entry in the prebuilt-module map.
-export void inject_static_libcxx(BuildPlan& plan, const Toolchain& tc,
-                                  const ModuleFileMap& prebuilt_modules) {
-    if (!tc.is_clang()) return;
-    if (tc.kind != CompilerKind::BakeSelf) return;
+// ===== Static libc++ injection (BakeSelf only) =====
 
+void inject_static_libcxx(BuildGraph& graph, const Toolchain& tc,
+                           const ModuleFileMap& prebuilt_modules) {
+    if (tc.kind != CompilerKind::BakeSelf) return;
     auto it = prebuilt_modules.find("std");
-    if (it == prebuilt_modules.end() || !it->second.is_regular_file())
-        return;
+    if (it == prebuilt_modules.end() || !it->second.is_regular_file()) return;
 
     auto libcxx_objs = ensure_libcxx_objects(tc);
-    if (libcxx_objs.empty())
-        return;
+    if (libcxx_objs.empty()) return;
 
-    for (auto& action : plan.actions) {
+    for (auto& action : graph.actions) {
         if (action.type != BuildAction::Type::Link) continue;
-
-        // Detect C++ link by checking if the compiler is invoked as "c++"
         bool is_cxx = false;
-        for (auto& arg : action.command) {
+        for (auto& arg : action.command)
             if (arg == "c++") { is_cxx = true; break; }
-        }
         if (!is_cxx) continue;
-
         action.command.push_back("-nodefaultlibs");
         for (auto& obj : libcxx_objs)
             action.command.push_back(obj.string());
@@ -853,66 +779,62 @@ export void inject_static_libcxx(BuildPlan& plan, const Toolchain& tc,
     }
 }
 
+// ===== build.cpp → MoidDeclaration =====
+//
+// Compiles build.cpp + bake.build.cppm into a small executable. The script
+// persists its declaration at BAKE_DECLARATION_PATH, which is then read through
+// the same strict codec used by convention mode.
 
-export int build_with_build_cpp(
-        const Layout& layout, const ParsedArgs& args,
-        const std::map<std::string, BuildOption>& dependency_options = {},
-        bool apply_cli_options = true) {
-    const Path& root = layout.root;
-    auto tc = Toolchain::detect();
-    auto runtime = find_build_script_runtime();
-    Path bake_dir = layout.bake_dir;
-    bake_dir.mkdir_recursive();
+MoidDeclaration compile_and_run_build_cpp(
+        const Path& moid_dir,
+        const Manifest& manifest,
+        const MoidNode& node,
+        const Toolchain& tc,
+        const ModuleFileMap& prebuilt_modules,
+        const Path& out_dir) {
 
-    auto manifest = Manifest::load(root);
-    if (!manifest) {
-        std::println(std::cerr, "bake: failed to load {}", (root / "bake.toml").string());
-        return 1;
+    const std::string identity_key = SHA256::hex(node.id.value).substr(0, 24);
+
+    // Project-local scripts dir: only build.o and build_app live here.
+    Path scripts_dir = out_dir / ".bake" / "scripts" / identity_key;
+    scripts_dir.mkdir_recursive();
+
+    Path wrapper_src = find_bake_build_source();
+    if (wrapper_src.string().empty()) {
+        std::println(std::cerr, "bake: cannot find bake.build.cppm");
+        std::exit(1);
     }
-    if (!write_effective_options(layout, *manifest, args, dependency_options,
-                                 apply_cli_options))
-        return 1;
 
-    Path build_cpp = root / "build.cpp";
-    Path wrapper_src = runtime.wrapper;
-    Path cabi_header = runtime.cabi_header;
+    // Global cache dir for bake.build.pcm + bake.build.o.
+    auto cache_info = bake_build_cache_info(tc, wrapper_src);
+    Path build_cache_dir = cache_info.dir / "bake.build";
+    build_cache_dir.mkdir_recursive();
 
-    // Copy wrapper + header to .bake/
-    Path wrapper_dst = bake_dir / "bake.build.cppm";
-    Path cabi_dst = bake_dir / "bake_cabi.h";
-    auto wrapper_content = read_file(wrapper_src);
-    auto cabi_content = read_file(cabi_header);
-    if (!wrapper_content || !cabi_content) {
-        std::println(std::cerr, "bake: cannot find bake.build.cppm or bake_cabi.h");
-        return 1;
-    }
-    write_file(wrapper_dst, *wrapper_content);
-    write_file(cabi_dst, *cabi_content);
+    // Copy wrapper into the cache dir (so it's self-contained and the
+    // -I flag resolves correctly for the compiler).
+    Path wrapper_dst = build_cache_dir / "bake.build.cppm";
+    if (auto content = read_file(wrapper_src))
+        write_file(wrapper_dst, *content);
 
-    // Pre-build the libc++ std + std.compat module PCMs (per project/compiler).
-    auto standard_modules = ensure_std_modules(tc, layout.out_dir);
-
-    // Helper: append valid standard-module file flags to a command vector.
-    // std must precede std.compat so the dependency is satisfied.
-    auto append_std_module_flags = [&](std::vector<std::string>& cmd) {
+    // Helper: append valid std-module file flags.
+    auto append_std_flags = [&](std::vector<std::string>& cmd) {
         if (!tc.is_clang()) return;
-        auto it_std = standard_modules.find("std");
-        if (it_std != standard_modules.end() && it_std->second.is_regular_file()) {
-            cmd.push_back("-fmodule-file=std=" + it_std->second.string());
-        }
-        auto it_compat = standard_modules.find("std.compat");
-        if (it_compat != standard_modules.end() &&
-            it_compat->second.is_regular_file()) {
-            cmd.push_back("-fmodule-file=std.compat=" +
-                          it_compat->second.string());
+        for (auto& [name, pcm] : prebuilt_modules) {
+            if (!pcm.string().empty() && pcm.is_regular_file())
+                cmd.push_back("-fmodule-file=" + name + "=" + pcm.string());
         }
     };
 
-    // Step 1: Compile wrapper module → BMI + .o
-    Path pcm = bake_dir / "bake.build.pcm";
-    Path wrapper_o = bake_dir / "bake.build.o";
+    // Step 1: Compile bake.build.cppm → PCM + .o  (global cache)
+    Path pcm = build_cache_dir / "bake.build.pcm";
+    Path wrapper_o = build_cache_dir / "bake.build.o";
 
-    {
+    if (!pcm.is_regular_file() || !wrapper_o.is_regular_file()) {
+        // Atomic compile: write to temp names, then rename into place.
+        std::string pid = std::to_string(getpid());
+        Path tmp_pcm = Path(pcm.string() + "." + pid + ".tmp");
+        Path tmp_o   = Path(wrapper_o.string() + "." + pid + ".tmp");
+
         std::vector<std::string> cmd;
         for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
         cmd.push_back("-c");
@@ -923,23 +845,32 @@ export int build_with_build_cpp(
         }
         cmd.push_back("-x");
         cmd.push_back("c++-module");
-        cmd.push_back("-I" + bake_dir.string());
-        append_std_module_flags(cmd);
-        cmd.push_back("-fmodule-output=" + pcm.string());
+        cmd.push_back("-I" + build_cache_dir.string());
+        append_std_flags(cmd);
+        cmd.push_back("-fmodule-output=" + tmp_pcm.string());
         cmd.push_back(wrapper_dst.string());
         cmd.push_back("-o");
-        cmd.push_back(wrapper_o.string());
+        cmd.push_back(tmp_o.string());
 
-        auto result = run_process(cmd, root, true);
+        auto result = run_process(cmd, moid_dir, true);
         if (!result.success()) {
             std::print(std::cerr, "{}", result.stderr_output);
             std::println(std::cerr, "bake: failed to compile bake.build.cppm");
-            return 1;
+            tmp_pcm.remove();
+            tmp_o.remove();
+            std::exit(1);
         }
+
+        std::error_code ec;
+        std::filesystem::rename(tmp_pcm.string(), pcm.string(), ec);
+        std::filesystem::rename(tmp_o.string(), wrapper_o.string(), ec);
+        // If rename failed because another process won the race, the
+        // final files exist and we're fine.
     }
 
-    // Step 2: Compile build.cpp → .o
-    Path build_o = bake_dir / "build.o";
+    // Step 2: Compile build.cpp → .o  (project-local)
+    Path build_cpp = moid_dir / "build.cpp";
+    Path build_o = scripts_dir / "build.o";
     {
         std::vector<std::string> cmd;
         for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
@@ -949,218 +880,282 @@ export int build_with_build_cpp(
             cmd.push_back("-stdlib=libc++");
             cmd.push_back("-Wno-reserved-module-identifier");
         }
-        cmd.push_back("-I" + bake_dir.string());
-        append_std_module_flags(cmd);
-        if (tc.is_clang()) {
-            cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
-        }
+        cmd.push_back("-I" + build_cache_dir.string());
+        append_std_flags(cmd);
+        cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
         cmd.push_back(build_cpp.string());
         cmd.push_back("-o");
         cmd.push_back(build_o.string());
 
-        auto result = run_process(cmd, root, true);
+        auto result = run_process(cmd, moid_dir, true);
         if (!result.success()) {
             std::print(std::cerr, "{}", result.stderr_output);
             std::println(std::cerr, "bake: failed to compile build.cpp");
-            return 1;
+            std::exit(1);
         }
     }
 
-    // Step 3: Link → build_app
-    Path build_app = bake_dir / "build_app";
-#ifdef _WIN32
-    build_app = bake_dir / "build_app.exe";
-#endif
+    // Step 3: Link → build_app (project-local; only needs std, no bake library)
+    Path build_app = scripts_dir / "build_app";
     {
         std::vector<std::string> cmd;
         for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
-        if (tc.is_clang() && tc.kind != CompilerKind::BakeSelf) {
+        if (tc.is_clang() && tc.kind != CompilerKind::BakeSelf)
             cmd.push_back("-stdlib=libc++");
-        }
         cmd.push_back(wrapper_o.string());
         cmd.push_back(build_o.string());
-        // BakeSelf: inject static libc++ objects (no -lc++ available).
-        if (tc.kind == CompilerKind::BakeSelf &&
-            standard_modules.contains("std")) {
+
+        // BakeSelf: inject static libc++ objects
+        if (tc.kind == CompilerKind::BakeSelf && prebuilt_modules.contains("std")) {
             auto libcxx_objs = ensure_libcxx_objects(tc);
             if (!libcxx_objs.empty()) {
                 cmd.push_back("-nodefaultlibs");
-                for (auto& obj : libcxx_objs)
-                    cmd.push_back(obj.string());
+                for (auto& obj : libcxx_objs) cmd.push_back(obj.string());
                 cmd.push_back("-lsystem");
             }
         }
-#ifdef _WIN32
-        // Windows: link against the import library directly
-        cmd.push_back((runtime.library_dir / "bake.lib").string());
-#else
-        cmd.push_back("-L" + runtime.library_dir.string());
-        cmd.push_back("-lbake");
-        cmd.push_back("-Wl,-rpath," + runtime.library_dir.string());
-#endif
         cmd.push_back("-o");
         cmd.push_back(build_app.string());
 
-        auto result = run_process(cmd, root, true);
+        auto result = run_process(cmd, moid_dir, true);
         if (!result.success()) {
             std::print(std::cerr, "{}", result.stderr_output);
             std::println(std::cerr, "bake: failed to link build_app");
-            return 1;
+            std::exit(1);
         }
     }
 
-    // Step 4: Run build_app → .bake/build.json
-    // Export the real bake binary path (BAKE_EXE) so build_app resolves
-    // resources (lib/, clang-scan-deps, std PCMs) relative to bake — not
-    // the temporary build_app executable. ScopedEnvironmentVariable
-    // restores the parent environment afterward.
+    // Step 4: Run build_app, then read its persisted declaration.
+    const auto& options = node.declaration.options;
+    std::string opts_str = serialize_options(options);
+    std::string declaration_options = declaration_options_json(options).dump();
+    std::string declaration_dependencies =
+        serialize_declaration_dependencies(node.dependencies);
+    std::string deps_str;
+    for (auto& [dep_name, dep] : manifest.dependencies) {
+        if (dep.is_path_dep) {
+            Path dep_dir = (moid_dir / dep.path).lexically_normal();
+            deps_str += dep_name + "=" + dep_dir.absolute().string() + "\n";
+        }
+    }
+    // Non-moid source deps resolved by the graph (remote archives, raw
+    // path dirs) — their source directories are needed by build.cpp.
+    for (auto& [alias, dir] : node.source_deps) {
+        deps_str += alias + "=" + dir + "\n";
+    }
+
+    Path declaration_path = moid_declaration_path(out_dir, node.id.value);
+    if (declaration_path.exists()) declaration_path.remove();
+
+    std::string self = get_self_exe_path();
     {
-        ScopedBuildContext context(layout);
-        if (!context.active()) {
-            std::println(std::cerr,
-                         "bake: failed to establish build script context");
-            return 1;
-        }
-        std::string self = get_self_exe_path();
-        if (self.empty()) {
-            std::println(std::cerr,
-                         "bake: cannot locate bake executable for build script");
-            return 1;
-        }
-        ScopedEnvironmentVariable bake_exe("BAKE_EXE", self);
-        if (!bake_exe.active()) {
-            std::println(std::cerr,
-                         "bake: failed to set BAKE_EXE for build script");
-            return 1;
-        }
-        auto result = run_process({build_app.string()}, root, true);
-        // build_app outputs progress (dependency compilation, etc.) to stdout.
-        std::print("{}", result.stdout_output);
+        ScopedEnv source_env("BAKE_SOURCE_DIR", node.declaration.root);
+        ScopedEnv build_env(
+            "BAKE_BUILD_DIR", out_dir.absolute().string());
+        ScopedEnv id_env("BAKE_MOID_ID", node.id.value);
+        ScopedEnv name_env("BAKE_MOID_NAME", manifest.moid->name);
+        ScopedEnv version_env("BAKE_MOID_VERSION", manifest.moid->version);
+        ScopedEnv declaration_env(
+            "BAKE_DECLARATION_PATH", declaration_path.string());
+        ScopedEnv options_env("BAKE_OPTIONS", opts_str);
+        ScopedEnv declaration_options_env(
+            "BAKE_DECLARATION_OPTIONS", declaration_options);
+        ScopedEnv declaration_dependencies_env(
+            "BAKE_DECLARATION_DEPENDENCIES", declaration_dependencies);
+        ScopedEnv dependencies_env("BAKE_DEPS", deps_str);
+        ScopedEnv executable_env("BAKE_EXE", self);
+
+        // Do not capture stdout/stderr: declaration transport uses the file,
+        // so build scripts retain their normal user-facing streams.
+        auto result = run_process({build_app.string()}, moid_dir, false);
         if (!result.success()) {
-            std::print(std::cerr, "{}", result.stderr_output);
             std::println(std::cerr, "bake: build_app failed");
-            return 1;
+            std::exit(1);
+        }
+
+        auto declaration = read_moid_declaration(declaration_path);
+        if (!declaration) {
+            std::println(std::cerr, "bake: {}", declaration.error());
+            std::exit(1);
+        }
+        return std::move(*declaration);
+    }
+}
+
+// ===== Configure the resolved outer graph =====
+
+namespace {
+
+Path persist_convention_declaration(
+        const Manifest& manifest, const Layout& layout, const Path& bake_dir,
+        const MoidNode& node) {
+    auto declaration = convention_declare(
+        manifest, layout, node.id.value, node.declaration.options,
+        node.declaration.dependencies);
+    const std::string identity_key = SHA256::hex(node.id.value).substr(0, 24);
+    Path path = bake_dir / (identity_key + ".moid.json");
+    auto written = write_moid_declaration(path, declaration);
+    if (!written) {
+        std::println(std::cerr, "bake: {}", written.error());
+        std::exit(1);
+    }
+    return path;
+}
+
+std::expected<void, std::string> validate_resolved_declaration(
+        const MoidDeclaration& declaration, const MoidNode& node) {
+    if (declaration.id != node.id.value) {
+        return std::unexpected(
+            "moid declaration field 'id' does not match resolved identity for moid '" +
+            node.declaration.name + "'");
+    }
+    if (declaration.root != node.declaration.root) {
+        return std::unexpected(
+            "moid declaration field 'root' does not match resolved root for moid '" +
+            node.declaration.name + "'");
+    }
+    if (declaration.version != node.declaration.version) {
+        return std::unexpected(
+            "moid declaration field 'version' does not match resolved version for moid '" +
+            node.declaration.name + "'");
+    }
+    if (declaration.options != node.declaration.options) {
+        return std::unexpected(
+            "moid declaration field 'options' does not match resolved options for moid '" +
+            node.declaration.name + "'");
+    }
+    if (declaration.dependencies.size() != node.declaration.dependencies.size()) {
+        return std::unexpected(
+            "moid declaration field 'dependencies' does not match resolved dependencies for moid '" +
+            node.declaration.name + "'");
+    }
+    for (std::size_t i = 0; i < declaration.dependencies.size(); ++i) {
+        const auto& actual = declaration.dependencies[i];
+        const auto& expected = node.declaration.dependencies[i];
+        if (actual.alias != expected.alias || actual.id != expected.id ||
+            actual.options != expected.options) {
+            return std::unexpected(
+                "moid declaration field 'dependencies' does not match resolved dependencies for moid '" +
+                node.declaration.name + "'");
+        }
+    }
+    return {};
+}
+
+} // namespace
+
+std::expected<void, std::string> configure_moid_graph(
+        MoidGraph& graph,
+        const Toolchain& tc,
+        const ModuleFileMap& prebuilt_modules,
+        const Path& out_dir,
+        const Path& project_root) {
+    // A build script owns its final declaration type, so provisional manifest
+    // types cannot reject an edge before that script has run.
+    auto topology = configuration_topological_moids(graph);
+    if (!topology) return std::unexpected(topology.error());
+
+    Path bake_dir = out_dir / ".bake";
+    bake_dir.mkdir_recursive();
+
+    for (const auto& id : *topology) {
+        auto& node = graph.nodes.at(id);
+        const Path moid_dir(node.declaration.root);
+        auto manifest = Manifest::load(moid_dir);
+        if (!manifest || !manifest->has_moid()) {
+            return std::unexpected(
+                "failed to load manifest for moid '" +
+                node.declaration.name + "'");
+        }
+
+        MoidDeclaration declaration;
+        if ((moid_dir / "build.cpp").is_regular_file()) {
+            declaration = compile_and_run_build_cpp(
+                moid_dir, *manifest, node, tc, prebuilt_modules, out_dir);
+        } else {
+            auto layout = Layout::detect(moid_dir, project_root);
+            auto declaration_path = persist_convention_declaration(
+                *manifest, layout, bake_dir, node);
+            auto persisted = read_moid_declaration(declaration_path);
+            if (!persisted) return std::unexpected(persisted.error());
+            declaration = std::move(*persisted);
+        }
+
+        auto validated = validate_resolved_declaration(declaration, node);
+        if (!validated) return std::unexpected(validated.error());
+        node.declaration = std::move(declaration);
+
+        if (node.declaration.type != MoidType::Executable) continue;
+        for (const auto& [_, consumer] : graph.nodes) {
+            for (const auto& edge : consumer.dependencies) {
+                if (edge.target != id) continue;
+                return std::unexpected(
+                    "moid '" + consumer.declaration.name +
+                    "' cannot use executable moid '" +
+                    node.declaration.name + "' as a normal dependency");
+            }
         }
     }
 
-    // Step 5: Read build.json → execute
-    Path build_json = bake_dir / "build.json";
-    if (!build_json.is_regular_file()) {
-        std::println(std::cerr, "bake: build_app did not produce .bake/build.json");
-        return 1;
-    }
-
-    auto plan = read_build_json(build_json, root);
-
-    // Inject static libc++ objects into C++ link actions.
-    // Standard-module flags (-fmodule-file=std=, -stdlib=libc++) are now
-    // injected by bake_builder_build() itself, so no CLI post-processing
-    // of compile actions is needed.
-    inject_static_libcxx(plan, tc, standard_modules);
-
-    // Write compile_commands.json
-    write_compile_commands(
-        plan,
-        layout.dependency_layout
-            ? layout.package_dir / "compile_commands.json"
-            : root / "compile_commands.json");
-
-    // Get job count
-    int jobs = 0;
-    if (auto j = args.get_option("j")) {
-        jobs = std::atoi(j->c_str());
-    }
-
-    return execute_plan(plan, jobs);
+    return {};
 }
 
 // ===== Lock enforcement =====
 
-// Check and resolve the lockfile. Returns 0 if the lock is consistent
-// or was successfully (re)resolved. Returns non-zero on failure.
+// Check and resolve the lockfile before building. Returns 0 if the lock is
+// consistent or was successfully (re)resolved. Returns non-zero on failure.
 // On success, root/bake.lock is guaranteed to exist and be consistent.
-// Cache integrity is verified on ALL builds to detect tampering.
-export int enforce_lock(const Path& root, const Manifest& manifest,
-                        const ParsedArgs& args,
-                        const Path& package_lock_path = {}) {
+//
+// --locked/--frozen: full enforcement — consistency check + cache verification.
+// --offline (without --locked): skip — let resolve_moid_graph produce specific
+//   ownership diagnostics from the lockfile state.
+// Normal: resolve if needed, verify/redownload cache.
+int enforce_lock(const Path& root, const Manifest& manifest,
+                 const ParsedArgs& args) {
     if (Lockfile::has_only_path_deps(manifest)) return 0;
 
     bool offline = args.has_option("offline") || args.has_option("frozen");
     bool locked = args.has_option("locked") || args.has_option("frozen");
 
-    const bool isolated_package_lock =
-        !package_lock_path.string().empty();
-    Path lock_path = isolated_package_lock
-        ? package_lock_path
-        : root / "bake.lock";
+    Path lock_path = root / "bake.lock";
+    auto lockfile = Lockfile::load(lock_path);
 
-    std::optional<Lockfile> lockfile;
-    bool save_selected_lock = false;
-    if (isolated_package_lock) {
-        // A versioned lock beside a path package is immutable input. Copy its
-        // resolved graph into this consumer's out tree; never update the
-        // dependency source directory. If it is absent/stale, reuse a valid
-        // consumer-local resolution before going to the network.
-        auto source_lock = Lockfile::load(root / "bake.lock");
-        if (source_lock && source_lock->is_consistent(manifest)) {
-            lockfile = std::move(source_lock);
-            save_selected_lock = true;
-        } else {
-            lockfile = Lockfile::load(lock_path);
+    bool needs_resolve = !lockfile || !lockfile->is_consistent(manifest, root);
+
+    // For --locked/--frozen: full enforcement.
+    if (locked) {
+        if (needs_resolve) {
+            std::println(std::cerr, "bake: lock file missing or stale (--locked)");
+            return 1;
         }
-    } else {
-        lockfile = Lockfile::load(lock_path);
-    }
-
-    bool needs_resolve = false;
-    if (!lockfile) {
-        needs_resolve = true;
-    } else if (!lockfile->is_consistent(manifest)) {
-        needs_resolve = true;
-    }
-
-    // Verify cache integrity on all builds, not just frozen/locked.
-    // This detects tampered or corrupted cached dependencies before they
-    // enter the build graph.
-    if (!needs_resolve && lockfile) {
-        if (!verify_lock_cache(*lockfile, get_cache_dir())) {
+        if (lockfile && !verify_lock_cache(*lockfile, get_cache_dir())) {
             std::println(std::cerr,
                 "bake: cache verification failed — cached sources missing or corrupted");
-            // We must NOT re-resolve tags — that would move locked commits.
-            // Instead, re-download using the existing locked commit hashes.
-            // For now, report the error clearly.
-            if (locked || offline) return 1;
-            // Re-download using locked commits (not re-resolve)
+            return 1;
+        }
+        return 0;
+    }
+
+    // For --offline without --locked: don't intercept. Let resolve_moid_graph
+    // produce specific ownership diagnostics from the lockfile.
+    if (offline) return 0;
+
+    // Normal build: verify cache when lock is consistent.
+    if (!needs_resolve && lockfile) {
+        if (!verify_lock_cache(*lockfile, get_cache_dir())) {
             Resolver resolver;
-            auto re_downloaded = resolver.redownload(*lockfile, ResolverConfig{});
-            if (!re_downloaded || !verify_lock_cache(*lockfile, get_cache_dir())) {
+            if (!resolver.redownload(*lockfile, ResolverConfig{}) ||
+                !verify_lock_cache(*lockfile, get_cache_dir())) {
                 std::println(std::cerr,
                     "bake: re-download failed. Run 'bake update' to re-resolve from scratch.");
                 return 1;
             }
             std::println("bake: cached sources re-downloaded using locked commits");
         }
-    }
-
-    if (!needs_resolve) {
-        if (save_selected_lock && lockfile && !lockfile->save(lock_path)) {
-            std::println(std::cerr,
-                         "bake: failed to write package lock state at {}",
-                         lock_path.string());
-            return 1;
-        }
         return 0;
     }
 
-    if (locked) {
-        std::println(std::cerr, "bake: lock file missing or stale (--locked)");
-        return 1;
-    }
-    if (offline) {
-        std::println(std::cerr, "bake: cannot resolve dependencies in offline mode");
-        return 1;
-    }
-
+    // Normal build, lock missing/stale: resolve dependencies.
     Resolver resolver;
     auto new_lock = resolver.resolve(manifest, ResolverConfig{});
     if (!new_lock) {
@@ -1175,845 +1170,98 @@ export int enforce_lock(const Path& root, const Manifest& manifest,
     return 0;
 }
 
-struct PathMetaOptionRequest {
-    BuildOption value;
-    std::string dependency_path;
-};
-
-struct PathMetaPackage {
-    Path root;
-    Manifest manifest;
-    std::string name;
-    std::map<std::string, PathMetaOptionRequest> option_requests;
-};
-
-struct PathMetaGraph {
-    std::map<std::string, PathMetaPackage> packages;
-    std::map<std::string, std::string> package_sources;
-    std::map<std::string, int> visit_state; // 0=unseen, 1=visiting, 2=done
-    std::vector<std::string> build_order;
-};
-
-std::string format_dependency_path(const std::vector<std::string>& path) {
-    std::string result;
-    for (const auto& component : path) {
-        if (!result.empty()) result += " -> ";
-        result += component;
-    }
-    return result;
-}
-
-std::string manifest_package_name(const Manifest& manifest) {
-    if (manifest.package && !manifest.package->name.empty())
-        return manifest.package->name;
-    auto filename = manifest.project_dir.filename_string();
-    return filename.empty() ? manifest.project_dir.string() : filename;
-}
-
-std::string manifest_package_label(const Manifest& manifest) {
-    const std::string name = manifest_package_name(manifest);
-    if (!manifest.package || manifest.package->version.empty()) return name;
-    return name + " v" + manifest.package->version;
-}
-
-bool valid_package_output_name(std::string_view name) {
-    if (name.empty() || name == "." || name == "..") return false;
-    for (const unsigned char c : name) {
-        const bool ascii_alnum = (c >= 'a' && c <= 'z') ||
-                                 (c >= 'A' && c <= 'Z') ||
-                                 (c >= '0' && c <= '9');
-        if (!ascii_alnum && c != '-' && c != '_' && c != '.') return false;
-    }
-    return true;
-}
-
-// First collect the complete path-package graph and unify every explicit
-// option request. Defaults are deliberately not constraints: they are applied
-// only after all incoming dependency edges have been considered.
-int collect_path_meta_dependencies(
-    const Manifest& manifest,
-    const std::vector<std::string>& parent_path,
-    PathMetaGraph& graph,
-    const std::set<std::string>& skip_dirs = {}) {
-    for (const auto& [name, dep] : manifest.dependencies) {
-        if (!dep.is_path_dep) continue;
-
-        Path dep_root = manifest.project_dir / dep.path;
-        auto dep_manifest = Manifest::load(dep_root);
-        if (!dep_manifest) continue; // raw path source, not a Bake package
-
-        Path dep_build_cpp = dep_root / "build.cpp";
-        if (!dep_build_cpp.is_regular_file()) continue;
-
-        std::error_code ec;
-        auto canonical = std::filesystem::weakly_canonical(dep_root.fs(), ec);
-        const std::string key = ec
-            ? std::filesystem::absolute(dep_root.fs()).lexically_normal().string()
-            : canonical.string();
-
-        // Skip dependencies that are workspace members — they are built
-        // by the workspace loop, not through .pkgs/.
-        if (skip_dirs.contains(key)) continue;
-
-        if (!validate_dependency_options(*dep_manifest, dep.options)) return 1;
-
-        auto [package_it, inserted] = graph.packages.try_emplace(key);
-        auto& package = package_it->second;
-        if (inserted) {
-            package.root = dep_root;
-            package.manifest = *dep_manifest;
-            package.name = manifest_package_name(*dep_manifest);
-            if (!valid_package_output_name(package.name)) {
-                std::println(
-                    std::cerr,
-                    "bake: package name '{}' cannot be used as an output directory",
-                    package.name);
-                return 1;
-            }
-            auto [source_it, source_inserted] =
-                graph.package_sources.try_emplace(package.name, key);
-            if (!source_inserted && source_it->second != key) {
-                std::println(
-                    std::cerr,
-                    "bake: package name conflict: '{}' refers to both {} and {}",
-                    package.name, source_it->second, key);
-                return 1;
-            }
-        }
-
-        auto request_path = parent_path;
-        request_path.push_back(name);
-        const std::string formatted_path =
-            format_dependency_path(request_path);
-
-        for (const auto& [option_name, requested_value] : dep.options) {
-            auto [request_it, request_inserted] =
-                package.option_requests.try_emplace(
-                    option_name,
-                    PathMetaOptionRequest{requested_value, formatted_path});
-            if (!request_inserted &&
-                request_it->second.value != requested_value) {
-                std::println(
-                    std::cerr,
-                    "bake: option conflict for package '{}':\n"
-                    "  option '{}' requested as {} by {}\n"
-                    "  option '{}' requested as {} by {}\n"
-                    "  one project builds one option configuration per package",
-                    package.name,
-                    option_name,
-                    build_option_value(request_it->second.value),
-                    request_it->second.dependency_path,
-                    option_name,
-                    build_option_value(requested_value),
-                    formatted_path);
-                return 1;
-            }
-        }
-
-        int& state = graph.visit_state[key];
-        if (state == 2) continue;
-        if (state == 1) {
-            std::println(std::cerr,
-                         "bake: cycle in path meta packages: {}",
-                         formatted_path);
-            return 1;
-        }
-        state = 1;
-
-        if (int rc = collect_path_meta_dependencies(
-                package.manifest, request_path, graph); rc != 0) {
-            return rc;
-        }
-        state = 2;
-        graph.build_order.push_back(key);
-    }
-    return 0;
-}
-
-int build_path_meta_dependencies(
-        const std::vector<const Manifest*>& manifests,
-        const ParsedArgs& args,
-        const Path& project_out,
-        const std::set<std::string>& skip_dirs = {}) {
-    PathMetaGraph graph;
-    for (const Manifest* manifest : manifests) {
-        if (!manifest) continue;
-        if (int rc = collect_path_meta_dependencies(
-                *manifest, {manifest_package_name(*manifest)}, graph,
-                skip_dirs); rc != 0) {
-            return rc;
-        }
-    }
-
-    for (const auto& key : graph.build_order) {
-        auto& package = graph.packages.at(key);
-        std::map<std::string, BuildOption> configured;
-        for (const auto& [name, request] : package.option_requests)
-            configured.emplace(name, request.value);
-
-        auto layout = Layout::for_dependency(
-            package.root, project_out, package.name);
-        if (int rc = enforce_lock(
-                package.root, package.manifest, args,
-                layout.bake_dir / "bake.lock"); rc != 0) {
-            return rc;
-        }
-
-        std::println("  Compiling {} (dependency)",
-                     manifest_package_label(package.manifest));
-        if (int rc = build_with_build_cpp(layout, args, configured,
-                                          /*apply_cli_options=*/false);
-            rc != 0) {
-            std::println(std::cerr,
-                         "bake: failed to build dependency '{}'",
-                         package.name);
-            return rc;
-        }
-    }
-    return 0;
-}
-
-int build_path_meta_dependencies(const Manifest& manifest,
-                                 const ParsedArgs& args,
-                                 const Path& project_out) {
-    return build_path_meta_dependencies(
-        std::vector<const Manifest*>{&manifest}, args, project_out);
-}
-
-std::optional<std::vector<PackageUsageRequirements>>
-load_path_meta_package_requirements(const Manifest& manifest,
-                                    const Path& project_out,
-                                    const std::set<std::string>& skip_dirs = {}) {
-    std::vector<PackageUsageRequirements> result;
-
-    for (const auto& [name, dependency] : manifest.dependencies) {
-        if (!dependency.is_path_dep) continue;
-
-        const Path dependency_root = manifest.project_dir / dependency.path;
-        auto dependency_manifest = Manifest::load(dependency_root);
-        if (!dependency_manifest) continue; // raw path source
-
-        // Convention-only path packages in a workspace are linked by the
-        // workspace builder today. A package with build.cpp, however, must be
-        // consumed through its exported metadata and never recompiled here.
-        if (!(dependency_root / "build.cpp").is_regular_file()) continue;
-
-        // Skip workspace members — they are built by the workspace loop.
-        std::error_code ec;
-        auto canonical = std::filesystem::weakly_canonical(dependency_root.fs(), ec);
-        const std::string key = ec
-            ? std::filesystem::absolute(dependency_root.fs()).lexically_normal().string()
-            : canonical.string();
-        if (skip_dirs.contains(key)) continue;
-
-        const std::string package_name =
-            manifest_package_name(*dependency_manifest);
-        const Path metadata_path =
-            project_out / ".pkgs" / package_name / "package.json";
-        auto content = read_file(metadata_path);
-        if (!content) {
-            std::println(
-                std::cerr,
-                "bake: dependency '{}' did not produce package metadata at {}",
-                name, metadata_path.string());
-            return std::nullopt;
-        }
-
-        try {
-            auto metadata = nlohmann::json::parse(*content);
-            if (!metadata.is_object() || metadata.value("schema", 0) != 1) {
-                std::println(
-                    std::cerr,
-                    "bake: dependency '{}' has unsupported package metadata at {}",
-                    name, metadata_path.string());
-                return std::nullopt;
-            }
-
-            PackageUsageRequirements requirements;
-            requirements.dependency_name = name;
-
-            auto read_paths = [&](std::string_view field,
-                                  std::vector<Path>& destination) -> bool {
-                const std::string key(field);
-                if (!metadata.contains(key)) return true;
-                const auto& values = metadata.at(key);
-                if (!values.is_array()) return false;
-                for (const auto& value : values) {
-                    if (!value.is_string()) return false;
-                    destination.emplace_back(value.get<std::string>());
-                }
-                return true;
-            };
-
-            auto read_strings = [&](std::string_view field,
-                                    std::vector<std::string>& destination)
-                    -> bool {
-                const std::string key(field);
-                if (!metadata.contains(key)) return true;
-                const auto& values = metadata.at(key);
-                if (!values.is_array()) return false;
-                for (const auto& value : values) {
-                    if (!value.is_string()) return false;
-                    destination.push_back(value.get<std::string>());
-                }
-                return true;
-            };
-
-            if (!read_paths("include_dirs", requirements.include_dirs) ||
-                !read_paths("link_inputs", requirements.link_inputs) ||
-                !read_strings("system_libs", requirements.system_libs) ||
-                !read_strings("frameworks", requirements.frameworks)) {
-                std::println(
-                    std::cerr,
-                    "bake: dependency '{}' has malformed package metadata at {}",
-                    name, metadata_path.string());
-                return std::nullopt;
-            }
-
-            if (metadata.contains("defines")) {
-                const auto& defines = metadata.at("defines");
-                if (!defines.is_array()) {
-                    std::println(
-                        std::cerr,
-                        "bake: dependency '{}' has malformed package metadata at {}",
-                        name, metadata_path.string());
-                    return std::nullopt;
-                }
-                for (const auto& define : defines) {
-                    if (!define.is_object() ||
-                        !define.contains("name") ||
-                        !define.at("name").is_string() ||
-                        (define.contains("value") &&
-                         !define.at("value").is_string())) {
-                        std::println(
-                            std::cerr,
-                            "bake: dependency '{}' has malformed package metadata at {}",
-                            name, metadata_path.string());
-                        return std::nullopt;
-                    }
-                    requirements.defines.push_back({
-                        define.at("name").get<std::string>(),
-                        define.value("value", std::string{})});
-                }
-            }
-
-            if (metadata.contains("uses_cxx") &&
-                !metadata.at("uses_cxx").is_boolean()) {
-                std::println(
-                    std::cerr,
-                    "bake: dependency '{}' has malformed package metadata at {}",
-                    name, metadata_path.string());
-                return std::nullopt;
-            }
-            requirements.uses_cxx = metadata.value("uses_cxx", false);
-            result.push_back(std::move(requirements));
-        } catch (const std::exception& error) {
-            std::println(
-                std::cerr,
-                "bake: cannot read package metadata for dependency '{}': {}",
-                name, error.what());
-            return std::nullopt;
-        }
-    }
-
-    return result;
-}
-
-// ===== Dep source extraction (bridges bake.package types to bake.engine types) =====
-
-// Extract bake-native dep sources and include dirs from a lockfile.
-// Walks ALL lock nodes (root + transitive) in topological order so that
-// dependencies are compiled before dependents.
-static void extract_dep_info(
-        const Lockfile& lockfile,
-        const Path& cache_dir,
-        std::vector<DepSourceEntry>& dep_sources,
-        std::vector<Path>& dep_include_dirs) {
-
-    // Topological sort of lock nodes by their dependency edges.
-    // Nodes with no dependencies come first.
-    std::vector<std::string> topo_order;
-    {
-        std::map<std::string, int> in_degree;
-        std::map<std::string, std::vector<std::string>> dependents;
-
-        for (auto& [id, node] : lockfile.nodes) {
-            in_degree[id] = 0;
-        }
-        for (auto& [id, node] : lockfile.nodes) {
-            for (auto& child_id : node.dependencies) {
-                if (lockfile.nodes.count(child_id)) {
-                    dependents[child_id].push_back(id);
-                    in_degree[id]++;
-                }
-            }
-        }
-
-        // Kahn's algorithm
-        std::vector<std::string> queue;
-        for (auto& [id, deg] : in_degree) {
-            if (deg == 0) queue.push_back(id);
-        }
-        std::sort(queue.begin(), queue.end());
-
-        while (!queue.empty()) {
-            std::string node_id = queue.front();
-            queue.erase(queue.begin());
-            topo_order.push_back(node_id);
-
-            for (auto& dep_id : dependents[node_id]) {
-                if (--in_degree[dep_id] == 0) {
-                    queue.push_back(dep_id);
-                }
-            }
-            std::sort(queue.begin(), queue.end());
-        }
-
-        // Append any remaining (cycle) nodes
-        for (auto& [id, node] : lockfile.nodes) {
-            if (std::find(topo_order.begin(), topo_order.end(), id) == topo_order.end()) {
-                topo_order.push_back(id);
-            }
-        }
-    }
-
-    // Walk nodes in topological order
-    for (auto& node_id : topo_order) {
-        auto node_it = lockfile.nodes.find(node_id);
-        if (node_it == lockfile.nodes.end()) continue;
-        const auto& node = node_it->second;
-        if (!node.native) continue;
-        if (node.tree_sha256.empty()) continue;
-
-        Path dep_cache = cache_dir / node.tree_sha256;
-        if (!dep_cache.is_directory()) {
-            std::println(std::cerr, "bake: cached source for '{}' not found at {}",
-                         node_id, dep_cache.string());
-            continue;
-        }
-
-        Path dep_public = dep_cache / "public";
-        if (dep_public.is_directory()) {
-            dep_include_dirs.push_back(dep_public);
-        }
-
-        Path dep_src = dep_cache / "src";
-        if (dep_src.is_directory()) {
-            auto dep_disc = discover_sources(dep_src, dep_public);
-            for (auto& cpp : dep_disc.cpp_files) {
-                dep_sources.push_back({node_id, cpp});
-            }
-            for (auto& c : dep_disc.c_files) {
-                dep_sources.push_back({node_id, c});
-            }
-        }
-    }
-}
-
 // ===== build command =====
 
 export int cmd_build(const ParsedArgs& args) {
-    // Find project root
     auto root = find_project_root();
     if (!root) {
-        std::println(std::cerr, "bake: no bake.toml found in current directory or any parent");
+        std::println(std::cerr, "bake: no bake.toml found");
         return 1;
     }
 
-    // Load manifest (needed for lock enforcement before build.cpp dispatch)
     auto manifest = Manifest::load(*root);
     if (!manifest) {
         std::println(std::cerr, "bake: failed to load bake.toml");
         return 1;
     }
 
-    if (!validate_option_names(*manifest, args)) return 1;
+    // Lockfile enforcement: resolve deps, verify cache, enforce --locked/--offline.
+    if (enforce_lock(*root, *manifest, args) != 0) return 1;
 
-    // ===== Lock enforcement (before build.cpp so --locked/--frozen work universally)
-    if (int rc = enforce_lock(*root, *manifest, args); rc != 0) return rc;
-
-    if (manifest->has_package()) {
-        std::println("   Building {}", manifest_package_label(*manifest));
-    } else if (manifest->is_workspace()) {
-        const std::string workspace_name = root->filename_string().empty()
-            ? root->string()
-            : root->filename_string();
-        std::println("   Building workspace {}", workspace_name);
-    }
-
-    // Handle workspace: build all members with inter-member deps
-    if (manifest->is_workspace()) {
-        int result = 0;
-        const Path project_out = Layout::detect(*root).out_dir;
-        int jobs = 0;
-        if (auto j = args.get_option("j")) {
-            jobs = std::atoi(j->c_str());
-        }
-
-        // Enforce lock for the workspace: merge all members' remote deps into
-        // a single combined manifest, then resolve once. This prevents each
-        // member's enforce_lock from overwriting the shared bake.lock.
-        {
-            Manifest combined;
-            combined.project_dir = *root;
-            for (auto& member : manifest->workspace->members) {
-                Path member_dir = *root / member;
-                auto member_manifest = Manifest::load(member_dir);
-                if (!member_manifest) continue;
-                for (auto& [name, dep] : member_manifest->dependencies) {
-                    if (dep.is_path_dep) continue;
-                    // Detect conflicts: same dep name but different URL/tag
-                    auto existing = combined.dependencies.find(name);
-                    if (existing != combined.dependencies.end()) {
-                        if (existing->second.url != dep.url || existing->second.tag != dep.tag) {
-                            std::println(std::cerr,
-                                "bake: dependency conflict — '{}' declared differently:\n"
-                                "  member '{}': url=\"{}\", tag=\"{}\"\n"
-                                "  member '{}': url=\"{}\", tag=\"{}\"",
-                                name,
-                                /* find which member declared the existing one */
-                                "(earlier)", existing->second.url, existing->second.tag,
-                                member, dep.url, dep.tag);
-                            return 1;
-                        }
-                        // Same URL + tag — reuse, skip
-                        continue;
-                    }
-                    combined.dependencies[name] = dep;
-                }
-            }
-            if (!Lockfile::has_only_path_deps(combined)) {
-                if (int rc = enforce_lock(*root, combined, args); rc != 0) {
-                    return rc;
-                }
-            }
-        }
-
-        // Load the final lockfile (may have been updated by member enforcement)
-        auto lockfile = Lockfile::load(*root / "bake.lock");
-
-        // Extract dep sources + include dirs from lockfile
-        std::vector<DepSourceEntry> dep_sources;
-        std::vector<Path> dep_include_dirs;
-        if (lockfile && !lockfile->empty()) {
-            extract_dep_info(*lockfile, get_cache_dir(),
-                             dep_sources, dep_include_dirs);
-        }
-
-        // Track built members for inter-member dependency resolution
-        struct BuiltMember {
-            std::string name;
-            Path bmi_dir;
-            Path lib_path;
-            std::vector<std::string> module_names;
-            // PCM paths for modules that this member's dependencies built
-            // (e.g. tomlplusplus.pcm, nlohmann.json.pcm). These must be
-            // passed to downstream members so transitive imports resolve.
-            std::map<std::string, Path> dep_pcms;
-        };
-        std::vector<BuiltMember> built;
-
-        // Build the standard modules lazily: an all-C workspace must not
-        // require a C++ standard library module at all.
-        ModuleFileMap standard_modules;
-
-        // Compute canonical paths of all workspace member directories so
-        // path-meta-dependency collection can skip them. Workspace members
-        // are built by the loop below, never through .pkgs/.
-        std::set<std::string> workspace_member_dirs;
-        for (const auto& member : manifest->workspace->members) {
-            Path member_dir = *root / member;
-            std::error_code ec;
-            auto canonical = std::filesystem::weakly_canonical(member_dir.fs(), ec);
-            workspace_member_dirs.insert(ec
-                ? std::filesystem::absolute(member_dir.fs()).lexically_normal().string()
-                : canonical.string());
-        }
-
-        // A workspace owns one dependency package graph. Collect every
-        // selected member's requests before building any path meta package so
-        // one package cannot be overwritten by a later member's options.
-        std::vector<Manifest> selected_member_manifests;
-        for (const auto& member : manifest->workspace->members) {
-            auto member_manifest = Manifest::load(*root / member);
-            if (!member_manifest || !member_manifest->has_package()) continue;
-            if (auto p = args.get_option("p");
-                p && *p != member_manifest->package->name) {
-                continue;
-            }
-            selected_member_manifests.push_back(std::move(*member_manifest));
-        }
-        std::vector<const Manifest*> selected_member_refs;
-        selected_member_refs.reserve(selected_member_manifests.size());
-        for (const auto& selected : selected_member_manifests)
-            selected_member_refs.push_back(&selected);
-        if (int rc = build_path_meta_dependencies(
-                selected_member_refs, args, project_out,
-                workspace_member_dirs); rc != 0) {
-            return rc;
-        }
-
-        for (auto& member : manifest->workspace->members) {
-            Path member_dir = *root / member;
-            auto member_manifest = Manifest::load(member_dir);
-            if (!member_manifest || !member_manifest->has_package()) {
-                std::println(std::cerr, "bake: skipping workspace member '{}' (no [package])", member);
-                continue;
-            }
-
-            // Check -p flag
-            if (auto p = args.get_option("p")) {
-                if (*p != member_manifest->package->name) continue;
-            }
-
-            std::println("  Compiling {}",
-                         manifest_package_label(*member_manifest));
-            auto layout = Layout::detect(member_dir, *root);
-            auto tc = Toolchain::detect();
-
-            // ── build.cpp escape hatch ──
-            // A member with build.cpp is built by its own script instead of
-            // convention mode. The output is recorded in `built` so that
-            // downstream workspace members can link against it.
-            Path member_build_cpp = member_dir / "build.cpp";
-            if (member_build_cpp.is_regular_file()) {
-                if (!is_c_standard(member_manifest->package->std_version)) {
-                    if (standard_modules.empty())
-                        standard_modules = ensure_std_modules(tc, layout.out_dir);
-                }
-
-                if (int rc = build_with_build_cpp(layout, args); rc != 0) {
-                    result = rc; break;
-                }
-
-                // Record this member for dependents
-                BuiltMember bm;
-                bm.name = member_manifest->package->name;
-                bm.bmi_dir = layout.bmi_dir;
-
-                // Read primary output from build.json
-                Path build_json = layout.bake_dir / "build.json";
-                if (build_json.is_regular_file()) {
-                    auto bp = read_build_json(build_json, member_dir);
-                    bm.lib_path = bp.primary_output;
-                }
-
-                // Collect module names from BMI directory
-                if (bm.bmi_dir.is_directory()) {
-                    for (auto& entry : std::filesystem::directory_iterator(bm.bmi_dir.fs())) {
-                        if (entry.path().extension() == ".pcm") {
-                            bm.module_names.push_back(entry.path().stem().string());
-                        }
-                    }
-                }
-
-                // Collect dependency module PCMs from package.json so
-                // downstream members can resolve transitive imports.
-                Path pkg_json = layout.bake_dir / "package.json";
-                auto pkg_content = read_file(pkg_json);
-                if (pkg_content) {
-                    try {
-                        auto pkg = nlohmann::json::parse(*pkg_content);
-                        if (pkg.contains("dependency_modules")) {
-                            for (const auto& entry : pkg["dependency_modules"]) {
-                                std::string mod = entry["module"].get<std::string>();
-                                std::string pcm_str = entry["pcm"].get<std::string>();
-                                Path pcm(pcm_str);
-                                if (pcm.is_regular_file())
-                                    bm.dep_pcms[mod] = pcm;
-                            }
-                        }
-                    } catch (...) {}
-                }
-
-                built.push_back(std::move(bm));
-                continue;
-            }
-
-            // ── convention mode ──
-            auto member_package_requirements =
-                load_path_meta_package_requirements(
-                    *member_manifest, project_out, workspace_member_dirs);
-            if (!member_package_requirements) return 1;
-
-            ModuleFileMap member_prebuilt;
-            if (!is_c_standard(member_manifest->package->std_version)) {
-                if (standard_modules.empty())
-                    standard_modules = ensure_std_modules(tc, layout.out_dir);
-                member_prebuilt = standard_modules;
-
-                // Pull in dependency PCMs from earlier workspace members
-                // so transitive imports resolve (e.g. bake imports core
-                // which imports tomlplusplus — bake needs tomlplusplus PCM).
-                for (const auto& bm : built) {
-                    for (const auto& [mod_name, pcm] : bm.dep_pcms)
-                        member_prebuilt[mod_name] = pcm;
-                }
-            }
-
-            auto plan = create_convention_plan(*member_manifest, layout, tc,
-                                                member_manifest->options,
-                                                dep_sources, dep_include_dirs,
-                                                /*compile_path_deps=*/false,
-                                                member_prebuilt,
-                                                *member_package_requirements);
-
-            // Inject external modules from built dependencies.
-            // Standard-module flags are injected by create_convention_plan;
-            // only workspace-member BMIs are appended here.
-            for (auto& action : plan.actions) {
-                if (action.type != BuildAction::Type::Compile &&
-                    action.type != BuildAction::Type::CompileModule) continue;
-
-                for (auto& bm : built) {
-                    if (!bm.bmi_dir.is_directory()) continue;
-                    for (auto& mod_name : bm.module_names) {
-                        Path bmi = bm.bmi_dir / (mod_name + ".pcm");
-                        if (bmi.is_regular_file()) {
-                            action.command.push_back("-fmodule-file=" + mod_name + "=" + bmi.string());
-                        }
-                    }
-                }
-            }
-
-            // Inject library links from built dependencies
-            for (auto& action : plan.actions) {
-                if (action.type != BuildAction::Type::Link) continue;
-
-                // Clang needs -stdlib=libc++ when import std is in use,
-                // unless BakeSelf (which uses static libc++ objects instead).
-                if (member_prebuilt.contains("std") && tc.is_clang() &&
-                    tc.kind != CompilerKind::BakeSelf) {
-                    auto prefix_len = cxx_prefix(tc).size();
-                    action.command.insert(action.command.begin() + prefix_len, "-stdlib=libc++");
-                }
-
-                for (auto& bm : built) {
-                    if (bm.lib_path.string().empty()) continue;
-                    // Link by full path — avoids name mismatch between
-                    // package name and library file name.
-                    action.command.insert(action.command.end() - 2,
-                        bm.lib_path.string());
-#ifndef _WIN32
-                    Path lib_dir = bm.lib_path.parent();
-                    action.command.insert(action.command.end() - 2,
-                        "-Wl,-rpath," + lib_dir.string());
-#endif
-                }
-            }
-
-            // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
-            inject_static_libcxx(plan, tc, member_prebuilt);
-
-            int r = execute_plan(plan, jobs);
-            if (r != 0) { result = r; break; }
-
-            // Record this member for dependents
-            BuiltMember bm;
-            bm.name = member_manifest->package->name;
-            bm.bmi_dir = layout.bmi_dir;
-            bm.lib_path = plan.primary_output;
-
-            // Collect module names from BMI directory
-            if (bm.bmi_dir.is_directory()) {
-                for (auto& entry : std::filesystem::directory_iterator(bm.bmi_dir.fs())) {
-                    if (entry.path().extension() == ".pcm") {
-                        bm.module_names.push_back(entry.path().stem().string());
-                    }
-                }
-            }
-
-            // Propagate dependency PCMs (std, std.compat, and any dep modules
-            // from earlier members) so downstream members inherit them.
-            for (const auto& [name, pcm] : member_prebuilt) {
-                if (name == "std" || name == "std.compat") continue;
-                if (pcm.is_regular_file())
-                    bm.dep_pcms[name] = pcm;
-            }
-
-            built.push_back(std::move(bm));
-        }
-        if (result == 0) {
-            const std::string workspace_name = root->filename_string().empty()
-                ? root->string()
-                : root->filename_string();
-            std::println("    Finished workspace {}", workspace_name);
-        }
-        return result;
-    }
-
-    if (!manifest->has_package()) {
-        std::println(std::cerr, "bake: no [package] section in bake.toml");
+    auto selected_member = resolve_workspace_member_selection(
+        *manifest, args.get_option("p"));
+    if (!selected_member) {
+        std::println(std::cerr, "bake: {}", selected_member.error());
         return 1;
     }
 
-    // Check for build.cpp (single-package escape hatch)
-    Path build_cpp = *root / "build.cpp";
-    if (build_cpp.is_regular_file()) {
-        auto layout = Layout::detect(*root);
-        if (int rc = build_path_meta_dependencies(
-                *manifest, args, layout.out_dir); rc != 0)
-            return rc;
-        return build_with_build_cpp(layout, args);
+    auto root_options = parse_root_options(*manifest, args, *selected_member);
+    if (!root_options) return 1;
+
+    BuildSelection selection;
+    selection.workspace_member = std::move(*selected_member);
+    selection.root_options = std::move(*root_options);
+
+    ResolvePolicy policy;
+    policy.locked = args.has_option("locked") || args.has_option("frozen");
+    policy.offline = args.has_option("offline") || args.has_option("frozen");
+
+    auto outer_graph = resolve_moid_graph(*manifest, selection, policy);
+    if (!outer_graph) {
+        std::println(std::cerr, "bake: {}", outer_graph.error());
+        return 1;
     }
 
-    auto layout = Layout::detect(*root);
-    if (int rc = build_path_meta_dependencies(
-            *manifest, args, layout.out_dir); rc != 0)
-        return rc;
-    auto package_requirements =
-        load_path_meta_package_requirements(*manifest, layout.out_dir);
-    if (!package_requirements) return 1;
+    Path out_dir = *root / "out";
+    Path bake_dir = out_dir / ".bake";
+    bake_dir.mkdir_recursive();
 
-    // Single package build
     auto tc = Toolchain::detect();
 
-    const bool package_uses_c = is_c_standard(manifest->package->std_version);
-    std::println("   Toolchain {} ({})", tc.kind_name(),
-                 package_uses_c ? tc.cc_path : tc.cxx_path);
+    const std::string label = manifest->is_workspace()
+        ? root->filename_string().empty() ? root->string() : root->filename_string()
+        : (manifest->has_moid()
+            ? manifest->moid->name + " v" + manifest->moid->version
+            : "project");
 
-    // A pure C package must not depend on libc++'s std module.
+    std::println("   Building {}", label);
+
+    // build.cpp compilation needs the std PCM to compile bake.build.cppm.
     ModuleFileMap prebuilt_modules;
-    if (!package_uses_c) {
-        prebuilt_modules = ensure_std_modules(tc, layout.out_dir);
-    }
-    // Dependency module planning is handled inside create_convention_plan.
+    if (tc.is_clang())
+        prebuilt_modules = ensure_std_modules(tc, out_dir);
 
-    // Extract dep sources + include dirs from lockfile
-    std::vector<DepSourceEntry> dep_sources;
-    std::vector<Path> dep_include_dirs;
-    auto lockfile = Lockfile::load(*root / "bake.lock");
-    if (lockfile && !lockfile->empty()) {
-        extract_dep_info(*lockfile, get_cache_dir(),
-                         dep_sources, dep_include_dirs);
+    auto configured = configure_moid_graph(
+        *outer_graph, tc, prebuilt_modules, out_dir, *root);
+    if (!configured) {
+        std::println(std::cerr, "bake: {}", configured.error());
+        return 1;
     }
 
-    // Apply type-preserving option overrides.
-    auto options = effective_build_options(*manifest, {}, &args);
-    if (!options) return 1;
+    auto graph = build_graph(
+        *outer_graph, tc, out_dir, *root, prebuilt_modules);
+    if (!graph) {
+        std::println(std::cerr, "bake: {}", graph.error());
+        return 1;
+    }
 
-    auto plan = create_convention_plan(*manifest, layout, tc, *options,
-                                        dep_sources, dep_include_dirs,
-                                        /*compile_path_deps=*/true,
-                                        prebuilt_modules,
-                                        *package_requirements);
+    // Inject static libc++ for BakeSelf.
+    inject_static_libcxx(*graph, tc, prebuilt_modules);
 
-    // Inject static libc++ for BakeSelf (replaces -stdlib=libc++)
-    inject_static_libcxx(plan, tc, prebuilt_modules);
+    // Write graph.json and compile_commands.json.
+    write_graph_json(*graph, bake_dir / "graph.json");
+    write_compile_commands(*graph, *root / "compile_commands.json");
 
-    // Write compile_commands.json
-    write_compile_commands(plan, *root / "compile_commands.json");
-
-    // Get job count
+    // Execute.
     int jobs = 0;
-    if (auto j = args.get_option("j")) {
-        jobs = std::atoi(j->c_str());
+    if (auto j = args.get_option("j")) jobs = std::atoi(j->c_str());
+
+    int result = execute_graph(*graph, jobs);
+    if (result == 0 && manifest->is_workspace()) {
+        std::println("    Finished workspace {}", label);
     }
-
-    return execute_plan(plan, jobs);
+    return result;
 }
-
-// ===== clean command =====
 
 export int cmd_clean(const ParsedArgs& args) {
     auto root = find_project_root();
@@ -2058,35 +1306,69 @@ export int cmd_run(const ParsedArgs& args) {
         return 1;
     }
 
-    // Workspace: find the executable member's output in out/bin/
-    if (manifest->is_workspace()) {
-        auto layout = Layout::detect(*root);
-        for (auto& member : manifest->workspace->members) {
-            auto member_manifest = Manifest::load(*root / member);
-            if (!member_manifest || !member_manifest->has_package()) continue;
-            if (member_manifest->package->type == PackageType::Executable) {
-                // Check -p flag
-                if (auto p = args.get_option("p")) {
-                    if (*p != member_manifest->package->name) continue;
-                }
-                std::string exe_name = library_name(
-                    member_manifest->package->name, PackageType::Executable);
-                exe_path = layout.bin_dir / exe_name;
-                break;
-            }
-        }
-    } else if (manifest->has_package()) {
-        // Single package: convention mode
-        auto layout = Layout::detect(*root);
+    auto selected_member = resolve_workspace_member_selection(
+        *manifest, args.get_option("p"));
+    if (!selected_member) {
+        std::println(std::cerr, "bake: {}", selected_member.error());
+        return 1;
+    }
 
-        if (manifest->package->type != PackageType::Executable) {
-            std::println(std::cerr, "bake: cannot run non-executable package");
+    BuildSelection selection;
+    selection.workspace_member = std::move(*selected_member);
+    ResolvePolicy policy;
+    policy.locked = args.has_option("locked") || args.has_option("frozen");
+    policy.offline = args.has_option("offline") || args.has_option("frozen");
+    auto outer_graph = resolve_moid_graph(*manifest, selection, policy);
+    if (!outer_graph) {
+        std::println(std::cerr, "bake: {}", outer_graph.error());
+        return 1;
+    }
+
+    std::vector<MoidDeclaration> executables;
+    const Path out_dir = *root / "out";
+    for (const auto& id : outer_graph->roots) {
+        auto declaration = read_moid_declaration(
+            moid_declaration_path(out_dir, id.value));
+        if (!declaration) {
+            std::println(std::cerr, "bake: {}", declaration.error());
             return 1;
         }
-
-        std::string exe_name = library_name(manifest->package->name, PackageType::Executable);
-        exe_path = layout.bin_dir / exe_name;
+        if (declaration->id != id.value) {
+            std::println(
+                std::cerr,
+                "bake: persisted declaration identity does not match selected moid '{}'",
+                id.value);
+            return 1;
+        }
+        if (declaration->type == MoidType::Executable)
+            executables.push_back(std::move(*declaration));
     }
+
+    if (executables.empty()) {
+        std::println(std::cerr, "bake: cannot run non-executable package");
+        return 1;
+    }
+    std::sort(executables.begin(), executables.end(),
+              [](const auto& left, const auto& right) {
+                  return left.id < right.id;
+              });
+    if (executables.size() > 1) {
+        std::string candidates;
+        for (const auto& declaration : executables) {
+            if (!candidates.empty()) candidates += ", ";
+            candidates += declaration.id + " (" + declaration.name + ")";
+        }
+        std::println(
+            std::cerr,
+            "bake: multiple executable packages selected; use -p <member> "
+            "to choose one: {}",
+            candidates);
+        return 1;
+    }
+
+    const auto& executable = executables.front();
+    exe_path = out_dir / "bin" /
+        library_name(executable.name, executable.type);
 
     if (!exe_path.exists()) {
         std::println(std::cerr, "bake: built executable not found at {}", exe_path.string());
@@ -2235,174 +1517,51 @@ export int cmd_update(const ParsedArgs& args) {
 
     Path lock_path = *root / "bake.lock";
 
-    // Load existing lock for comparison / preservation
+    // Load existing lock for comparison
     auto old_lock = Lockfile::load(lock_path);
 
+    // Full re-resolve: the lock is flat, so we always resolve the full closure.
     Resolver resolver;
+    auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
+    if (!new_lock) {
+        std::println(std::cerr, "bake: failed to resolve dependencies");
+        return 1;
+    }
+
+    // Report changes for the filtered dep (or all if no filter)
+    auto report_change = [&](const std::string& name) {
+        // Find old and new lock entries by URL+ref match
+        const auto& dep = manifest->dependencies.at(name);
+        const LockDep* old_entry = old_lock
+            ? old_lock->find_remote(dep.url, dep.tag) : nullptr;
+        const LockDep* new_entry = new_lock->find_remote(dep.url, dep.tag);
+
+        if (!old_entry && new_entry) {
+            std::println("bake: {} added", name);
+        } else if (old_entry && new_entry) {
+            if (old_entry->commit != new_entry->commit) {
+                std::println("bake: {} updated: {} → {}",
+                            name, old_entry->commit.substr(0, 12),
+                            new_entry->commit.substr(0, 12));
+            } else {
+                std::println("bake: {} unchanged ({})", name,
+                            new_entry->commit.substr(0, 12));
+            }
+        }
+    };
 
     if (filter_dep.empty()) {
-        // Full re-resolve (existing behavior)
-        auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
-        if (!new_lock) {
-            std::println(std::cerr, "bake: failed to resolve dependencies");
-            return 1;
-        }
-
-        // Report changes
-        if (old_lock) {
-            for (auto& [name, node_id] : new_lock->root_deps) {
-                auto old_it = old_lock->root_deps.find(name);
-                if (old_it != old_lock->root_deps.end()) {
-                    auto& old_node = old_lock->nodes[old_it->second];
-                    auto& new_node = new_lock->nodes[node_id];
-                    if (old_node.commit != new_node.commit) {
-                        std::println("bake: {} updated: {} → {}",
-                                    name, old_node.commit.substr(0, 12),
-                                    new_node.commit.substr(0, 12));
-                    }
-                } else {
-                    std::println("bake: {} added", name);
-                }
-            }
-        }
-
-        if (!new_lock->save(lock_path)) {
-            std::println(std::cerr, "bake: failed to write bake.lock");
-            return 1;
+        for (auto& [name, dep] : manifest->dependencies) {
+            if (dep.is_path_dep) continue;
+            report_change(name);
         }
     } else {
-        // Single-dep update: resolve the dep AND its transitive closure,
-        // then prune old transitive nodes and merge new ones.
-        //
-        // If the old lock is missing or corrupt, we can't safely do a
-        // partial update (we'd lose other root deps). Fall back to full resolve.
-        if (!old_lock || !old_lock->is_consistent(*manifest)) {
-            std::println("bake: lock missing or stale, doing full re-resolve");
-            auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
-            if (!new_lock) {
-                std::println(std::cerr, "bake: failed to resolve dependencies");
-                return 1;
-            }
-            if (!new_lock->save(lock_path)) {
-                std::println(std::cerr, "bake: failed to write bake.lock");
-                return 1;
-            }
-            std::println("bake: lock file updated");
-            return 0;
-        }
+        report_change(filter_dep);
+    }
 
-        auto& dep = manifest->dependencies[filter_dep];
-
-        // Resolve dep + full transitive subtree
-        auto subtree = resolver.resolve_subtree(dep, filter_dep);
-        if (!subtree) {
-            std::println(std::cerr, "bake: failed to resolve '{}'", filter_dep);
-            return 1;
-        }
-
-        // Report change
-        if (old_lock) {
-            auto old_it = old_lock->root_deps.find(filter_dep);
-            if (old_it != old_lock->root_deps.end()) {
-                auto& old_node = old_lock->nodes[old_it->second];
-                auto& new_node = subtree->nodes[subtree->root_deps[filter_dep]];
-                if (old_node.commit != new_node.commit) {
-                    std::println("bake: {} updated: {} → {}",
-                                filter_dep, old_node.commit.substr(0, 12),
-                                new_node.commit.substr(0, 12));
-                } else {
-                    std::println("bake: {} unchanged ({})", filter_dep,
-                                new_node.commit.substr(0, 12));
-                }
-            } else {
-                std::println("bake: {} added", filter_dep);
-            }
-        }
-
-        // Build the merged lock:
-        // 1. Start with a fresh lockfile
-        // 2. Copy all old root_deps except the updated one
-        // 3. Copy all old nodes except those exclusively reachable from the old dep
-        // 4. Add all new nodes from the subtree
-        Lockfile new_lock;
-
-        // Find the old node ID for the updated dep
-        std::string old_node_id;
-        if (old_lock) {
-            auto old_it = old_lock->root_deps.find(filter_dep);
-            if (old_it != old_lock->root_deps.end()) {
-                old_node_id = old_it->second;
-            }
-        }
-
-        // Compute set of nodes reachable from old_node_id (the old subtree)
-        std::set<std::string> old_subtree_nodes;
-        if (!old_node_id.empty() && old_lock) {
-            std::vector<std::string> queue = {old_node_id};
-            while (!queue.empty()) {
-                std::string nid = queue.back();
-                queue.pop_back();
-                if (old_subtree_nodes.count(nid)) continue;
-                old_subtree_nodes.insert(nid);
-                auto n_it = old_lock->nodes.find(nid);
-                if (n_it != old_lock->nodes.end()) {
-                    for (auto& child : n_it->second.dependencies) {
-                        queue.push_back(child);
-                    }
-                }
-            }
-        }
-
-        // Compute set of nodes reachable from OTHER root deps (keep these)
-        std::set<std::string> keep_nodes;
-        if (old_lock) {
-            for (auto& [name, nid] : old_lock->root_deps) {
-                if (name == filter_dep) continue;
-                std::vector<std::string> queue = {nid};
-                while (!queue.empty()) {
-                    std::string id = queue.back();
-                    queue.pop_back();
-                    if (keep_nodes.count(id)) continue;
-                    keep_nodes.insert(id);
-                    auto n_it = old_lock->nodes.find(id);
-                    if (n_it != old_lock->nodes.end()) {
-                        for (auto& child : n_it->second.dependencies) {
-                            queue.push_back(child);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Copy old root_deps (except the updated dep)
-        if (old_lock) {
-            for (auto& [name, nid] : old_lock->root_deps) {
-                if (name == filter_dep) continue;
-                new_lock.root_deps[name] = nid;
-            }
-        }
-
-        // Copy old nodes that are NOT exclusively in the old subtree
-        if (old_lock) {
-            for (auto& [id, node] : old_lock->nodes) {
-                // Keep if not in old subtree, or if also reachable from other deps
-                if (old_subtree_nodes.count(id) && !keep_nodes.count(id)) {
-                    continue; // Prune stale transitive node
-                }
-                new_lock.nodes[id] = node;
-            }
-        }
-
-        // Add all new nodes from the subtree
-        for (auto& [id, node] : subtree->nodes) {
-            new_lock.nodes[id] = node;
-        }
-        new_lock.root_deps[filter_dep] = subtree->root_deps[filter_dep];
-
-        if (!new_lock.save(lock_path)) {
-            std::println(std::cerr, "bake: failed to write bake.lock");
-            return 1;
-        }
+    if (!new_lock->save(lock_path)) {
+        std::println(std::cerr, "bake: failed to write bake.lock");
+        return 1;
     }
 
     std::println("bake: lock file updated");

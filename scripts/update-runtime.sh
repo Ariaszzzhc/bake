@@ -30,7 +30,8 @@ fi
 if [[ "${1:-}" == "--clean" ]]; then
   echo "==> Removing runtime source"
   rm -rf "$ROOT/lib/libcxx" "$ROOT/lib/libcxxabi" \
-         "$ROOT/lib/libunwind" "$ROOT/lib/compiler-rt"
+         "$ROOT/lib/libunwind" "$ROOT/lib/compiler-rt" \
+         "$ROOT/lib/include"
 fi
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -191,11 +192,29 @@ for arch in arm avr hexagon i386 loongarch macho_embedded ppc riscv ve wasm x86_
 done
 
 # ═══════════════════════════════════════════════════════════════════════
+# Clang builtin headers (stdarg.h, stddef.h, intrinsics, etc.)
+# ═══════════════════════════════════════════════════════════════════════
+echo "==> Updating clang builtin headers"
+rm -rf "$ROOT/lib/include"
+mkdir -p "$ROOT/lib/include"
+
+# Source: the installed clang resource directory.
+CLANG_VER_DIR=$(ls -d "$LLVM_INSTALL/lib/clang/"*/ 2>/dev/null | head -1)
+if [ -z "$CLANG_VER_DIR" ]; then
+  echo "error: cannot find clang resource dir under $LLVM_INSTALL/lib/clang/"
+  exit 1
+fi
+cp -R "${CLANG_VER_DIR}include/"* "$ROOT/lib/include/"
+
+# Clean up stale lib/clang/ if it exists from a previous layout.
+rm -rf "$ROOT/lib/clang"
+
+# ═══════════════════════════════════════════════════════════════════════
 # Summary
 # ═══════════════════════════════════════════════════════════════════════
 echo ""
 echo "==> Done. Updated runtime source:"
-for d in libc/libc/darwin libcxx libcxxabi libunwind compiler-rt; do
+for d in libc/darwin libcxx libcxxabi libunwind compiler-rt include; do
   if [ -d "$ROOT/lib/$d" ]; then
     printf "    %-30s %s\n" "$d" "$(du -sh "$ROOT/lib/$d" | cut -f1)"
   fi

@@ -81,10 +81,10 @@ bake/                     workspace root
 ## Manifest Format (bake.toml)
 
 ```toml
-[package]
+[moid]
 name = "myapp"
 version = "0.1.0"
-type = "executable"          # or "static-lib", "shared-lib"
+type = "executable"          # or "lib", "dylib"
 std = "c++23"                # c++17 | c++20 | c++23
 
 [dependencies]

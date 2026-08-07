@@ -1,8 +1,9 @@
-[package]
+[moid]
 name = "bake"
 version = "0.1.0"
 type = "executable"
 std = "c++23"
 
 [dependencies]
-core = { path = "../core" }
+tomlplusplus = { path = "../third_party/tomlplusplus" }
+nlohmann_json = { path = "../third_party/nlohmann" }

@@ -1,9 +1,0 @@
-[package]
-name = "core"
-version = "0.1.0"
-type = "shared-lib"
-std = "c++23"
-
-[dependencies]
-tomlplusplus = { path = "../third_party/tomlplusplus" }
-nlohmann_json = { path = "../third_party/nlohmann" }

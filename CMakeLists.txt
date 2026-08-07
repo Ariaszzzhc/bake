@@ -65,45 +65,40 @@ add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json INTERFACE
     ${CMAKE_SOURCE_DIR}/third_party/nlohmann/public)
 
-# ---- core (shared library: compiler + engine + package + C ABI) ----
+# ---- bake (single executable: CLI + compiler + engine + package) ----
 
-add_library(core SHARED
-    core/src/cabi/api.cpp
-    core/src/compiler/bake_llvm.cpp
-    core/src/compiler/bake_clang_driver.cpp
-    core/src/compiler/bake_clang_cc1_main.cpp
+add_executable(bake
+    bake/src/main.cpp
+    bake/src/compiler/bake_llvm.cpp
+    bake/src/compiler/bake_clang_driver.cpp
+    bake/src/compiler/bake_clang_cc1_main.cpp
 )
 
-target_sources(core
+target_sources(bake
     PUBLIC
         FILE_SET CXX_MODULES
         FILES
             third_party/nlohmann/public/nlohmann.json.cppm
             third_party/tomlplusplus/public/tomlplusplus.cppm
-            core/src/bake.util.cppm
-            core/src/bake.project.cppm
-            core/src/bake.compiler.cppm
-            core/src/bake.engine.cppm
-            core/src/bake.package.cppm
+            bake/src/bake.util.cppm
+            bake/src/bake.project.cppm
+            bake/src/bake.moid.cppm
+            bake/src/bake.graph.cppm
+            bake/src/bake.compiler.cppm
+            bake/src/bake.engine.cppm
+            bake/src/bake.package.cppm
+            bake/src/cli.cppm
 )
 
-set_target_properties(core PROPERTIES OUTPUT_NAME "bake")
-
-# Use @rpath in install_name so the binary works from any location
-# (build tree, install tree, or packaged distribution).
-if(APPLE)
-    set_target_properties(core PROPERTIES
-        BUILD_INSTALL_NAME_DIR "@rpath"
-        INSTALL_NAME_DIR "@rpath"
-    )
-endif()
+target_compile_features(bake PRIVATE cxx_std_23)
+set_target_properties(bake PROPERTIES CXX_MODULE_STD ON ENABLE_EXPORTS ON)
 
 # Static linking against all LLVM/Clang/LLD libraries.
 file(GLOB BAKE_LLVM_STATIC_LIBS  "${LLVM_PREFIX}/lib/libLLVM*.a")
 file(GLOB BAKE_CLANG_STATIC_LIBS "${LLVM_PREFIX}/lib/libclang*.a")
 file(GLOB BAKE_LLD_STATIC_LIBS   "${LLVM_PREFIX}/lib/liblld*.a")
 
-target_link_libraries(core PRIVATE
+target_link_libraries(bake PRIVATE
     tomlplusplus nlohmann_json
     ${BAKE_CLANG_STATIC_LIBS}
     ${BAKE_LLD_STATIC_LIBS}
@@ -118,31 +113,23 @@ find_library(ZLIB_STATIC_LIB NAMES libz.a
 find_library(ZSTD_STATIC_LIB NAMES libzstd.a
   PATHS ${CMAKE_SOURCE_DIR}/external/zstd-install/lib
   NO_DEFAULT_PATH REQUIRED)
-target_link_libraries(core PRIVATE ${ZLIB_STATIC_LIB} ${ZSTD_STATIC_LIB})
+target_link_libraries(bake PRIVATE ${ZLIB_STATIC_LIB} ${ZSTD_STATIC_LIB})
 
 # dead_strip removes unreferenced code from the final binary.
 if(APPLE)
-    target_link_options(core PRIVATE -Wl,-dead_strip)
+    target_link_options(bake PRIVATE -Wl,-dead_strip)
 endif()
-target_include_directories(core PRIVATE
+
+target_include_directories(bake PRIVATE
     ${LLVM_INCLUDE_DIRS}
     ${CLANG_INCLUDE_DIRS}
     ${LLD_INCLUDE_DIRS}
     ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus/public
     ${CMAKE_SOURCE_DIR}/third_party/nlohmann/public
-    ${CMAKE_SOURCE_DIR}/core/src/cabi
 )
-target_compile_definitions(core PRIVATE
+target_compile_definitions(bake PRIVATE
     BAKE_VERSION="${PROJECT_VERSION}"
 )
-
-# On Windows, core exports symbols; consumers import them.
-if(WIN32)
-    target_compile_definitions(core PRIVATE BAKE_BUILDING_DLL)
-endif()
-
-target_compile_features(core PRIVATE cxx_std_23)
-set_target_properties(core PROPERTIES CXX_MODULE_STD ON)
 
 # LLVM headers expect -fno-rtti (LLVM is built with RTTI disabled).
 # Apply only to the LLVM-interfacing C++ source files that instantiate
@@ -150,51 +137,33 @@ set_target_properties(core PROPERTIES CXX_MODULE_STD ON)
 # bake_clang_driver.cpp is excluded: it imports bake.util (which has RTTI
 # enabled), and doesn't use typeid/dynamic_cast on LLVM types.
 set_property(SOURCE
-    core/src/compiler/bake_llvm.cpp
-    core/src/compiler/bake_clang_cc1_main.cpp
+    bake/src/compiler/bake_llvm.cpp
+    bake/src/compiler/bake_clang_cc1_main.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
 
-# ---- bake (executable: CLI + main) ----
-
-add_executable(bake bake/src/main.cpp)
-target_link_libraries(bake PRIVATE core)
-target_compile_features(bake PRIVATE cxx_std_23)
-set_target_properties(bake PROPERTIES CXX_MODULE_STD ON)
-
-target_sources(bake
-    PUBLIC
-        FILE_SET CXX_MODULES
-        FILES
-            bake/src/cli.cppm
-)
-
-# Platform-specific runtime library search path
-# Include both bake's build dir and the self-built LLVM lib dir.
+# Runtime library search path — only self-built LLVM lib dir needed
+# (bake is now a single statically-linked executable, no libbake.dylib).
 if(APPLE)
     set_target_properties(bake PROPERTIES
-        BUILD_RPATH "${CMAKE_BINARY_DIR};${LLVM_PREFIX}/lib"
+        BUILD_RPATH "${LLVM_PREFIX}/lib"
         INSTALL_RPATH "@loader_path/../lib"
     )
 elseif(UNIX)
     set_target_properties(bake PROPERTIES
-        BUILD_RPATH "${CMAKE_BINARY_DIR};${LLVM_PREFIX}/lib"
+        BUILD_RPATH "${LLVM_PREFIX}/lib"
         INSTALL_RPATH "$ORIGIN/../lib"
     )
 endif()
-# Windows: no RPATH concept — DLLs found via PATH or same directory as EXE
 
 # ---- Installation ----
 
 include(GNUInstallDirs)
-install(TARGETS bake core
+install(TARGETS bake
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
 )
 install(FILES
-    core/public/bake.build.cppm
-    core/src/cabi/bake_cabi.h
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/bake
+    lib/bake/bake.build.cppm
+    DESTINATION lib/bake
 )
 
 # ---- Tests ----
@@ -208,6 +177,26 @@ target_compile_definitions(test_runner PRIVATE
     BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
 )
 
+add_executable(graph_test tests/graph_test.cpp)
+target_link_libraries(graph_test PRIVATE tomlplusplus nlohmann_json)
+target_compile_features(graph_test PRIVATE cxx_std_23)
+set_target_properties(graph_test PROPERTIES CXX_MODULE_STD ON)
+
+# graph_test imports bake.graph + bake.moid (and their transitive deps).
+# Provide these as module sources directly — they are pure data structures
+# with no LLVM linkage, so no static libs needed.
+target_sources(graph_test
+    PUBLIC
+        FILE_SET CXX_MODULES
+        FILES
+            third_party/nlohmann/public/nlohmann.json.cppm
+            third_party/tomlplusplus/public/tomlplusplus.cppm
+            bake/src/bake.util.cppm
+            bake/src/bake.project.cppm
+            bake/src/bake.moid.cppm
+            bake/src/bake.graph.cppm
+)
+
 add_test(
     NAME bake_test_suite
     COMMAND test_runner $<TARGET_FILE:bake>
@@ -216,3 +205,5 @@ add_test(
 set_tests_properties(bake_test_suite PROPERTIES
     ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
 )
+
+add_test(NAME graph_test COMMAND graph_test)

@@ -1,4 +1,5 @@
-[package]
+[moid]
 name = "nlohmann_json"
 version = "3.12.0"
-type = "static-lib"
+type = "lib"
+std = "c++23"
