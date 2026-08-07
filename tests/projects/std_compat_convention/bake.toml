@@ -1,4 +1,4 @@
-[package]
+[moid]
 name = "std-compat-convention"
 version = "0.1.0"
 type = "executable"

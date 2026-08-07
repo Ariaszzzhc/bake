@@ -1,0 +1,7 @@
+[moid]
+name = "app"
+version = "0.1.0"
+type = "executable"
+
+[dependencies]
+tool = { path = "../tool" }

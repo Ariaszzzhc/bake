@@ -1,0 +1,4 @@
+[moid]
+name = "declaration-reader-validation"
+version = "0.1.0"
+std = "c++23"

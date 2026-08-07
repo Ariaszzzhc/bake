@@ -1,0 +1,7 @@
+[moid]
+name = "archive"
+version = "0.1.0"
+type = "lib"
+
+[dependencies]
+base = { path = "../base" }

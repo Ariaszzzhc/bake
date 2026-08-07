@@ -1,0 +1,7 @@
+[moid]
+name = "modlib"
+version = "0.1.0"
+type = "lib"
+std = "c++23"
+
+[dependencies]

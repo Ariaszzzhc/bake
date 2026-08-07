@@ -8,11 +8,11 @@ int main() {
         std::println(std::cerr, "base: unsupported tls backend '{}'", tls);
         return 1;
     }
-    auto& upstream = b.dependency("upstream");
-    b.static_lib("base")
-        .sources(upstream, "src/*.cpp")
-        .include_dirs(upstream, "include")
-        .private_define(tls == "wolfssl" ? "BASE_VALUE=41" : "BASE_VALUE=42")
+    std::string upstream{b.dep_src_dir("upstream")};
+    b.lib("base")
+        .sources(upstream + "/src/*.cpp")
+        .include_dirs(upstream + "/include")
+        .define(tls == "wolfssl" ? "BASE_VALUE=41" : "BASE_VALUE=42")
         .std("c++23");
     return b.build();
 }

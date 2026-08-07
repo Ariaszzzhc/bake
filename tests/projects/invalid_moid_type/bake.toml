@@ -1,0 +1,5 @@
+[moid]
+name = "invalid-moid-type"
+version = "0.1.0"
+type = "static-lib"
+std = "c++23"

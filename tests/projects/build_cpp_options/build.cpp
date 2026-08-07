@@ -4,8 +4,7 @@ import std;
 int main() {
     bake::Builder b;
 
-    const char* configured_backend = b.option_str("backend");
-    const std::string backend = configured_backend ? configured_backend : "";
+    const std::string backend{b.option_str("backend")};
     if (backend != "portable" && backend != "native") {
         std::println(std::cerr,
                      "option-app: backend must be 'portable' or 'native', got '{}'",
@@ -24,9 +23,9 @@ int main() {
             "src/left/value.c",
             "src/right/value.c",
         })
-        .private_define("SELECTED_BACKEND", backend_define.c_str())
-        .private_define("DIAGNOSTICS_ENABLED", diagnostics_define.c_str())
-        .private_define("OPTION_LEVEL", level_define.c_str())
+        .define("SELECTED_BACKEND", backend_define)
+        .define("DIAGNOSTICS_ENABLED", diagnostics_define)
+        .define("OPTION_LEVEL", level_define)
         .std("c17");
 
     return b.build();

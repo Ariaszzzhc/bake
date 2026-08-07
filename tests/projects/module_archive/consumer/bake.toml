@@ -1,0 +1,8 @@
+[moid]
+name = "consumer"
+version = "0.1.0"
+type = "executable"
+std = "c++23"
+
+[dependencies]
+modlib = { path = "../modlib" }
