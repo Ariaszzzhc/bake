@@ -49,7 +49,7 @@ cmake --install "$BUILD_ZSTD" --strip
 rm -rf "$BUILD_ZSTD"
 
 # ── LLVM/Clang/LLD ───────────────────────────────────────────────────
-echo "==> Configuring LLVM (AArch64, clang+lld, Release)"
+echo "==> Configuring LLVM (AArch64+X86, clang+lld, Release)"
 cmake -G Ninja -S "$SRC_LLVM/llvm" -B "$BUILD_LLVM" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$INSTALL_LLVM" \
@@ -60,7 +60,7 @@ cmake -G Ninja -S "$SRC_LLVM/llvm" -B "$BUILD_LLVM" \
   -Dzstd_INCLUDE_DIR="$INSTALL_ZSTD/include" \
   -Dzstd_LIBRARY="$INSTALL_ZSTD/lib/libzstd.a" \
   -DLLVM_ENABLE_PROJECTS="clang;lld" \
-  -DLLVM_TARGETS_TO_BUILD="AArch64" \
+  -DLLVM_TARGETS_TO_BUILD="AArch64;X86" \
   -DLLVM_ENABLE_ASSERTIONS=OFF \
   -DLLVM_ENABLE_ZLIB=ON \
   -DLLVM_ENABLE_ZSTD=ON \
