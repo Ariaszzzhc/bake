@@ -1072,8 +1072,37 @@ std::expected<void, std::string> configure_moid_graph(
 
         MoidDeclaration declaration;
         if ((moid_dir / "build.cpp").is_regular_file()) {
-            declaration = compile_and_run_build_cpp(
-                moid_dir, *manifest, node, tc, prebuilt_modules, out_dir);
+            // Fast path: reuse cached declaration if inputs haven't changed.
+            Path decl_path = moid_declaration_path(out_dir, node.id.value);
+            bool cache_hit = false;
+            if (decl_path.is_regular_file()) {
+                namespace fs = std::filesystem;
+                auto decl_time = fs::last_write_time(decl_path.fs());
+                auto inputs_older = [&]() {
+                    Path cpp = moid_dir / "build.cpp";
+                    if (fs::last_write_time(cpp.fs()) > decl_time) return false;
+                    Path toml = moid_dir / "bake.toml";
+                    if (toml.is_regular_file() &&
+                        fs::last_write_time(toml.fs()) > decl_time) return false;
+                    Path wrapper = find_bake_build_source();
+                    if (!wrapper.string().empty() && wrapper.is_regular_file() &&
+                        fs::last_write_time(wrapper.fs()) > decl_time) return false;
+                    return true;
+                };
+                if (inputs_older()) {
+                    if (auto cached = read_moid_declaration(decl_path)) {
+                        auto v = validate_resolved_declaration(*cached, node);
+                        if (v) {
+                            declaration = std::move(*cached);
+                            cache_hit = true;
+                        }
+                    }
+                }
+            }
+            if (!cache_hit) {
+                declaration = compile_and_run_build_cpp(
+                    moid_dir, *manifest, node, tc, prebuilt_modules, out_dir);
+            }
         } else {
             auto layout = Layout::detect(moid_dir, project_root);
             auto declaration_path = persist_convention_declaration(

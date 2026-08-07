@@ -66,6 +66,9 @@ export inline std::string compute_tree_sha256(const Path& dir) {
     std::vector<std::pair<std::string, std::string>> entries;
 
     for (auto& entry : std::filesystem::recursive_directory_iterator(dir.fs())) {
+        // Skip bake-internal sentinel files — they are not part of the source.
+        if (entry.path().filename() == ".bake-verified") continue;
+
         // Use lexically_relative instead of filesystem::relative.
         // filesystem::relative() resolves symlinks, so a symlink and its
         // target would hash identically. lexically_relative() does a pure
@@ -143,6 +146,10 @@ inline std::string repo_name_from_url(const std::string& url) {
 // Verify that cached source for every remote lock entry matches its integrity.
 // Detects tampering with cached dependencies. Called by the CLI layer.
 // Silent on cache miss (caller handles messaging); prints only on tamper.
+//
+// A `.bake-verified` sentinel is written inside each cache dir after a
+// successful full-tree verification. Subsequent calls compare the sentinel
+// to the expected hash and skip the expensive tree walk when they match.
 export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache_dir) {
     for (auto& [key, dep] : lockfile.deps) {
         if (!dep.is_remote()) continue;
@@ -152,6 +159,15 @@ export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache
         Path cache_path = cache_dir / hash;
         if (!cache_path.is_directory()) return false;
 
+        // Fast path: sentinel exists and matches expected hash.
+        Path sentinel = cache_path / ".bake-verified";
+        if (sentinel.is_regular_file()) {
+            if (auto content = read_file(sentinel)) {
+                if (*content == hash) continue;
+            }
+        }
+
+        // Slow path: full tree SHA-256.
         std::string actual_hash = compute_tree_sha256(cache_path);
         if (actual_hash != hash) {
             std::println(std::cerr,
@@ -160,6 +176,8 @@ export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache
                 actual_hash.substr(0, 12));
             return false;
         }
+
+        write_file(sentinel, hash);
     }
     return true;
 }

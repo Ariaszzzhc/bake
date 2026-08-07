@@ -343,6 +343,12 @@ static Path generate_standard_module_source(
         const Path& cache_dir,
         std::string_view module_name,
         std::string_view placeholder) {
+    Path result = cache_dir / (std::string(module_name) + ".cppm");
+
+    // Skip regeneration if the output already exists — the vendored .inc
+    // files never change between bake invocations.
+    if (result.is_regular_file()) return result;
+
     Path modules_dir = find_lib_dir() / "libcxx" / "modules";
     Path cppm_in = modules_dir / (std::string(module_name) + ".cppm.in");
     if (!cppm_in.is_regular_file()) return Path();
@@ -370,7 +376,6 @@ static Path generate_standard_module_source(
     cppm.replace(pos, placeholder.size(), inc_sources);
 
     // Write to cache
-    Path result = cache_dir / (std::string(module_name) + ".cppm");
     if (!write_file(result, cppm)) return Path();
 
     return result;
@@ -378,7 +383,21 @@ static Path generate_standard_module_source(
 
 // Capture compiler identity + version + target triple as a stable string.
 // Centralised so all toolchain cache keys share the same identity base.
+// Cached to a file so we avoid spawning the compiler on every invocation.
 static std::string compiler_identity_block(const Toolchain& tc) {
+    namespace fs = std::filesystem;
+
+    // File cache: reuse if the compiler binary hasn't changed.
+    Path identity_cache = get_toolchain_cache_root() / ".compiler-identity";
+    Path compiler_bin(tc.cxx_path);
+    if (identity_cache.is_regular_file() && compiler_bin.is_regular_file()) {
+        if (fs::last_write_time(compiler_bin.fs()) <=
+            fs::last_write_time(identity_cache.fs())) {
+            if (auto cached = read_file(identity_cache))
+                return *cached;
+        }
+    }
+
     auto prefix = cxx_prefix(tc);
 
     auto ver_args = prefix;
@@ -389,10 +408,13 @@ static std::string compiler_identity_block(const Toolchain& tc) {
     triple_args.push_back("-dumpmachine");
     auto triple = run_process(triple_args, Path(), true);
 
-    return tc.cxx_path + "\n" +
-           ver.stdout_output + "\n" +
-           ver.stderr_output + "\n" +
-           triple.stdout_output + "\n";
+    std::string block = tc.cxx_path + "\n" +
+                        ver.stdout_output + "\n" +
+                        ver.stderr_output + "\n" +
+                        triple.stdout_output + "\n";
+
+    write_file(identity_cache, block);
+    return block;
 }
 
 // Content-addressed cache key + directory for std/std.compat PCMs.

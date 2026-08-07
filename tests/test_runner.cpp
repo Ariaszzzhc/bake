@@ -541,8 +541,9 @@ TestResult test_declaration_convention_boundary() {
     CHECK_EQ(count_occurrences(caller, "persist_convention_declaration("),
              std::size_t(1),
              "the convention configuration path must receive only a declaration path");
-    CHECK_EQ(count_occurrences(caller, "read_moid_declaration("), std::size_t(1),
-             "the convention configuration path must read its persisted declaration");
+    CHECK_EQ(count_occurrences(caller, "read_moid_declaration("), std::size_t(2),
+             "the convention configuration path must read its persisted declaration"
+             " (1 convention + 1 build.cpp cache)");
     CHECK_EQ(count_occurrences(caller, "convention_declare("), std::size_t(0),
              "convention callers must not bypass the persisted declaration reader");
     return {};
