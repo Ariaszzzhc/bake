@@ -197,6 +197,13 @@ bake uses cargo-style progress output:
 
 When nothing changed: just `   Building X` + `    Finished in 0.03s`. Per-file `[n/total] <path>` progress is behind `-v` / `--verbose`.
 
+## Commit Messages
+
+- **Conventional commits** — use `feat:`, `fix:`, `refactor:`, `chore:`, `docs:`, `test:`, `perf:` prefixes.
+- **Subject only, no body** — keep it to a single line ≤ 50 characters. Only add a body if the subject genuinely can't capture the change.
+- **Describe what changed, not why** — internal discussion, review feedback, and phase/iteration numbers don't belong in commit messages.
+- **Examples**: `feat: in-process LLVM/Clang/LLD compiler`, `fix: skip std flags for C files in workspace`, `refactor: unify output layout to out/bin/lib/obj`.
+
 ## Key Constraints
 
 - **Do NOT remove CMakeLists.txt** — it is the permanent Stage 0 bootstrap, not a temporary scaffold.
