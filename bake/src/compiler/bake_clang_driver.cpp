@@ -597,39 +597,44 @@ static int clang_main(int Argc, const char **Argv,
     // Map to arch-os dir name (x86_64 → "x86", aarch64 → "aarch64")
     std::string arch_os_dir = (arch == "x86_64") ? "x86" : arch.str();
 
-    // 1. Per-arch musl bits (alltypes.h, syscall.h, signal.h, ...)
+    if (IsCxx && !lib.empty()) {
+      // Cross-compile __config_site (musl-specific values).
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(
+          (lib + "/libcxx/cross-config").c_str()).data());
+      // libc++ headers (C++ wrappers must shadow C library).
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(
+          (lib + "/libcxx/include").c_str()).data());
+    }
+    // Clang builtin headers (stdarg.h, stddef.h).
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save((lib + "/include").c_str()).data());
+    }
+    // Per-arch musl bits (alltypes.h, syscall.h, signal.h, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/" + target_triple).c_str()).data());
     }
-    // 2. Generic musl public headers (stdio.h, stdlib.h, ...)
+    // Generic musl public headers (stdio.h, stdlib.h, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/generic-musl").c_str()).data());
     }
-    // 3. Per-arch kernel UAPI asm (asm/types.h, asm/unistd.h, ...)
+    // Per-arch kernel UAPI asm (asm/types.h, asm/unistd.h, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/" + arch_os_dir + "-linux-any").c_str()).data());
     }
-    // 4. Common kernel UAPI (linux/*, asm-generic/*, drm/*, ...)
+    // Common kernel UAPI (linux/*, asm-generic/*, drm/*, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/any-linux-any").c_str()).data());
-    }
-    // 5. Clang builtin headers (stdarg.h, stddef.h)
-    if (!lib.empty()) {
-      Args.push_back(Saver.save("-isystem").data());
-      Args.push_back(Saver.save((lib + "/include").c_str()).data());
-    }
-    // 6. libc++ headers (C++ only)
-    if (IsCxx && !lib.empty()) {
-      Args.push_back(Saver.save("-isystem").data());
-      Args.push_back(Saver.save((lib + "/libcxx/include").c_str()).data());
     }
   }
 #ifdef __APPLE__

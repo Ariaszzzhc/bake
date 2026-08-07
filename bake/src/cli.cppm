@@ -1058,6 +1058,243 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     return result_a;
 }
 
+// ===== Cross-compile C++ runtime (libc++ + libc++abi + libunwind) =====
+//
+// Compiles the C++ runtime from vendored LLVM sources for the linux-musl
+// target. Produces three archives: libc++abi.a, libc++.a, libunwind.a.
+// Cache: ~/.cache/bake/libcxx-objects/<triple>/
+// Approach mirrors Zig's libcxx.zig + libunwind.zig.
+
+struct CrossLibcxx {
+    Path libcxx_a;
+    Path libcxxabi_a;
+    Path libunwind_a;
+};
+
+// libunwind source lists (same for every target — #ifdef guards arch).
+static const char* libunwind_c_files[] = {
+    "UnwindLevel1.c", "UnwindLevel1-gcc-ext.c",
+    "Unwind-sjlj.c", "Unwind-wasm.c", "gcc_personality_v0.c",
+};
+static const char* libunwind_cpp_files[] = {
+    "libunwind.cpp", "Unwind-EHABI.cpp", "Unwind-seh.cpp",
+};
+static const char* libunwind_asm_files[] = {
+    "UnwindRegistersRestore.S", "UnwindRegistersSave.S",
+};
+
+export CrossLibcxx ensure_cross_libcxx(const Toolchain& tc) {
+    CrossLibcxx result;
+    if (!tc.target.is_linux_musl()) return result;
+
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return result;
+
+    Path cache_dir = get_cache_dir().parent() / "libcxx-objects" / tc.target.triple();
+    Path sentinel  = cache_dir / ".libcxx-done";
+
+    result.libcxx_a     = cache_dir / "libc++.a";
+    result.libcxxabi_a  = cache_dir / "libc++abi.a";
+    result.libunwind_a  = cache_dir / "libunwind.a";
+
+    if (sentinel.is_regular_file() &&
+        result.libcxx_a.is_regular_file() &&
+        result.libcxxabi_a.is_regular_file() &&
+        result.libunwind_a.is_regular_file())
+        return result;
+
+    cache_dir.mkdir_recursive();
+    std::println("   Compiling libc++ + libc++abi + libunwind for {} (cached)",
+                 tc.target.triple());
+
+    auto libcxxabi_inc = lib.string() + "/libcxxabi/include";
+    auto libcxx_src    = lib.string() + "/libcxx/src";
+    auto libcxxabi_src = lib.string() + "/libcxxabi/src";
+    auto libcxx_libc   = lib.string() + "/libcxx/libc";  // shared/fp_bits.h etc.
+    auto libunwind_inc = lib.string() + "/libunwind/include";
+    auto libunwind_src = lib.string() + "/libunwind/src";
+
+    auto compile_file = [&](const std::vector<std::string>& flags,
+                            const std::string& dir,
+                            const std::string& filename,
+                            const std::string& prefix) -> Path {
+        std::string stem = filename.substr(0, filename.rfind('.'));
+        for (auto& c : stem) if (c == '/') c = '_';
+        Path obj = cache_dir / (prefix + "__" + stem + ".o");
+        if (obj.is_regular_file()) return obj;
+
+        std::vector<std::string> cmd = flags;
+        cmd.push_back(dir + "/" + filename);
+        cmd.push_back("-o");
+        cmd.push_back(obj.string());
+
+        auto r = run_process(cmd, Path(), true);
+        if (!r.success()) {
+            std::print(std::cerr, "{}", r.stderr_output);
+            std::println(std::cerr, "bake: failed to compile {}:{}", prefix, filename);
+            return Path();
+        }
+        return obj;
+    };
+
+    auto archive = [&](const Path& ar_path, const std::vector<Path>& objs) {
+        std::vector<std::string> cmd = {tc.ar_path, "rcs", ar_path.string()};
+        for (auto& o : objs) cmd.push_back(o.string());
+        run_process(cmd, Path(), true);
+    };
+
+    int total = 0;
+
+    // ── libunwind ──
+    {
+        std::vector<Path> objs;
+
+        // .c files: -std=c99 -fexceptions
+        for (auto* f : libunwind_c_files) {
+            std::vector<std::string> flags;
+            flags.push_back(tc.exe_path);
+            flags.push_back("cc");
+            flags.push_back("-target");
+            flags.push_back(tc.target.triple());
+            flags.push_back("-c");
+            flags.push_back("-std=c99");
+            flags.push_back("-I" + libunwind_inc);
+            flags.push_back("-D_LIBUNWIND_HIDE_SYMBOLS");
+            flags.push_back("-D_LIBUNWIND_IS_NATIVE_ONLY");
+            flags.push_back("-fvisibility=hidden");
+            flags.push_back("-fPIC");
+            flags.push_back("-Os");
+            flags.push_back("-w");
+            auto obj = compile_file(flags, libunwind_src, f, "unwind");
+            if (obj.string().empty()) return result;
+            objs.push_back(obj);
+            ++total;
+        }
+        // .cpp files: -fno-exceptions -fno-rtti
+        for (auto* f : libunwind_cpp_files) {
+            std::vector<std::string> flags;
+            flags.push_back(tc.exe_path);
+            flags.push_back("c++");
+            flags.push_back("-target");
+            flags.push_back(tc.target.triple());
+            flags.push_back("-c");
+            flags.push_back("-std=c++23");
+            flags.push_back("-fno-exceptions");
+            flags.push_back("-fno-rtti");
+            flags.push_back("-I" + libunwind_inc);
+            flags.push_back("-D_LIBUNWIND_HIDE_SYMBOLS");
+            flags.push_back("-D_LIBUNWIND_IS_NATIVE_ONLY");
+            flags.push_back("-fvisibility=hidden");
+            flags.push_back("-fvisibility-inlines-hidden");
+            flags.push_back("-fPIC");
+            flags.push_back("-Os");
+            flags.push_back("-w");
+            auto obj = compile_file(flags, libunwind_src, f, "unwind");
+            if (obj.string().empty()) return result;
+            objs.push_back(obj);
+            ++total;
+        }
+        // .S files: assembly, no special flags
+        for (auto* f : libunwind_asm_files) {
+            std::vector<std::string> flags;
+            flags.push_back(tc.exe_path);
+            flags.push_back("cc");
+            flags.push_back("-target");
+            flags.push_back(tc.target.triple());
+            flags.push_back("-c");
+            flags.push_back("-I" + libunwind_inc);
+            flags.push_back("-w");
+            auto obj = compile_file(flags, libunwind_src, f, "unwind");
+            if (obj.string().empty()) return result;
+            objs.push_back(obj);
+            ++total;
+        }
+        archive(result.libunwind_a, objs);
+    }
+
+    // ── libc++abi ──
+    {
+        std::vector<std::string> flags;
+        for (auto& a : cxx_prefix(tc)) flags.push_back(a);
+        flags.push_back("-target");
+        flags.push_back(tc.target.triple());
+        flags.push_back("-c");
+        flags.push_back("-std=c++23");
+        flags.push_back("-DNDEBUG");
+        flags.push_back("-I" + libcxxabi_inc);
+        flags.push_back("-I" + libcxx_src);
+        flags.push_back("-I" + libcxx_libc);
+        flags.push_back("-fPIC");
+        flags.push_back("-Os");
+        flags.push_back("-D_LIBCPP_BUILDING_LIBRARY");
+        flags.push_back("-DLIBCXX_BUILDING_LIBCXXABI");
+        flags.push_back("-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS");
+        flags.push_back("-fvisibility=hidden");
+        flags.push_back("-fvisibility-inlines-hidden");
+        flags.push_back("-faligned-allocation");
+        flags.push_back("-D_LIBCXXABI_BUILDING_LIBRARY");
+
+        std::vector<Path> objs;
+        for (auto* f : libcxxabi_files) {
+            std::string fname(f);
+            if (fname == "cxa_noexception.cpp") continue;  // WASI only
+            auto obj = compile_file(flags, libcxxabi_src, fname, "libcxxabi");
+            if (obj.string().empty()) return result;
+            objs.push_back(obj);
+            ++total;
+        }
+        archive(result.libcxxabi_a, objs);
+    }
+
+    // ── libc++ ──
+    {
+        std::vector<std::string> flags;
+        for (auto& a : cxx_prefix(tc)) flags.push_back(a);
+        flags.push_back("-target");
+        flags.push_back(tc.target.triple());
+        flags.push_back("-c");
+        flags.push_back("-std=c++23");
+        flags.push_back("-DNDEBUG");
+        flags.push_back("-I" + libcxxabi_inc);
+        flags.push_back("-I" + libcxx_src);
+        flags.push_back("-I" + libcxx_libc);
+        flags.push_back("-fPIC");
+        flags.push_back("-Os");
+        flags.push_back("-D_LIBCPP_BUILDING_LIBRARY");
+        flags.push_back("-DLIBCXX_BUILDING_LIBCXXABI");
+        flags.push_back("-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS");
+        flags.push_back("-fvisibility=hidden");
+        flags.push_back("-fvisibility-inlines-hidden");
+        flags.push_back("-faligned-allocation");
+
+        std::vector<Path> objs;
+        std::set<std::string> compiled;
+        for (auto* f : libcxx_base_files) {
+            std::string fname(f);
+            // Skip int128_builtins.cpp — conflicts with compiler-rt __muloti4.
+            if (fname == "filesystem/int128_builtins.cpp") continue;
+            auto obj = compile_file(flags, libcxx_src, fname, "libcxx");
+            if (obj.string().empty()) return result;
+            objs.push_back(obj);
+            compiled.insert(fname);
+            ++total;
+        }
+        for (auto* f : libcxx_thread_files) {
+            std::string fname(f);
+            if (compiled.count(fname)) continue;
+            auto obj = compile_file(flags, libcxx_src, fname, "libcxx");
+            if (obj.string().empty()) return result;
+            objs.push_back(obj);
+            ++total;
+        }
+        archive(result.libcxx_a, objs);
+    }
+
+    std::println("   Compiled {} sources for {}", total, tc.target.triple());
+    write_file(sentinel, "");
+    return result;
+}
+
 // ===== Cross-compile link injection =====
 //
 // Injects crt1.o + libc.a + compiler-rt into link actions for linux-musl.
@@ -1071,13 +1308,33 @@ void inject_cross_objects(BuildGraph& graph, const Toolchain& tc) {
 
     auto compiler_rt = ensure_compiler_rt_objects(tc);
 
+    // Cross-compile C++ runtime (only built if any C++ link action exists).
+    CrossLibcxx cross_cxx;
+    bool need_cxx = false;
+    for (auto& action : graph.actions) {
+        if (action.type != BuildAction::Type::Link) continue;
+        for (auto& arg : action.command)
+            if (arg == "c++") { need_cxx = true; break; }
+        if (need_cxx) break;
+    }
+    if (need_cxx) {
+        cross_cxx = ensure_cross_libcxx(tc);
+    }
+
     for (auto& action : graph.actions) {
         if (action.type != BuildAction::Type::Link) continue;
 
+        // Detect C++ link action.
+        bool is_cxx = false;
+        for (auto& arg : action.command)
+            if (arg == "c++") { is_cxx = true; break; }
+
         // Link order (Zig model):
-        // crt1.o → user objects → [archives] → libc.a → compiler-rt
-        // We insert crt1.o at the front (after the driver args),
-        // and libc.a at the end (before -o).
+        // crt1.o → user objects → [archives] → libcxxabi → libc++ → libunwind
+        //   → libc.a → compiler-rt
+        //
+        // LLD resolves circular references (libc ↔ libunwind ↔ compiler-rt)
+        // automatically in static linking — no --start-group needed.
 
         // Find the position after driver args (bake c++ or bake cc).
         size_t insert_pos = 0;
@@ -1103,17 +1360,28 @@ void inject_cross_objects(BuildGraph& graph, const Toolchain& tc) {
         action.command.insert(action.command.begin() + insert_pos,
                               musl.crt1_o.string());
 
-        // Append libc.a + compiler-rt before "-o".
+        // Append runtime libraries before "-o".
+        // Order: C++ archives → libc.a → compiler-rt
+        // LLD resolves circular references automatically (no --start-group needed).
         auto o_it = std::find(action.command.begin(), action.command.end(),
                               "-o");
+
+        std::vector<std::string> runtime_libs;
+        if (is_cxx && !cross_cxx.libcxxabi_a.string().empty()) {
+            runtime_libs.push_back(cross_cxx.libcxxabi_a.string());
+            runtime_libs.push_back(cross_cxx.libcxx_a.string());
+            runtime_libs.push_back(cross_cxx.libunwind_a.string());
+        }
+        runtime_libs.push_back(musl.libc_a.string());
+        if (!compiler_rt.string().empty())
+            runtime_libs.push_back(compiler_rt.string());
+
         if (o_it != action.command.end()) {
-            action.command.insert(o_it, musl.libc_a.string());
-            if (!compiler_rt.string().empty())
-                action.command.insert(o_it, compiler_rt.string());
+            action.command.insert(o_it, runtime_libs.begin(),
+                                  runtime_libs.end());
         } else {
-            action.command.push_back(musl.libc_a.string());
-            if (!compiler_rt.string().empty())
-                action.command.push_back(compiler_rt.string());
+            for (auto& lib : runtime_libs)
+                action.command.push_back(lib);
         }
     }
 }
@@ -1616,7 +1884,8 @@ export int cmd_build(const ParsedArgs& args) {
     std::println("   Building {}", label);
 
     // build.cpp compilation needs the std PCM to compile bake.build.cppm.
-    // Skip for cross-compile targets — C++ cross-compilation is future work.
+    // For cross-compile, the std PCM is not yet built — convention-mode
+    // C++ with #include headers works fine without it.
     ModuleFileMap prebuilt_modules;
     if (tc.target.is_native())
         prebuilt_modules = ensure_std_modules(tc, out_dir);
