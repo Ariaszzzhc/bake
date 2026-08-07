@@ -419,7 +419,9 @@ std::optional<std::string> validate_terminal_relative_path(
         return std::nullopt;
     const auto parent = relative.parent_path().generic_string();
     const auto filename = relative.filename().generic_string();
-    if ((parent != "bin" && parent != "lib") || filename.empty() ||
+    if ((parent != "bin" && parent != "lib" &&
+         !parent.starts_with("bin-") && !parent.starts_with("lib-")) ||
+        filename.empty() ||
         filename == "." || filename == "..") {
         return std::nullopt;
     }
@@ -536,8 +538,14 @@ export std::expected<BuildGraph, std::string> build_graph(
 
     (out_dir / ".obj").mkdir_recursive();
     (out_dir / ".bmi").mkdir_recursive();
-    (out_dir / "bin").mkdir_recursive();
-    (out_dir / "lib").mkdir_recursive();
+
+    // Output subdirectory: "bin" for native, "bin-<triple>" for cross-compile.
+    std::string bin_subdir = tc.target.is_native()
+        ? "bin" : "bin-" + tc.target.triple();
+    std::string lib_subdir = tc.target.is_native()
+        ? "lib" : "lib-" + tc.target.triple();
+    (out_dir / bin_subdir).mkdir_recursive();
+    (out_dir / lib_subdir).mkdir_recursive();
     graph.state_dir.mkdir_recursive();
 
     struct TerminalClaim {
@@ -682,8 +690,8 @@ export std::expected<BuildGraph, std::string> build_graph(
 
             std::string out_name = library_name(decl.name, rm.type);
             rm.output = (rm.type == MoidType::Executable)
-                ? out_dir / "bin" / out_name
-                : out_dir / "lib" / out_name;
+                ? out_dir / bin_subdir / out_name
+                : out_dir / lib_subdir / out_name;
 
             auto relative_output = terminal_relative_path(out_dir, rm.output);
             if (!relative_output) {
@@ -1359,13 +1367,9 @@ export std::expected<BuildGraph, std::string> build_graph(
             link.frameworks = requirements.frameworks;
             action.command = make_link_command(tc, link);
 
-            // Inject -stdlib=libc++ when std module is in use.
-            if (rm.uses_cxx && prebuilt_modules.contains("std") &&
-                tc.is_clang() && tc.kind != CompilerKind::BakeSelf) {
-                auto prefix_len = cxx_prefix(tc).size();
-                action.command.insert(action.command.begin() + prefix_len,
-                                      "-stdlib=libc++");
-            }
+            // Inject -stdlib=libc++ when std module is in use (non-BakeSelf path
+            // removed — bake always uses its own driver which handles this).
+            // No-op: make_compile_command already adds -stdlib=libc++ when needed.
 
             exports.terminal = terminal;
             exports.link.objects.clear();

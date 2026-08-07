@@ -627,8 +627,6 @@ static const char* libcxxabi_files[] = {
 // Approach mirrors Zig's libcxx.zig: curated file lists, specific defines,
 // libcxx/src as include path for internal headers.
 export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
-    if (!tc.is_clang()) return {};
-
     Path lib = find_lib_dir();
     if (lib.string().empty()) return {};
 
@@ -754,6 +752,372 @@ export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
     return objs;
 }
 
+// ===== musl compilation (crt objects + libc.a) =====
+//
+// Compiles musl from vendored source into a per-target sysroot cache.
+// Cache: ~/.cache/bake/musl-objects/<target-key>/
+// Pattern mirrors ensure_libcxx_objects() + Zig's musl.zig.
+
+struct MuslObjects {
+    Path crt1_o;     // static link entry
+    Path libc_a;     // static libc
+};
+
+// Determine if a musl source file should be compiled for the target arch.
+// Rules:
+// 1. Files inside src/<dir>/<arch>/ are only compiled for that arch.
+// 2. Generic files in src/<dir>/ are compiled unless an arch override exists.
+// 3. .s/.S assembly files follow the same rules.
+static bool should_compile_musl_source(
+        const Path& src_root, const Path& file,
+        std::string_view arch) {
+    auto rel = std::filesystem::relative(file.fs(), src_root.fs());
+    if (rel.empty()) return false;
+    auto generic = rel.lexically_normal().generic_string();
+
+    // Check if the path contains an arch-specific directory.
+    // e.g. src/fenv/x86_64/fenv.c → arch-specific
+    std::string arch_token = "/" + std::string(arch) + "/";
+    auto arch_pos = generic.find(arch_token);
+    if (arch_pos != std::string::npos) return true;  // our arch → compile
+
+    // Check for other arch directories.
+    static const std::vector<std::string> all_archs = {
+        "aarch64", "arm", "i386", "x86_64", "riscv64", "riscv32",
+        "mips", "mips64", "mipsn32", "powerpc", "powerpc64",
+        "s390x", "sh", "x32", "loongarch64", "m68k", "microblaze", "or1k"
+    };
+    for (const auto& a : all_archs) {
+        if (a == arch) continue;
+        if (generic.find("/" + a + "/") != std::string::npos)
+            return false;  // another arch's file → skip
+    }
+
+    // Generic file: skip only if an arch-specific override exists (.c, .s, or .S).
+    auto slash = generic.rfind('/');
+    if (slash == std::string::npos) return true;
+    std::string dir = generic.substr(0, slash);
+    std::string base = generic.substr(slash + 1);
+    auto dot = base.rfind('.');
+    std::string stem = (dot != std::string::npos) ? base.substr(0, dot) : base;
+
+    for (auto ext : {".c", ".s", ".S"}) {
+        Path override_path = src_root / dir / std::string(arch) / (stem + ext);
+        if (override_path.is_regular_file()) return false;
+    }
+
+    return true;
+}
+
+export MuslObjects ensure_musl_objects(const Toolchain& tc) {
+    MuslObjects result;
+    if (!tc.target.is_linux_musl()) return result;
+
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return result;
+
+    Path musl_src = lib / "libc" / "musl";
+    std::string arch = tc.target.musl_arch_dir();
+
+    // Global cache: ~/.cache/bake/musl-objects/<triple>/
+    Path cache_root = get_cache_dir().parent() / "musl-objects";
+    Path cache_dir = cache_root / tc.target.triple();
+
+    // Check sentinel — already built?
+    Path sentinel = cache_dir / ".done";
+    if (sentinel.is_regular_file()) {
+        result.crt1_o = cache_dir / "crt1.o";
+        result.libc_a = cache_dir / "libc.a";
+        if (result.crt1_o.is_regular_file() && result.libc_a.is_regular_file())
+            return result;
+    }
+
+    cache_dir.mkdir_recursive();
+    std::println("   Compiling musl for {} (cached)", tc.target.triple());
+
+    // Generate version.h (normally created by musl's configure).
+    write_file(cache_dir / "version.h",
+               "#define VERSION \"" + std::string("1.2.5") + "\"\n");
+
+    // Build musl compilation flags.
+    auto make_flags = [&]() {
+        std::vector<std::string> flags;
+        flags.push_back(tc.exe_path);
+        flags.push_back("cc");
+        flags.push_back("-target");
+        flags.push_back(tc.target.triple());
+        flags.push_back("-c");
+        flags.push_back("-std=c99");
+        flags.push_back("-ffreestanding");
+        flags.push_back("-fexcess-precision=standard");
+        flags.push_back("-frounding-math");
+        flags.push_back("-ffp-contract=off");
+        flags.push_back("-fno-strict-aliasing");
+        flags.push_back("-Wa,--noexecstack");
+        flags.push_back("-D_XOPEN_SOURCE=700");
+        flags.push_back("-Os");
+        flags.push_back("-w");  // silence warnings
+        // musl internal include paths (highest priority via -I)
+        flags.push_back("-I" + (musl_src / "arch" / arch).string());
+        flags.push_back("-I" + (musl_src / "arch" / "generic").string());
+        flags.push_back("-I" + (musl_src / "src" / "include").string());
+        flags.push_back("-I" + (musl_src / "src" / "internal").string());
+        flags.push_back("-I" + cache_dir.string());  // for generated version.h
+        flags.push_back("-I" + (musl_src / "include").string());
+        return flags;
+    };
+
+    auto base_flags = make_flags();
+    auto flags_03 = base_flags;
+    // Hot-path sources get -O3 instead of -Os.
+    std::replace(flags_03.begin(), flags_03.end(), std::string("-Os"),
+                 std::string("-O3"));
+
+    auto is_hot_path = [](const std::string& rel) {
+        return rel.find("malloc/") != std::string::npos ||
+               rel.find("string/") != std::string::npos ||
+               rel.find("internal/") != std::string::npos;
+    };
+
+    // ── Compile crt1.o ──
+    Path crt1_c = musl_src / "crt" / "crt1.c";
+    result.crt1_o = cache_dir / "crt1.o";
+    if (!result.crt1_o.is_regular_file()) {
+        auto cmd = base_flags;
+        cmd.push_back("-DCRT");
+        cmd.push_back(crt1_c.string());
+        cmd.push_back("-o");
+        cmd.push_back(result.crt1_o.string());
+        auto r = run_process(cmd, Path(), true);
+        if (!r.success()) {
+            std::print(std::cerr, "{}", r.stderr_output);
+            std::println(std::cerr, "bake: failed to compile crt1.c");
+            return result;
+        }
+    }
+
+    // ── Compile libc.a ──
+    result.libc_a = cache_dir / "libc.a";
+
+    // Collect .c, .s, .S source files from src/ recursively.
+    namespace fs = std::filesystem;
+    std::vector<Path> sources;
+    for (auto& entry : fs::recursive_directory_iterator((musl_src / "src").fs())) {
+        auto ext = entry.path().extension().string();
+        if (ext == ".c" || ext == ".s" || ext == ".S") {
+            Path f(entry.path());
+            if (should_compile_musl_source(musl_src / "src", f, arch))
+                sources.push_back(std::move(f));
+        }
+    }
+    std::sort(sources.begin(), sources.end());
+
+    std::vector<Path> obj_files;
+    int compiled = 0;
+    for (const auto& src : sources) {
+        auto rel = fs::relative(src.fs(), (musl_src / "src").fs());
+        std::string stem = rel.lexically_normal().generic_string();
+        for (auto& c : stem) if (c == '/') c = '_';
+        stem = stem.substr(0, stem.rfind('.'));  // remove extension
+        Path obj = cache_dir / (stem + ".o");
+
+        if (!obj.is_regular_file()) {
+            auto rel_str = rel.lexically_normal().generic_string();
+            auto& flags = is_hot_path(rel_str) ? flags_03 : base_flags;
+            auto cmd = flags;
+            cmd.push_back(src.string());
+            cmd.push_back("-o");
+            cmd.push_back(obj.string());
+            auto r = run_process(cmd, Path(), true);
+            if (!r.success()) {
+                std::print(std::cerr, "{}", r.stderr_output);
+                std::println(std::cerr, "bake: failed to compile {}", rel_str);
+                return result;
+            }
+            ++compiled;
+        }
+        obj_files.push_back(obj);
+    }
+
+    // Archive into libc.a
+    if (!obj_files.empty()) {
+        std::vector<std::string> ar_cmd;
+        ar_cmd.push_back(tc.ar_path);
+        ar_cmd.push_back("rcs");
+        ar_cmd.push_back(result.libc_a.string());
+        for (auto& o : obj_files)
+            ar_cmd.push_back(o.string());
+        auto r = run_process(ar_cmd, Path(), true);
+        if (!r.success()) {
+            std::println(std::cerr, "bake: failed to create libc.a");
+            return result;
+        }
+    }
+
+    std::println("   Compiled {} musl sources", compiled);
+    write_file(sentinel, "");
+
+    return result;
+}
+
+// ===== compiler-rt builtins for cross-compilation =====
+//
+// Compiles generic + arch-specific compiler-rt builtins for the target.
+// Needed for soft-float helpers (__multf3, __eqtf2, etc.) on aarch64.
+// Cache: ~/.cache/bake/musl-objects/<triple>/compiler-rt.a
+
+export Path ensure_compiler_rt_objects(const Toolchain& tc) {
+    if (!tc.target.is_linux_musl()) return Path();
+
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return Path();
+
+    Path builtins_dir = lib / "compiler-rt" / "lib" / "builtins";
+    Path cache_dir = get_cache_dir().parent() / "musl-objects" / tc.target.triple();
+    Path result_a = cache_dir / "libcompiler_rt.a";
+    Path sentinel = cache_dir / ".compiler-rt-done";
+
+    if (sentinel.is_regular_file() && result_a.is_regular_file())
+        return result_a;
+
+    std::string arch = tc.target.musl_arch_dir();
+
+    // Compile flags for builtins.
+    auto make_flags = [&]() {
+        std::vector<std::string> flags;
+        flags.push_back(tc.exe_path);
+        flags.push_back("cc");
+        flags.push_back("-target");
+        flags.push_back(tc.target.triple());
+        flags.push_back("-c");
+        flags.push_back("-ffreestanding");
+        flags.push_back("-Os");
+        flags.push_back("-w");
+        flags.push_back("-fPIC");
+        flags.push_back("-I" + builtins_dir.string());
+        return flags;
+    };
+    auto base_flags = make_flags();
+
+    namespace fs = std::filesystem;
+    std::vector<Path> obj_files;
+
+    // Compile generic .c files in builtins root.
+    for (auto& entry : fs::directory_iterator(builtins_dir.fs())) {
+        if (entry.path().extension() != ".c") continue;
+        Path src(entry.path());
+        Path obj = cache_dir / ("crt__" + src.filename().string() + ".o");
+        if (!obj.is_regular_file()) {
+            auto cmd = base_flags;
+            cmd.push_back(src.string());
+            cmd.push_back("-o");
+            cmd.push_back(obj.string());
+            auto r = run_process(cmd, Path(), true);
+            if (!r.success()) {
+                // Some builtins may fail for the target — skip silently.
+                continue;
+            }
+        }
+        obj_files.push_back(obj);
+    }
+
+    // Compile arch-specific .c files (if the arch directory exists).
+    Path arch_dir = builtins_dir / arch;
+    if (arch_dir.is_directory()) {
+        for (auto& entry : fs::recursive_directory_iterator(arch_dir.fs())) {
+            if (entry.path().extension() != ".c") continue;
+            Path src(entry.path());
+            auto rel = fs::relative(src.fs(), arch_dir.fs());
+            std::string stem = rel.lexically_normal().generic_string();
+            for (auto& c : stem) if (c == '/') c = '_';
+            stem = stem.substr(0, stem.rfind('.'));
+            Path obj = cache_dir / ("crt__" + arch + "__" + stem + ".o");
+            if (!obj.is_regular_file()) {
+                auto cmd = base_flags;
+                cmd.push_back(src.string());
+                cmd.push_back("-o");
+                cmd.push_back(obj.string());
+                auto r = run_process(cmd, Path(), true);
+                if (!r.success()) continue;
+            }
+            obj_files.push_back(obj);
+        }
+    }
+
+    // Archive into libcompiler_rt.a
+    if (!obj_files.empty()) {
+        std::vector<std::string> ar_cmd;
+        ar_cmd.push_back(tc.ar_path);
+        ar_cmd.push_back("rcs");
+        ar_cmd.push_back(result_a.string());
+        for (auto& o : obj_files) ar_cmd.push_back(o.string());
+        run_process(ar_cmd, Path(), true);
+    }
+
+    write_file(sentinel, "");
+    return result_a;
+}
+
+// ===== Cross-compile link injection =====
+//
+// Injects crt1.o + libc.a + compiler-rt into link actions for linux-musl.
+// Analogous to inject_static_libcxx() for the native case.
+
+void inject_cross_objects(BuildGraph& graph, const Toolchain& tc) {
+    if (!tc.target.is_linux_musl()) return;
+
+    auto musl = ensure_musl_objects(tc);
+    if (musl.libc_a.string().empty()) return;
+
+    auto compiler_rt = ensure_compiler_rt_objects(tc);
+
+    for (auto& action : graph.actions) {
+        if (action.type != BuildAction::Type::Link) continue;
+
+        // Link order (Zig model):
+        // crt1.o → user objects → [archives] → libc.a → compiler-rt
+        // We insert crt1.o at the front (after the driver args),
+        // and libc.a at the end (before -o).
+
+        // Find the position after driver args (bake c++ or bake cc).
+        size_t insert_pos = 0;
+        for (size_t i = 0; i < action.command.size(); ++i) {
+            if (action.command[i] == "c++" || action.command[i] == "cc") {
+                insert_pos = i + 1;
+                break;
+            }
+        }
+        // Also skip -target flag pair if present
+        if (insert_pos + 1 < action.command.size() &&
+            action.command[insert_pos] == "-target") {
+            insert_pos += 2;
+        }
+
+        // -nostdlib -static: prevent default crt/libgcc, force static link.
+        action.command.insert(action.command.begin() + insert_pos,
+                              "-nostdlib");
+        action.command.insert(action.command.begin() + insert_pos,
+                              "-static");
+
+        // Insert crt1.o at the front.
+        action.command.insert(action.command.begin() + insert_pos,
+                              musl.crt1_o.string());
+
+        // Append libc.a + compiler-rt before "-o".
+        auto o_it = std::find(action.command.begin(), action.command.end(),
+                              "-o");
+        if (o_it != action.command.end()) {
+            action.command.insert(o_it, musl.libc_a.string());
+            if (!compiler_rt.string().empty())
+                action.command.insert(o_it, compiler_rt.string());
+        } else {
+            action.command.push_back(musl.libc_a.string());
+            if (!compiler_rt.string().empty())
+                action.command.push_back(compiler_rt.string());
+        }
+    }
+}
+
 // Inject statically-compiled libc++ + libc++abi objects into all C++ link
 // actions in a plan. Replaces dynamic -lc++ / libc++.1.dylib dependency.
 // For BakeSelf only: the in-process LLD has no system libc++.tbd.
@@ -761,7 +1125,6 @@ export std::vector<Path> ensure_libcxx_objects(const Toolchain& tc) {
 
 void inject_static_libcxx(BuildGraph& graph, const Toolchain& tc,
                            const ModuleFileMap& prebuilt_modules) {
-    if (tc.kind != CompilerKind::BakeSelf) return;
     auto it = prebuilt_modules.find("std");
     if (it == prebuilt_modules.end() || !it->second.is_regular_file()) return;
 
@@ -820,7 +1183,6 @@ MoidDeclaration compile_and_run_build_cpp(
 
     // Helper: append valid std-module file flags.
     auto append_std_flags = [&](std::vector<std::string>& cmd) {
-        if (!tc.is_clang()) return;
         for (auto& [name, pcm] : prebuilt_modules) {
             if (!pcm.string().empty() && pcm.is_regular_file())
                 cmd.push_back("-fmodule-file=" + name + "=" + pcm.string());
@@ -841,10 +1203,8 @@ MoidDeclaration compile_and_run_build_cpp(
         for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
-        if (tc.is_clang()) {
-            cmd.push_back("-stdlib=libc++");
-            cmd.push_back("-Wno-reserved-module-identifier");
-        }
+        cmd.push_back("-stdlib=libc++");
+        cmd.push_back("-Wno-reserved-module-identifier");
         cmd.push_back("-x");
         cmd.push_back("c++-module");
         cmd.push_back("-I" + build_cache_dir.string());
@@ -878,10 +1238,8 @@ MoidDeclaration compile_and_run_build_cpp(
         for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
-        if (tc.is_clang()) {
-            cmd.push_back("-stdlib=libc++");
-            cmd.push_back("-Wno-reserved-module-identifier");
-        }
+        cmd.push_back("-stdlib=libc++");
+        cmd.push_back("-Wno-reserved-module-identifier");
         cmd.push_back("-I" + build_cache_dir.string());
         append_std_flags(cmd);
         cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
@@ -902,13 +1260,11 @@ MoidDeclaration compile_and_run_build_cpp(
     {
         std::vector<std::string> cmd;
         for (auto& a : cxx_prefix(tc)) cmd.push_back(a);
-        if (tc.is_clang() && tc.kind != CompilerKind::BakeSelf)
-            cmd.push_back("-stdlib=libc++");
         cmd.push_back(wrapper_o.string());
         cmd.push_back(build_o.string());
 
-        // BakeSelf: inject static libc++ objects
-        if (tc.kind == CompilerKind::BakeSelf && prebuilt_modules.contains("std")) {
+        // Inject static libc++ objects
+        if (prebuilt_modules.contains("std")) {
             auto libcxx_objs = ensure_libcxx_objects(tc);
             if (!libcxx_objs.empty()) {
                 cmd.push_back("-nodefaultlibs");
@@ -1247,6 +1603,10 @@ export int cmd_build(const ParsedArgs& args) {
 
     auto tc = Toolchain::detect();
 
+    // Cross-compile target from --target=<triple>.
+    if (auto t = args.get_option("target"))
+        tc.target = parse_target(*t);
+
     const std::string label = manifest->is_workspace()
         ? root->filename_string().empty() ? root->string() : root->filename_string()
         : (manifest->has_moid()
@@ -1256,8 +1616,9 @@ export int cmd_build(const ParsedArgs& args) {
     std::println("   Building {}", label);
 
     // build.cpp compilation needs the std PCM to compile bake.build.cppm.
+    // Skip for cross-compile targets — C++ cross-compilation is future work.
     ModuleFileMap prebuilt_modules;
-    if (tc.is_clang())
+    if (tc.target.is_native())
         prebuilt_modules = ensure_std_modules(tc, out_dir);
 
     auto configured = configure_moid_graph(
@@ -1274,8 +1635,11 @@ export int cmd_build(const ParsedArgs& args) {
         return 1;
     }
 
-    // Inject static libc++ for BakeSelf.
-    inject_static_libcxx(*graph, tc, prebuilt_modules);
+    // Inject runtime objects: native → static libc++, cross → crt + libc.a.
+    if (tc.target.is_native())
+        inject_static_libcxx(*graph, tc, prebuilt_modules);
+    else
+        inject_cross_objects(*graph, tc);
 
     // Write graph.json and compile_commands.json.
     write_graph_json(*graph, bake_dir / "graph.json");

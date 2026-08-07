@@ -97,16 +97,9 @@ static const char *GetStableCStr(llvm::StringSet<> &SavedStrings, StringRef S) {
 extern int cc1_main(ArrayRef<const char *> Argv, const char *Argv0,
                     void *MainAddr);
 
-// cc1as_main (integrated assembler) is not linked from the shared Clang
-// library.  Provide a stub that reports the limitation so the symbol
-// resolves at link time without dragging in a full cc1as implementation.
-extern "C" int cc1as_main(ArrayRef<const char *> Argv, const char *Argv0,
-                          void *MainAddr);
+// cc1as_main is compiled from Clang's cc1as_main.cpp (as bake_clang_cc1as_main.cpp).
 int cc1as_main(ArrayRef<const char *> Argv, const char *Argv0,
-               void *MainAddr) {
-  llvm::errs() << "bake: integrated assembler (-cc1as) is not supported.\n";
-  return 1;
-}
+               void *MainAddr);
 
 static void insertTargetAndModeArgs(const ParsedClangName &NameParts,
                                     SmallVectorImpl<const char *> &ArgVector,
@@ -431,6 +424,9 @@ static int clang_main(int Argc, const char **Argv,
     return 1;
 
   llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmParsers();
+  llvm::InitializeAllAsmPrinters();
 
   llvm::BumpPtrAllocator A;
   llvm::StringSaver Saver(A);
@@ -561,75 +557,116 @@ static int clang_main(int Argc, const char **Argv,
     llvm::CrashRecoveryContext::Enable();
   }
 
-  // Use vendored headers instead of system SDK (macOS).
-  // -nostdinc disables ALL default include search; we re-add everything via -isystem.
-  // Search order is critical: libc++ headers must come first so their wrapper
-  // versions of stddef.h/stdlib.h are found before Clang builtins and C headers.
-#ifdef __APPLE__
-  Args.push_back(Saver.save("-nostdinc").data());
+  // ── Vendored header injection ──────────────────────────────────────
+  // bake uses -nostdinc to disable ALL default include search, then
+  // re-adds vendored headers via -isystem. The set of headers depends
+  // on whether we're compiling natively (darwin) or cross-compiling
+  // (e.g. linux-musl).
+  //
+  // Detect the target from -target flag in Args.
+  std::string target_triple;
+  for (size_t i = 0; i + 1 < Args.size(); ++i) {
+    if (StringRef(Args[i]) == "-target") {
+      target_triple = Args[i + 1];
+      break;
+    }
+  }
+
+  const std::string lib = bake::find_lib_dir().string();
+
+  bool is_cross_musl = !target_triple.empty() &&
+                       StringRef(target_triple).contains("linux") &&
+                       StringRef(target_triple).contains("musl");
+
   bool IsCxx = false;
   for (const char *A : Args) {
-    if (A && llvm::StringRef(A).contains("driver-mode=g++")) {
+    if (A && StringRef(A).contains("driver-mode=g++")) {
       IsCxx = true;
       break;
     }
   }
-  if (IsCxx)
-    Args.push_back(Saver.save("-nostdinc++").data());
-  // 1. libc++ headers (C++ wrappers that must shadow C builtins)
-  {
-    const std::string lib = bake::find_lib_dir().string();
+
+  if (is_cross_musl) {
+    // ── linux-musl cross-compilation headers ──
+    Args.push_back(Saver.save("-nostdinc").data());
+    if (IsCxx)
+      Args.push_back(Saver.save("-nostdinc++").data());
+
+    // Parse arch from triple (e.g. "x86_64-linux-musl" → "x86_64")
+    StringRef arch = StringRef(target_triple).split('-').first;
+    // Map to arch-os dir name (x86_64 → "x86", aarch64 → "aarch64")
+    std::string arch_os_dir = (arch == "x86_64") ? "x86" : arch.str();
+
+    // 1. Per-arch musl bits (alltypes.h, syscall.h, signal.h, ...)
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
-      Args.push_back(Saver.save((lib + "/libcxx/include").c_str()).data());
+      Args.push_back(Saver.save(
+        (lib + "/libc/include/" + target_triple).c_str()).data());
     }
-  }
-  // 2. Clang builtin headers (stdarg.h, stddef.h — vendored in lib/include/)
-  {
-    const std::string lib = bake::find_lib_dir().string();
+    // 2. Generic musl public headers (stdio.h, stdlib.h, ...)
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(
+        (lib + "/libc/include/generic-musl").c_str()).data());
+    }
+    // 3. Per-arch kernel UAPI asm (asm/types.h, asm/unistd.h, ...)
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(
+        (lib + "/libc/include/" + arch_os_dir + "-linux-any").c_str()).data());
+    }
+    // 4. Common kernel UAPI (linux/*, asm-generic/*, drm/*, ...)
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(
+        (lib + "/libc/include/any-linux-any").c_str()).data());
+    }
+    // 5. Clang builtin headers (stdarg.h, stddef.h)
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save((lib + "/include").c_str()).data());
     }
-  }
-  // 3. Darwin C library headers (stdio.h, stdlib.h, etc.)
-  {
-    const std::string lib = bake::find_lib_dir().string();
-    if (!lib.empty()) {
+    // 6. libc++ headers (C++ only)
+    if (IsCxx && !lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
-      Args.push_back(Saver.save((lib + "/libc/darwin/include").c_str()).data());
+      Args.push_back(Saver.save((lib + "/libcxx/include").c_str()).data());
     }
   }
-  // 4. macOS framework headers (CoreFoundation.h, AppKit.h, etc.)
-  //    Detected via xcrun — framework headers only exist in the SDK.
-  //    This does NOT affect libc++ or libSystem (those are vendored).
-  {
+#ifdef __APPLE__
+  else {
+    // ── Native darwin headers ──
+    Args.push_back(Saver.save("-nostdinc").data());
+    if (IsCxx)
+      Args.push_back(Saver.save("-nostdinc++").data());
+
+    // 1. libc++ headers (C++ wrappers that must shadow C builtins)
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save((lib + "/libcxx/include").c_str()).data());
+    }
+    // 2. Clang builtin headers
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save((lib + "/include").c_str()).data());
+    }
+    // 3. Darwin C library headers
+    if (!lib.empty()) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(
+        (lib + "/libc/darwin/include").c_str()).data());
+    }
+    // 4. macOS framework headers (from SDK)
     auto &sdk = getMacosSdkPath();
     if (!sdk.empty()) {
       Args.push_back(Saver.save("-iframework").data());
-      Args.push_back(Saver.save((sdk + "/System/Library/Frameworks").c_str()).data());
+      Args.push_back(Saver.save(
+        (sdk + "/System/Library/Frameworks").c_str()).data());
     }
-  }
-#endif
 
-  // Set deployment target to match the running macOS version.
-  // Without this, clang defaults to <major>.0.0 (truncated from the Darwin
-  // kernel version), causing LLD warnings when system dylibs are newer.
-  // Skip if the user already specified a deployment target.
-#ifdef __APPLE__
-  {
+    // Set deployment target to match running macOS version.
     const std::string& ver = getMacosVersion();
     if (!ver.empty()) {
-      bool has_target = false;
-      for (const char *A : Args) {
-        if (A && (llvm::StringRef(A).starts_with("-mmacosx-version-min") ||
-                  llvm::StringRef(A).starts_with("-target")))
-          has_target = true;
-      }
-      if (!has_target) {
-        Args.push_back(
-            Saver.save(("-mmacosx-version-min=" + ver).c_str()).data());
-      }
+      Args.push_back(Saver.save(("-mmacosx-version-min=" + ver).c_str()).data());
     }
   }
 #endif

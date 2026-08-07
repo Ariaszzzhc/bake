@@ -72,6 +72,7 @@ add_executable(bake
     bake/src/compiler/bake_llvm.cpp
     bake/src/compiler/bake_clang_driver.cpp
     bake/src/compiler/bake_clang_cc1_main.cpp
+    bake/src/compiler/bake_clang_cc1as_main.cpp
 )
 
 target_sources(bake
@@ -139,6 +140,7 @@ target_compile_definitions(bake PRIVATE
 set_property(SOURCE
     bake/src/compiler/bake_llvm.cpp
     bake/src/compiler/bake_clang_cc1_main.cpp
+    bake/src/compiler/bake_clang_cc1as_main.cpp
     APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
 
 # Runtime library search path — only self-built LLVM lib dir needed
