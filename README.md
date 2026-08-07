@@ -61,7 +61,7 @@ myapp/
 ```
 
 ```toml
-[moid]
+[package]
 name = "myapp"
 version = "0.1.0"
 ```

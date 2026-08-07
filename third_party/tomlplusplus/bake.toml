@@ -1,4 +1,4 @@
-[moid]
+[package]
 name = "tomlplusplus"
 version = "3.4.0"
 type = "lib"

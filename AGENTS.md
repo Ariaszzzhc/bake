@@ -122,7 +122,7 @@ Multi-package projects like Cargo. Each member is a separate package with its ow
 ## Manifest Format (bake.toml)
 
 ```toml
-[moid]
+[package]
 name = "myapp"
 version = "0.1.0"
 type = "executable"          # executable (default) | lib | dylib

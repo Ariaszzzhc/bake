@@ -1,4 +1,4 @@
-[moid]
+[package]
 name = "invalid-declaration-schema"
 version = "0.1.0"
 std = "c++23"

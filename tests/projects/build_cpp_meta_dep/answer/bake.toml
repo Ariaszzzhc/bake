@@ -1,4 +1,4 @@
-[moid]
+[package]
 name = "answer"
 version = "1.0.0"
 type = "lib"

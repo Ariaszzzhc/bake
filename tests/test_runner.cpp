@@ -1036,13 +1036,13 @@ TestResult test_moid_outputs() {
     auto module_dir = make_temp_dir("moid_outputs_private_modules");
     copy_fixture("moid_outputs", module_dir);
     write_file(module_dir / "base" / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"base\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
         "std = \"c++23\"\n");
     write_file(module_dir / "shared" / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"shared\"\n"
         "version = \"0.1.0\"\n"
         "type = \"dylib\"\n"
@@ -1050,7 +1050,7 @@ TestResult test_moid_outputs() {
         "[dependencies]\n"
         "archive = { path = \"../archive\" }\n");
     write_file(module_dir / "app" / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"app\"\n"
         "version = \"0.1.0\"\n"
         "std = \"c++23\"\n\n"
@@ -1132,7 +1132,7 @@ TestResult test_moid_outputs() {
 TestResult test_missing_path_dependency() {
     auto dir = make_temp_dir("missing_path_dependency");
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"missing-path-app\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -1170,7 +1170,7 @@ TestResult test_frozen_no_lock() {
 
     // Add a fake remote dependency
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"frozen-test\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n\n"
@@ -1194,7 +1194,7 @@ TestResult test_lock_consistency() {
 
     // Add a remote dependency to the manifest
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"lock-test\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n\n"
@@ -1352,7 +1352,7 @@ TestResult test_update_single_dep() {
 
     // This test requires network — just verify the CLI parses the arg.
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"update-test\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n\n"
@@ -1415,7 +1415,7 @@ TestResult test_add_duplicate_compact() {
 
     // Write bake.toml with compact TOML dependency (no spaces around =)
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"dup-test\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -1441,7 +1441,7 @@ TestResult test_lock_transitive_consistency() {
     copy_fixture("simple_app", dir);
 
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"trans-test\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n\n"
@@ -1478,7 +1478,7 @@ TestResult test_frozen_missing_cache() {
     copy_fixture("simple_app", dir);
 
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"cache-test\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n\n"
@@ -1545,14 +1545,14 @@ TestResult test_workspace_unified_output() {
         "[workspace]\n"
         "members = [\"a\", \"b\"]\n");
     write_file(conflict_dir / "a" / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"member-a\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n\n"
         "[dependencies]\n"
         "base = { path = \"../base\", options = { tls = \"mbedtls\" } }\n");
     write_file(conflict_dir / "b" / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"member-b\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n\n"
@@ -1648,7 +1648,7 @@ TestResult test_canonical_terminal_collision() {
     auto dir = make_temp_dir("canonical_terminal_collision");
     copy_fixture("same_moid_name", dir);
     write_file(dir / "right/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"duplicate\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -1670,7 +1670,7 @@ TestResult test_canonical_terminal_collision() {
 TestResult test_archive_rebuild_drops_removed_objects() {
     auto dir = make_temp_dir("archive_rebuild_drops_removed_objects");
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"fresh-archive\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -1702,7 +1702,7 @@ TestResult test_archive_failure_is_atomic() {
 #else
     auto dir = make_temp_dir("archive_failure_is_atomic");
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"atomic-archive\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -1768,7 +1768,7 @@ TestResult test_terminal_case_collision() {
     auto dir = make_temp_dir("terminal_case_collision");
     copy_fixture("same_moid_name", dir);
     write_file(dir / "right/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"DUPLICATE\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -1789,7 +1789,7 @@ TestResult test_terminal_case_collision() {
 TestResult test_terminal_output_escape() {
     auto write_project = [](const fs::path& dir, const std::string& name) {
         write_file(dir / "bake.toml",
-            "[moid]\n"
+            "[package]\n"
             "name = \"" + name + "\"\n"
             "version = \"0.1.0\"\n"
             "type = \"executable\"\n"
@@ -1868,7 +1868,7 @@ TestResult test_workspace_selection_identity() {
         "[workspace]\n"
         "members = [\"./chosen\", \"other\"]\n");
     write_file(dir / "chosen/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"path-target\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -1878,7 +1878,7 @@ TestResult test_workspace_selection_identity() {
     write_file(dir / "chosen/src/main.c",
         "int main(void) { return 0; }\n");
     write_file(dir / "other/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"chosen\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -1917,13 +1917,13 @@ TestResult test_workspace_selection_identity() {
               selected_graph);
 
     write_file(dir / "chosen/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"friendly\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
         "std = \"c17\"\n");
     write_file(dir / "other/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"friendly\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -1947,7 +1947,7 @@ TestResult test_workspace_duplicate_canonical_member() {
         "[workspace]\n"
         "members = [\"member\", \"./member\"]\n");
     write_file(dir / "member/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"duplicate-member\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -1973,14 +1973,14 @@ TestResult test_workspace_symlink_selector() {
         "[workspace]\n"
         "members = [\"real\", \"other\"]\n");
     write_file(dir / "real/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"real-app\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
         "std = \"c17\"\n");
     write_file(dir / "real/src/main.c", "int main(void) { return 0; }\n");
     write_file(dir / "other/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"other-lib\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -2017,7 +2017,7 @@ TestResult test_executable_dependency() {
     auto scripted = make_temp_dir("scripted_executable_dependency");
     copy_fixture("executable_dependency", scripted);
     write_file(scripted / "tool/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"tool\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -2059,7 +2059,7 @@ TestResult test_executable_dependency() {
     auto scripted_library = make_temp_dir("scripted_library_dependency");
     copy_fixture("executable_dependency", scripted_library);
     write_file(scripted_library / "tool/bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"tool\"\n"
         "version = \"0.1.0\"\n"
         "std = \"c++23\"\n");
@@ -2093,7 +2093,7 @@ TestResult test_executable_dependency() {
 TestResult test_run_final_declaration() {
     auto scripted_executable = make_temp_dir("run_final_executable");
     write_file(scripted_executable / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"manifest-library\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
@@ -2123,7 +2123,7 @@ TestResult test_run_final_declaration() {
 
     auto scripted_library = make_temp_dir("run_final_library");
     write_file(scripted_library / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"stale-run\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2169,7 +2169,7 @@ TestResult test_run_final_declaration() {
 TestResult test_source_less_executable_rejects_stale_output() {
     auto dir = make_temp_dir("source_less_executable");
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"stale-source\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2204,7 +2204,7 @@ TestResult test_run_requires_member_for_multiple_executables() {
     auto write_member = [&](const std::string& member,
                             const std::string& name) {
         write_file(dir / member / "bake.toml",
-            "[moid]\n"
+            "[package]\n"
             "name = \"" + name + "\"\n"
             "version = \"0.1.0\"\n"
             "type = \"executable\"\n"
@@ -2301,7 +2301,7 @@ TestResult test_convention_meta_dependency() {
     auto unknown_dir = make_temp_dir("build_cpp_meta_dep_unknown_option");
     copy_fixture("build_cpp_meta_dep", unknown_dir);
     write_file(unknown_dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"meta-consumer\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2318,7 +2318,7 @@ TestResult test_convention_meta_dependency() {
     auto wrong_type_dir = make_temp_dir("build_cpp_meta_dep_wrong_option_type");
     copy_fixture("build_cpp_meta_dep", wrong_type_dir);
     write_file(wrong_type_dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"meta-consumer\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2338,7 +2338,7 @@ TestResult test_convention_meta_dependency() {
     auto unified_dir = make_temp_dir("build_cpp_meta_dep_unified_option");
     copy_fixture("build_cpp_meta_dep", unified_dir);
     write_file(unified_dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"meta-consumer\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2362,7 +2362,7 @@ TestResult test_convention_meta_dependency() {
     auto conflict_dir = make_temp_dir("build_cpp_meta_dep_option_conflict");
     copy_fixture("build_cpp_meta_dep", conflict_dir);
     write_file(conflict_dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"meta-consumer\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2371,7 +2371,7 @@ TestResult test_convention_meta_dependency() {
         "answer = { path = \"answer\", options = { bias = 1 } }\n"
         "base = { path = \"base\", options = { tls = \"wolfssl\" } }\n");
     write_file(conflict_dir / "answer" / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"answer\"\n"
         "version = \"1.0.0\"\n"
         "type = \"lib\"\n"
@@ -2399,7 +2399,7 @@ TestResult test_convention_meta_dependency() {
 TestResult test_overlapping_source_groups() {
     auto duplicate = make_temp_dir("duplicate_source_groups");
     write_file(duplicate / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"duplicate-sources\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2428,7 +2428,7 @@ TestResult test_overlapping_source_groups() {
 
     auto conflicting = make_temp_dir("conflicting_source_groups");
     write_file(conflicting / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"conflicting-sources\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2465,7 +2465,7 @@ TestResult test_overlapping_source_groups() {
 TestResult test_symlink_source_identity() {
     auto dir = make_temp_dir("symlink_source_identity");
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"symlink-sources\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2603,7 +2603,7 @@ TestResult test_build_cpp_options() {
 TestResult test_build_cpp_multiline_option() {
     auto dir = make_temp_dir("build_cpp_multiline_option");
     write_file(dir / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"multiline-option\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
@@ -2856,7 +2856,7 @@ TestResult test_remote_archive_extract() {
           "failed to create fixture archive: " + make_archive.stdout);
 
     write_file(project / "bake.toml",
-        "[moid]\n"
+        "[package]\n"
         "name = \"remote-archive-app\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"

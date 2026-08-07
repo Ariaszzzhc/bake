@@ -1,4 +1,4 @@
-[moid]
+[package]
 name = "std-compat-build-cpp"
 version = "0.1.0"
 type = "executable"

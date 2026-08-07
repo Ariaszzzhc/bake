@@ -520,7 +520,7 @@ export int cmd_init(const ParsedArgs& args) {
     (target_dir / "tests").mkdir_recursive();
 
     // Write bake.toml
-    std::string toml_content = std::string("[moid]\n")
+    std::string toml_content = std::string("[package]\n")
         + "name = \"" + project_name + "\"\n"
         + "version = \"0.1.0\"\n"
         + "type = \"" + std::string(moid_type_str(moid_type)) + "\"\n"

@@ -187,25 +187,18 @@ export struct Manifest {
             m.workspace = std::move(w);
         }
 
-        if (tbl.contains("package")) {
-            std::println(std::cerr,
-                         "bake: [package] is not supported; use [moid] in {}",
-                         toml_path.string());
-            return std::nullopt;
-        }
-
-        // [moid]
-        if (auto* moid_tbl = tbl["moid"].as_table()) {
+        // [package]
+        if (auto* pkg_tbl = tbl["package"].as_table()) {
             Moid value;
-            if (auto v = (*moid_tbl)["name"].value<std::string>())
+            if (auto v = (*pkg_tbl)["name"].value<std::string>())
                 value.name = *v;
-            if (auto v = (*moid_tbl)["version"].value<std::string>())
+            if (auto v = (*pkg_tbl)["version"].value<std::string>())
                 value.version = *v;
-            if (auto* type_node = moid_tbl->get("type")) {
+            if (auto* type_node = pkg_tbl->get("type")) {
                 auto token = type_node->value<std::string>();
                 if (!token) {
                     std::println(std::cerr,
-                                 "bake: moid type must be a string in {}",
+                                 "bake: package type must be a string in {}",
                                  toml_path.string());
                     return std::nullopt;
                 }
@@ -217,7 +210,7 @@ export struct Manifest {
                 }
                 value.type = *parsed;
             }
-            if (auto v = (*moid_tbl)["std"].value<std::string>())
+            if (auto v = (*pkg_tbl)["std"].value<std::string>())
                 value.std_version = *v;
             m.moid = std::move(value);
         }
@@ -383,7 +376,7 @@ export std::optional<Path> find_project_root(const Path& start = Path::current()
 // }
 //
 // Identity rules (lock key):
-//   Moid package (has bake.toml):   key = [moid].name
+//   Moid package (has bake.toml):   key = [package].name
 //   Non-Moid git package:           key = "git:<url>@<commit>"
 //   Non-Moid archive package:        key = "archive:<url>@<content-sha256>"
 //   Non-Moid path package:           key = "path:<relative-path>"

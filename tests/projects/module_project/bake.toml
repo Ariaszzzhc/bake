@@ -1,4 +1,4 @@
-[moid]
+[package]
 name = "module-test"
 version = "0.1.0"
 type = "executable"

@@ -161,7 +161,7 @@ resolve_workspace_member_selection(
         auto manifest = Manifest::load(*member_root);
         if (!manifest || !manifest->has_moid()) {
             return std::unexpected(
-                "workspace member '" + member + "' does not declare a [moid]");
+                "workspace member '" + member + "' does not declare a [package]");
         }
 
         std::error_code error;
@@ -365,7 +365,7 @@ resolve_moid_graph(const Manifest& root,
         if (!manifest.has_moid()) {
             return std::unexpected(
                 "source '" + manifest.project_dir.string() +
-                "' does not declare a [moid]");
+                "' does not declare a [package]");
         }
 
         const Path source_root = manifest.project_dir;
@@ -387,7 +387,7 @@ resolve_moid_graph(const Manifest& root,
             auto manifest = Manifest::load(*member_root);
             if (!manifest || !manifest->has_moid()) {
                 return std::unexpected(
-                    "workspace member '" + member + "' does not declare a [moid]");
+                    "workspace member '" + member + "' does not declare a [package]");
             }
             manifest->project_dir = *member_root;
 
@@ -448,7 +448,7 @@ resolve_moid_graph(const Manifest& root,
         if (!added) return std::unexpected(added.error());
         graph.roots.push_back(id);
     } else {
-        return std::unexpected("project does not declare a [moid] or [workspace]");
+        return std::unexpected("project does not declare a [package] or [workspace]");
     }
 
     auto lockfile = Lockfile::load(*root_path / "bake.lock");
@@ -485,7 +485,7 @@ resolve_moid_graph(const Manifest& root,
                 if (!manifest || !manifest->has_moid()) {
                     return std::unexpected(
                         "dependency '" + alias + "' at '" +
-                        dependency_root->string() + "' does not declare a [moid]");
+                        dependency_root->string() + "' does not declare a [package]");
                 }
                 manifest->project_dir = *dependency_root;
                 target_manifest = std::move(*manifest);
