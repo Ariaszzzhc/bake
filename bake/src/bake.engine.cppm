@@ -246,6 +246,7 @@ export struct BuildAction {
     std::string moid_id;         // canonical owning moid identity
     std::string description;     // progress display text
     std::string moid;            // owning moid display name
+    std::string moid_version;    // owning moid version (for display)
     std::vector<Path> inputs;
     std::vector<Path> outputs;
     std::vector<std::string> command;
@@ -1052,6 +1053,7 @@ export std::expected<BuildGraph, std::string> build_graph(
         action.id = aid;
         action.moid_id = rm.canonical_id;
         action.moid = moid_name;
+        action.moid_version = rm.decl->version;
         action.description = normalized_source_id(rm.source_dir, src);
         action.inputs = {src};
         for (auto& [_, dep_pcm] : cc.module_deps)
@@ -1170,6 +1172,7 @@ export std::expected<BuildGraph, std::string> build_graph(
             action.id = aid;
             action.moid_id = rm.canonical_id;
             action.moid = moid_name;
+            action.moid_version = rm.decl->version;
             action.description = normalized_source_id(rm.source_dir, src);
             action.inputs = {src};
             for (auto& [_, dep_pcm] : cc.module_deps)
@@ -1305,6 +1308,7 @@ export std::expected<BuildGraph, std::string> build_graph(
         action.id = aid;
         action.moid_id = rm.canonical_id;
         action.moid = moid_name;
+        action.moid_version = rm.decl->version;
         action.outputs = {rm.output};
 
         if (rm.type == MoidType::Lib) {
@@ -1406,6 +1410,7 @@ export void write_graph_json(const BuildGraph& graph, const Path& path) {
         aj["id"] = action.id;
         aj["moid_id"] = action.moid_id;
         aj["moid"] = action.moid;
+        aj["moid_version"] = action.moid_version;
         aj["description"] = action.description;
 
         auto to_str_arr = [](const std::vector<Path>& paths) {
@@ -1477,6 +1482,7 @@ export BuildGraph read_graph_json(const Path& path) {
         action.id = aj.value("id", "");
         action.moid_id = aj.value("moid_id", "");
         action.moid = aj.value("moid", "");
+        action.moid_version = aj.value("moid_version", "");
         action.description = aj.value("description", action.id);
 
         std::string type_str = aj.value("type", "compile");
@@ -1567,9 +1573,17 @@ std::map<std::string, std::string> load_fingerprints(const Path& path) {
 
 // ===== Executor =====
 
-export int execute_graph(BuildGraph& graph, int jobs) {
+export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
+    auto start_time = std::chrono::steady_clock::now();
+
+    auto print_finished = [&]() {
+        double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - start_time).count();
+        std::println("    Finished in {:.2}s", elapsed);
+    };
+
     if (graph.actions.empty()) {
-        std::println("    Finished (nothing to build)");
+        print_finished();
         return 0;
     }
 
@@ -1613,13 +1627,7 @@ export int execute_graph(BuildGraph& graph, int jobs) {
     int skipped = static_cast<int>(graph.actions.size()) - pending;
 
     if (pending == 0) {
-        // Per-moid "Finished" output
-        std::set<std::string> printed;
-        for (auto& action : graph.actions) {
-            if (printed.insert(action.moid_id).second) {
-                std::println("    Finished {} (up to date)", action.moid);
-            }
-        }
+        print_finished();
         return 0;
     }
 
@@ -1637,16 +1645,21 @@ export int execute_graph(BuildGraph& graph, int jobs) {
         if (dirty[i])
             moid_total[graph.actions[i].moid_id]++;
 
-    std::string current_header_id;
+    std::set<std::string> announced;
     auto announce = [&](const BuildAction& action) {
         std::lock_guard<std::mutex> lock(output_mutex);
-        if (action.moid_id != current_header_id) {
-            current_header_id = action.moid_id;
-            std::println("  Compiling {}", action.moid);
+        if (announced.insert(action.moid_id).second) {
+            if (action.moid_version.empty())
+                std::println("   Compiling {}", action.moid);
+            else
+                std::println("   Compiling {} v{}",
+                             action.moid, action.moid_version);
         }
-        int started = ++moid_started[action.moid_id];
-        int total = moid_total[action.moid_id];
-        std::println("    [{}/{}] {}", started, total, action.description);
+        if (verbose) {
+            int started = ++moid_started[action.moid_id];
+            int total = moid_total[action.moid_id];
+            std::println("    [{}/{}] {}", started, total, action.description);
+        }
     };
 
     // Build reverse dependency edges for O(1) dependent lookup.
@@ -1827,14 +1840,7 @@ export int execute_graph(BuildGraph& graph, int jobs) {
         state["actions"][graph.actions[i].id] = fingerprints[i];
     atomic_write_file(state_path, state.dump(2));
 
-    // Per-moid "Finished" output
-    std::set<std::string> printed;
-    for (auto& action : graph.actions) {
-        if (printed.insert(action.moid_id).second) {
-            int moid_actions = moid_total[action.moid_id];
-            std::println("    Finished {} ({} actions)", action.moid, moid_actions);
-        }
-    }
+    print_finished();
 
     return 0;
 }

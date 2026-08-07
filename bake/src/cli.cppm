@@ -415,6 +415,7 @@ export void print_help() {
         "    --locked                Fail if lock is missing or stale\n"
         "    --offline               Never connect to the network\n"
         "    --frozen                Equivalent to --locked --offline\n"
+        "    -v, --verbose           Show per-file compile progress\n"
         "    -p <member>             Build a specific workspace member\n"
         "    -j <n>                  Parallel job count\n"
         "\n"
@@ -450,7 +451,8 @@ export void print_command_help(std::string_view cmd) {
             "    -p <member>              Build specific workspace member\n"
             "    --locked                 Fail if lock is missing/stale\n"
             "    --offline                No network access\n"
-            "    --frozen                 --locked + --offline"
+            "    --frozen                 --locked + --offline\n"
+            "    -v, --verbose            Show per-file compile progress"
         );
     } else if (cmd == "clean") {
         std::println(
@@ -1150,7 +1152,6 @@ int enforce_lock(const Path& root, const Manifest& manifest,
                     "bake: re-download failed. Run 'bake update' to re-resolve from scratch.");
                 return 1;
             }
-            std::println("bake: cached sources re-downloaded using locked commits");
         }
         return 0;
     }
@@ -1166,7 +1167,6 @@ int enforce_lock(const Path& root, const Manifest& manifest,
         std::println(std::cerr, "bake: failed to write bake.lock");
         return 1;
     }
-    std::println("bake: dependencies resolved and locked");
     return 0;
 }
 
@@ -1255,11 +1255,9 @@ export int cmd_build(const ParsedArgs& args) {
     // Execute.
     int jobs = 0;
     if (auto j = args.get_option("j")) jobs = std::atoi(j->c_str());
+    bool verbose = args.has_option("v") || args.has_option("verbose");
 
-    int result = execute_graph(*graph, jobs);
-    if (result == 0 && manifest->is_workspace()) {
-        std::println("    Finished workspace {}", label);
-    }
+    int result = execute_graph(*graph, jobs, verbose);
     return result;
 }
 

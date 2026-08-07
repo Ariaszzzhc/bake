@@ -112,8 +112,37 @@ export inline std::string compute_tree_sha256(const Path& dir) {
     return SHA256::hex(combined);
 }
 
+// Extract a short display name from an identity key.
+//   "brotli"                               → "brotli"
+//   "git:https://github.com/Mbed-TLS/mbedtls@abc123" → "mbedtls"
+inline std::string display_name_for_key(const std::string& key) {
+    if (!key.starts_with("git:")) return key;
+    // Strip "git:" prefix, take URL up to '@', extract last path segment.
+    std::string url = key.substr(4);
+    auto at = url.find('@');
+    if (at != std::string::npos) url = url.substr(0, at);
+    // Remove trailing slash.
+    while (!url.empty() && url.back() == '/') url.pop_back();
+    auto slash = url.find_last_of('/');
+    if (slash != std::string::npos) return url.substr(slash + 1);
+    return url;
+}
+
+// Extract repo name from a URL (last path segment, no extension).
+//   "https://github.com/curl/curl" → "curl"
+inline std::string repo_name_from_url(const std::string& url) {
+    std::string u = url;
+    while (!u.empty() && u.back() == '/') u.pop_back();
+    auto slash = u.find_last_of('/');
+    std::string name = (slash != std::string::npos) ? u.substr(slash + 1) : u;
+    auto dot = name.find_last_of('.');
+    if (dot != std::string::npos) name = name.substr(0, dot);
+    return name;
+}
+
 // Verify that cached source for every remote lock entry matches its integrity.
 // Detects tampering with cached dependencies. Called by the CLI layer.
+// Silent on cache miss (caller handles messaging); prints only on tamper.
 export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache_dir) {
     for (auto& [key, dep] : lockfile.deps) {
         if (!dep.is_remote()) continue;
@@ -121,18 +150,13 @@ export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache
         if (hash.empty()) continue;
 
         Path cache_path = cache_dir / hash;
-        if (!cache_path.is_directory()) {
-            std::println(std::cerr,
-                "bake: cache for '{}' missing at {}",
-                key, cache_path.string());
-            return false;
-        }
+        if (!cache_path.is_directory()) return false;
 
         std::string actual_hash = compute_tree_sha256(cache_path);
         if (actual_hash != hash) {
             std::println(std::cerr,
                 "bake: cache tampered for '{}' (expected {}, got {})",
-                key, hash.substr(0, 12),
+                display_name_for_key(key), hash.substr(0, 12),
                 actual_hash.substr(0, 12));
             return false;
         }
@@ -554,7 +578,7 @@ inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep
         return node;
     }
 
-    std::println(std::cerr, "bake: resolving {} ({})...", dep.name, dep.tag);
+    std::println("  Downloading {}", repo_name_from_url(dep.url));
 
     // Step 1: tag → commit
     auto commit = resolve_tag(dep.url, dep.tag);
@@ -633,8 +657,7 @@ inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig&
         Path cached = cache_dir_ / hash;
         if (cached.is_directory()) continue;  // already cached
 
-        std::println(std::cerr, "bake: re-downloading '{}' (commit {})...",
-                     key, dep.commit.substr(0, 12));
+        std::println("  Downloading {}", display_name_for_key(key));
 
         // Download by locked commit (no tag re-resolution)
         Path download_dir = cache_dir_ / ".downloads";
