@@ -150,6 +150,17 @@ export std::optional<ModuleInfo> scan_module_file(const Path& source) {
             info.module_name = std::string(name.substr(b, e - b + 1));
             info.is_interface = true;
         }
+        // module <name>;  (implementation unit — implicitly imports its module)
+        else if (sv.starts_with("module ") && !sv.starts_with("module;")) {
+            sv.remove_prefix(7);
+            auto semi = sv.find(';');
+            if (semi == std::string_view::npos) continue;
+            auto name = sv.substr(0, semi);
+            auto b = name.find_first_not_of(" \t");
+            auto e = name.find_last_not_of(" \t");
+            if (b == std::string_view::npos) continue;
+            info.imports.push_back(std::string(name.substr(b, e - b + 1)));
+        }
         // import <name>;  (also covers "export import <name>;")
         else if (sv.starts_with("import ") || sv.starts_with("export import ")) {
             if (sv.starts_with("export "))
@@ -350,8 +361,30 @@ export MoidDeclaration convention_declare(
 
 // ===== Unified DAG builder =====
 //
-// Takes all moid declarations, scans modules across all of them,
-// resolves cross-moid dependencies, and produces a single BuildGraph.
+// Translates a resolved MoidGraph into a flat BuildGraph of compile/link
+// actions with explicit dependency edges.
+//
+// Data flow:
+//
+//   MoidGraph (topological moid order)
+//        │
+//        ▼
+//   Resolve declarations → per-moid source lists, include dirs, module map
+//        │
+//        ▼
+//   Module scan: cross-moid import resolution → topo-ordered module interfaces
+//        │
+//        ▼
+//   Compile module interfaces → PCM + .o actions (with module dep edges)
+//        │
+//        ▼
+//   Compile regular sources → .o actions (with module dep edges)
+//        │
+//        ▼
+//   Link / archive → terminal artifacts (executable / .a / .dylib)
+//
+// Convention mode and build.cpp mode both produce the same MoidDeclaration
+// JSON, so they converge here — the DAG builder never distinguishes them.
 
 namespace {
 
@@ -554,7 +587,7 @@ export std::expected<BuildGraph, std::string> build_graph(
     };
     std::map<std::string, TerminalClaim> terminal_claims;
 
-    // ── Phase 1: Resolve declarations into per-moid data ──
+    // ── Resolve declarations into per-moid data ──
 
     struct ResolvedMoid {
         const MoidDeclaration* decl;
@@ -807,7 +840,7 @@ export std::expected<BuildGraph, std::string> build_graph(
         return result;
     };
 
-    // ── Phase 2: Owner-scoped module scan across all moids ──
+    // ── Module scan: cross-moid import resolution ──
 
     using ModuleKey = std::pair<std::string, std::string>;
     using ModuleProviderMap = std::map<std::string, ModuleKey>;
@@ -998,10 +1031,10 @@ export std::expected<BuildGraph, std::string> build_graph(
         exported_module_providers.emplace(moid_id, std::move(exported));
     }
 
-    // Shared across phases 3–5: each object retains its typed producer.
+    // Shared across compile and link: each object retains its typed producer.
     std::map<std::string, std::vector<ArtifactRef>> moid_objects;
 
-    // ── Phase 3: Compile module interfaces (topological order) ──
+    // ── Compile module interfaces (topological order) ──
 
     struct ModuleActionInfo {
         ArtifactRef module;
@@ -1108,7 +1141,7 @@ export std::expected<BuildGraph, std::string> build_graph(
     if (!compile_exports)
         return std::unexpected(compile_exports.error());
 
-    // ── Phase 4: Compile regular sources ──
+    // ── Compile regular sources ──
 
     for (const auto& moid_id : moid_order) {
         auto& rm = moids.at(moid_id);
@@ -1210,7 +1243,7 @@ export std::expected<BuildGraph, std::string> build_graph(
         }
     }
 
-    // ── Phase 5: Compute typed exports, then link / archive ──
+    // ── Link / archive: produce terminal artifacts ──
 
     auto add_artifact_inputs = [](BuildAction& action,
                                   const std::vector<ArtifactRef>& artifacts) {
@@ -1366,10 +1399,6 @@ export std::expected<BuildGraph, std::string> build_graph(
             link.system_libraries = requirements.system_libraries;
             link.frameworks = requirements.frameworks;
             action.command = make_link_command(tc, link);
-
-            // Inject -stdlib=libc++ when std module is in use (non-BakeSelf path
-            // removed — bake always uses its own driver which handles this).
-            // No-op: make_compile_command already adds -stdlib=libc++ when needed.
 
             exports.terminal = terminal;
             exports.link.objects.clear();

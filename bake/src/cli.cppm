@@ -26,21 +26,13 @@ import bake.graph;
 import bake.compiler;
 import bake.engine;
 import bake.package;
+import bake.llvm;
 import nlohmann.json;
 import tomlplusplus;
 
 #ifndef BAKE_VERSION
 #define BAKE_VERSION "0.1.0"
 #endif
-
-// Phase 5: LLVM compiler integration — C ABI
-extern "C" {
-    int bake_clang_main(int argc, const char** argv);
-    int bake_has_llvm(void);
-    int bake_ar_write(const char *archive_name,
-                      const char **members, size_t member_count,
-                      int archive_kind);
-}
 
 namespace bake::cli {
 
@@ -405,8 +397,7 @@ export void print_help() {
         "    clean           Remove build artifacts\n"
         "    cc              Invoke embedded Clang C driver\n"
         "    c++             Invoke embedded Clang C++ driver\n"
-        "    ar              Archiver (not yet implemented)\n"
-        "    ranlib          Archive index (not yet implemented)\n"
+        "    ar              Create static archive\n"
         "\n"
         "GLOBAL OPTIONS:\n"
         "    -V, --version   Print version and exit\n"
@@ -650,7 +641,8 @@ MoidDeclaration compile_and_run_build_cpp(
         Path tmp_o   = Path(wrapper_o.string() + "." + pid + ".tmp");
 
         std::vector<std::string> cmd;
-        for (auto& a : cxx_prefix(native_tc)) cmd.push_back(a);
+        cmd.push_back(native_tc.exe_path);
+        cmd.push_back("c++");
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
         cmd.push_back("-stdlib=libc++");
@@ -685,7 +677,8 @@ MoidDeclaration compile_and_run_build_cpp(
     Path build_o = scripts_dir / "build.o";
     {
         std::vector<std::string> cmd;
-        for (auto& a : cxx_prefix(native_tc)) cmd.push_back(a);
+        cmd.push_back(native_tc.exe_path);
+        cmd.push_back("c++");
         cmd.push_back("-c");
         cmd.push_back("-std=c++23");
         cmd.push_back("-stdlib=libc++");
@@ -710,7 +703,8 @@ MoidDeclaration compile_and_run_build_cpp(
     Path build_app = scripts_dir / "build_app";
     {
         std::vector<std::string> cmd;
-        for (auto& a : cxx_prefix(native_tc)) cmd.push_back(a);
+        cmd.push_back(native_tc.exe_path);
+        cmd.push_back("c++");
         cmd.push_back(wrapper_o.string());
         cmd.push_back(build_o.string());
         cmd.push_back("-o");
@@ -900,7 +894,7 @@ std::expected<void, std::string> configure_moid_graph(
                     moid_dir, *manifest, node, tc, out_dir);
             }
         } else {
-            auto layout = Layout::detect(moid_dir, project_root);
+            auto layout = Layout::detect(moid_dir);
             auto declaration_path = persist_convention_declaration(
                 *manifest, layout, bake_dir, node);
             auto persisted = read_moid_declaration(declaration_path);
@@ -1393,7 +1387,7 @@ export int cmd_update(const ParsedArgs& args) {
 // ===== Stub commands =====
 
 export int cmd_test(const ParsedArgs& args) {
-    std::println(std::cerr, "bake: test not yet implemented (Phase 7)");
+    std::println(std::cerr, "bake: test not yet implemented");
     return 1;
 }
 
@@ -1442,7 +1436,7 @@ export int main(int argc, char* argv[]) {
     if (args.command == "test")     return cmd_test(args);
     if (args.command == "clean")    return cmd_clean(args);
 
-    // Phase 5: LLVM compiler integration — pass raw argv to Clang driver
+    // Pass raw argv to the embedded Clang driver.
     if (args.command == "cc" || args.command == "c++") {
         if (!bake_has_llvm()) {
             std::println(std::cerr, "bake {}: LLVM support not compiled in", args.command);

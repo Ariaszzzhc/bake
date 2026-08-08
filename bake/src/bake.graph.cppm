@@ -329,6 +329,17 @@ configuration_topological_moids(const MoidGraph& graph) {
     return topological_moids(provisional);
 }
 
+// Build a resolved MoidGraph from a root manifest.
+//
+// Walks the dependency closure recursively:
+//   workspace members → path deps → remote deps (from lockfile)
+// Each node gets a canonical identity (workspace:path, path:<hash>,
+// git:<url>#<commit>). Non-moid sources (no bake.toml) are recorded as
+// source_deps for build.cpp access but don't become graph nodes.
+//
+// Build options are resolved after the graph structure is complete:
+// each option request is validated against the target package's declared
+// [options], and conflicts between multiple requesters are detected.
 export std::expected<MoidGraph, std::string>
 resolve_moid_graph(const Manifest& root,
                    const BuildSelection& selection,

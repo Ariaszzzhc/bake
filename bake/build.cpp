@@ -51,15 +51,15 @@ int main() {
             "src/bake.project.cppm",
             "src/bake.moid.cppm",
             "src/bake.graph.cppm",
+            "src/compiler/bake.llvm.cppm",
             "src/bake.compiler.cppm",
             "src/bake.engine.cppm",
             "src/bake.package.cppm",
             "src/cli.cppm",
         })
-        // LLVM-interfacing sources: LLVM is built with -fno-rtti, these must match.
-        .sources("src/compiler/bake_llvm.cpp", { .flags = {"-fno-rtti"} })
-        .sources("src/compiler/bake_clang_cc1_main.cpp", { .flags = {"-fno-rtti"} })
-        .sources("src/compiler/bake_clang_cc1as_main.cpp", { .flags = {"-fno-rtti"} })
+        .sources("src/compiler/bake_llvm.cpp")
+        .sources("src/compiler/bake_clang_cc1_main.cpp")
+        .sources("src/compiler/bake_clang_cc1as_main.cpp")
         .sources("src/compiler/bake_clang_driver.cpp")
         .sources("src/main.cpp")
         .include_dirs({

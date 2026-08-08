@@ -7,6 +7,7 @@ export module bake.compiler;
 import std;
 import bake.util;
 import bake.project;
+import bake.llvm;
 
 // ============================================================
 // bake.compiler — toolchain detection, compile/link commands
@@ -104,16 +105,6 @@ export struct Toolchain {
     std::string cxx() const { return exe_path; }
     std::string cc() const { return exe_path; }
 };
-
-// argv prefix for C++ driver invocation: ["bake", "c++"]
-export inline std::vector<std::string> cxx_prefix(const Toolchain& tc) {
-    return {tc.exe_path, "c++"};
-}
-
-// argv prefix for C driver invocation: ["bake", "cc"]
-export inline std::vector<std::string> cc_prefix(const Toolchain& tc) {
-    return {tc.exe_path, "cc"};
-}
 
 // ===== Compile configuration =====
 
@@ -332,7 +323,7 @@ static std::string compiler_identity_block(const Toolchain& tc) {
         }
     }
 
-    auto prefix = cxx_prefix(tc);
+    std::vector<std::string> prefix = {tc.exe_path, "c++"};
 
     auto ver_args = prefix;
     ver_args.push_back("--version");
@@ -441,7 +432,7 @@ export ModuleFileMap ensure_std_modules(
     if (!std_pcm.is_regular_file()) {
         std::println("   Preparing standard library module");
 
-        std::vector<std::string> cmd = cxx_prefix(tc);
+        std::vector<std::string> cmd = {tc.exe_path, "c++"};
         cmd.push_back("-std=c++23");
         cmd.push_back("-stdlib=libc++");
         cmd.push_back("-nostdinc++");
@@ -472,7 +463,7 @@ export ModuleFileMap ensure_std_modules(
     }
 
     if (!compat_pcm.is_regular_file()) {
-        std::vector<std::string> cmd = cxx_prefix(tc);
+        std::vector<std::string> cmd = {tc.exe_path, "c++"};
         cmd.push_back("-std=c++23");
         cmd.push_back("-stdlib=libc++");
         cmd.push_back("-nostdinc++");
@@ -552,10 +543,6 @@ export std::string library_name(std::string_view base_name, MoidType type) {
 //
 // bake embeds LLVM's archive writer, so it never depends on external `ar`.
 
-extern "C" int bake_ar_write(const char *archive_name,
-                              const char **members, size_t member_count,
-                              int archive_kind);
-
 static bool write_archive(const Path& archive_path,
                           const std::vector<Path>& members,
                           bool is_darwin) {
@@ -572,12 +559,24 @@ static bool write_archive(const Path& archive_path,
                          cstrs.data(), cstrs.size(), kind) == 0;
 }
 
-// ===== Cross-compile runtime object management =====
+// ===== Runtime object management =====
 //
-// All cross-compile runtime building/injection lives here (not in cli.cppm)
-// so that bake's in-process Clang driver can inject link objects when bake
-// is used as a standalone compiler (bake cc/c++ -target ...).
-// This makes bake cc a complete drop-in cross-compiler.
+// bake vendors libc++, libc++abi, libunwind, compiler-rt, and musl sources
+// alongside the binary. These are compiled on first use (or when the cache
+// is invalidated) and cached globally keyed by target triple — the host
+// platform is irrelevant, so the same cache works for any host → target
+// combination.
+//
+// The result is .a archives, not loose .o files. This lets the linker
+// pull only the symbols actually referenced, keeping binaries small.
+//
+// C vs C++ runtime: `bake cc` (C mode) only needs libc/compiler-rt.
+// `bake c++` (C++ mode) additionally needs libc++/libc++abi/libunwind.
+// The Clang driver determines this via IsCxx and injects accordingly.
+//
+// All functions below are called from the in-process Clang driver
+// (bake_clang_driver.cpp), making `bake cc/c++ -target <triple>` a
+// complete drop-in cross-compiler with no external dependencies.
 
 // ── Source file lists (curated from upstream libcxx/libunwind) ──
 

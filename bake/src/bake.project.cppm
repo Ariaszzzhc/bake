@@ -261,88 +261,22 @@ export struct Manifest {
 };
 
 // ===== Layout (directory conventions) =====
+//
+// Convention-based source discovery: src/ for implementation, public/ for
+// headers and module interfaces. All build outputs go under out/ and are
+// managed by the build graph — Layout only describes source-side structure.
 
 export struct Layout {
-    Path root;              // source root (contains bake.toml)
-    Path source_dir;        // root/src/
-    Path public_dir;        // root/public/
-    Path tests_dir;         // root/tests/
-    Path bake_dir;          // private build-script state/staging
+    Path root;          // source root (contains bake.toml)
+    Path source_dir;    // root/src/
+    Path public_dir;    // root/public/
 
-    // All mutable build products belong to the top-level project's out/.
-    Path out_dir;           // <top-level>/out/
-    Path package_dir;       // out/ for root, out/.pkgs/<package>/ for deps
-    Path package_file;      // exported package usage requirements
-    Path bin_dir;
-    Path lib_dir;
-    Path obj_dir;           // out/.obj/[<member-or-package>/]
-    Path bmi_dir;           // out/.bmi/[<member-or-package>/]
-    std::string package_name;
-    bool dependency_layout = false;
-
-    // Detect layout. Pass ws_root for workspace members so all outputs
-    // go under the workspace root's out/ directory.
-    static Layout detect(const Path& root, const Path& ws_root = Path{}) {
-        Layout l;
-        l.root = root;
-        l.source_dir = root / "src";
-        l.public_dir = root / "public";
-        l.tests_dir = root / "tests";
-
-        Path out_base = ws_root.string().empty() ? root : ws_root;
-        l.out_dir = out_base / "out";
-        l.package_dir = l.out_dir;
-        l.bin_dir = l.out_dir / "bin";
-        l.lib_dir = l.out_dir / "lib";
-
-        if (ws_root.string().empty() || ws_root == root) {
-            l.bake_dir = l.out_dir / ".bake";
-            l.obj_dir = l.out_dir / ".obj";
-            l.bmi_dir = l.out_dir / ".bmi";
-        } else {
-            // Per-member subdirs to avoid name collisions in workspace builds
-            std::string member = root.filename_string();
-            l.bake_dir = l.out_dir / ".bake" / member;
-            l.obj_dir = l.out_dir / ".obj" / member;
-            l.bmi_dir = l.out_dir / ".bmi" / member;
-        }
-        l.package_file = l.bake_dir / "package.json";
-        return l;
-    }
-
-    // A dependency keeps immutable sources at root, while every generated
-    // file is placed in the consuming top-level project's out directory.
-    static Layout for_dependency(const Path& root, const Path& project_out,
-                                 std::string_view package_name) {
-        Layout l;
-        l.root = root;
-        l.source_dir = root / "src";
-        l.public_dir = root / "public";
-        l.tests_dir = root / "tests";
-        l.out_dir = project_out;
-        l.package_dir = project_out / ".pkgs" / std::string(package_name);
-        l.package_file = l.package_dir / "package.json";
-        l.bake_dir = l.package_dir / ".bake";
-        l.bin_dir = l.package_dir / "bin";
-        l.lib_dir = l.package_dir / "lib";
-        l.obj_dir = project_out / ".obj" / std::string(package_name);
-        l.bmi_dir = project_out / ".bmi" / std::string(package_name);
-        l.package_name = package_name;
-        l.dependency_layout = true;
-        return l;
-    }
-
-    void create_directories() const {
-        bake_dir.mkdir_recursive();
-        obj_dir.mkdir_recursive();
-        bmi_dir.mkdir_recursive();
-        bin_dir.mkdir_recursive();
-        lib_dir.mkdir_recursive();
-    }
-
-    // Output directory for a given Moid type.
-    Path output_for(MoidType type) const {
-        return (type == MoidType::Executable) ? bin_dir : lib_dir;
+    static Layout detect(const Path& root) {
+        return Layout{
+            root,
+            root / "src",
+            root / "public",
+        };
     }
 };
 
@@ -530,9 +464,6 @@ export struct Lockfile {
     }
 
   public:
-    // True when the entire dependency closure (recursively following path
-    // deps) contains only path dependencies — no remote deps anywhere.
-    // In that case no lockfile is needed at all.
     static bool has_only_path_deps(const Manifest& manifest) {
         std::set<Path> visited;
         return closure_has_only_path_deps(manifest, visited);
@@ -560,8 +491,6 @@ export struct Lockfile {
         }
         return true;
     }
-
-    bool empty() const { return deps.empty(); }
 };
 
 // Get the global source cache directory

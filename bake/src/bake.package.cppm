@@ -509,7 +509,7 @@ inline bool prescan_archive(const Path& archive, std::size_t& out_file_count,
 }
 
 inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir) {
-    // Phase 1: Pre-scan archive entries BEFORE extraction.
+    // Pre-scan archive entries BEFORE extraction.
     // This prevents malicious archives from writing to the filesystem
     // before safety checks can run.
     std::size_t file_count = 0;
@@ -518,7 +518,7 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
         return false;
     }
 
-    // Phase 2: Create a uniquely-named temp directory for extraction.
+    // Create a uniquely-named temp directory for extraction.
     std::random_device rd;
     std::uniform_int_distribution<unsigned> dist(0, 0xFFFFFF);
     std::string suffix;
@@ -531,7 +531,7 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     tmp_dir.remove_all();
     tmp_dir.mkdir_recursive();
 
-    // Phase 3: Extract with tar.
+    // Extract with tar.
     // POSIX: strip ownership/permissions with flags supported by both GNU tar
     // and BSD tar. Extraction always targets a new, empty temp directory, so
     // GNU tar's non-portable --no-overwrite-dir is unnecessary.
@@ -551,7 +551,7 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
         return false;
     }
 
-    // Phase 4: Post-extraction validation (defense in depth).
+    // Post-extraction validation (defense in depth).
     // The pre-scan should have caught everything, but verify the actual
     // extracted tree as well — in case tar's behavior differs from -tf.
     if (!validate_extracted_tree(tmp_dir.fs())) {

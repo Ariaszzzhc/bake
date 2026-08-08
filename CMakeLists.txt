@@ -85,6 +85,7 @@ target_sources(bake
             bake/src/bake.project.cppm
             bake/src/bake.moid.cppm
             bake/src/bake.graph.cppm
+            bake/src/compiler/bake.llvm.cppm
             bake/src/bake.compiler.cppm
             bake/src/bake.engine.cppm
             bake/src/bake.package.cppm
@@ -132,16 +133,7 @@ target_compile_definitions(bake PRIVATE
     BAKE_VERSION="${PROJECT_VERSION}"
 )
 
-# LLVM headers expect -fno-rtti (LLVM is built with RTTI disabled).
-# Apply only to the LLVM-interfacing C++ source files that instantiate
-# LLVM templates (which use #include, not import std).
-# bake_clang_driver.cpp is excluded: it imports bake.util (which has RTTI
-# enabled), and doesn't use typeid/dynamic_cast on LLVM types.
-set_property(SOURCE
-    bake/src/compiler/bake_llvm.cpp
-    bake/src/compiler/bake_clang_cc1_main.cpp
-    bake/src/compiler/bake_clang_cc1as_main.cpp
-    APPEND PROPERTY COMPILE_OPTIONS -fno-rtti)
+# LLVM is built with LLVM_ENABLE_RTTI=ON, so no -fno-rtti needed anywhere.
 
 # Runtime library search path — only self-built LLVM lib dir needed
 # (bake is now a single statically-linked executable, no libbake.dylib).

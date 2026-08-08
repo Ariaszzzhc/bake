@@ -11,6 +11,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+module;
+
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticFrontend.h"
 #include "clang/Basic/DiagnosticOptions.h"
@@ -56,9 +58,11 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
-#include <memory>
-#include <optional>
-#include <system_error>
+
+module bake.llvm;
+
+import std;
+
 using namespace clang;
 using namespace clang::options;
 using namespace llvm;
