@@ -1,0 +1,125 @@
+#!/bin/bash
+# bootstrap/build — produce a bake binary for any target platform.
+#
+# Usage: ./bootstrap/build <target> [mcpu]
+#   target:  aarch64-linux-musl | x86_64-linux-musl | aarch64-macos | ...
+#   mcpu:    baseline (default) | native | <specific cpu>
+#
+# Host dependencies: CMake ≥ 3.30, Ninja, Clang with libc++ (stage 0).
+#
+# Pipeline:
+#   1. Ensure host bake exists (CMake stage 0 → build/bake)
+#   2. Cross-compile LLVM/Clang/LLD using bake cc as the compiler
+#   3. Cross-compile bake itself using bake build --target=<target>
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+TARGET="${1:?usage: ./bootstrap/build <target> [mcpu]}"
+MCPU="${2:-baseline}"
+
+LLVM_SRC=external/llvm-project/llvm
+PREFIX="external/llvm-install-$TARGET"
+NATIVE=external/llvm-project/build-native
+CROSS=external/llvm-project/build-cross
+WRAP=.tmp/cross-wrappers
+
+mkdir -p "$WRAP"
+
+# ── Step 1: Ensure host bake ──
+if [ ! -f build/bake ]; then
+    echo "=== Step 1: Building host bake (CMake stage 0) ==="
+    cmake -G Ninja -B build
+    cmake --build build
+fi
+BAKE="$(pwd)/build/bake"
+LIB="$(pwd)/lib"
+
+# ── Compiler wrappers ──
+for w in cc c++; do
+    cat > "$WRAP/$w" << EOF
+#!/bin/sh
+export BAKE_LIB_DIR=$LIB
+exec $BAKE $w -target $TARGET "\$@"
+EOF
+    cat > "$WRAP/native-$w" << EOF
+#!/bin/sh
+export BAKE_LIB_DIR=$LIB
+exec $BAKE $w "\$@"
+EOF
+done
+chmod +x "$WRAP/"*
+
+# ── Step 2: Cross-compile LLVM ──
+if [ ! -f "$PREFIX/lib/libLLVMCore.a" ]; then
+    echo "=== Step 2: Cross-compiling LLVM for $TARGET ==="
+
+    # 2a: Native tablegen (runs on host)
+    if [ ! -f "$NATIVE/bin/llvm-tblgen" ]; then
+        rm -rf "$NATIVE"
+        cmake -G Ninja -B "$NATIVE" \
+            -DCMAKE_C_COMPILER="$WRAP/native-cc" \
+            -DCMAKE_CXX_COMPILER="$WRAP/native-c++" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            "$LLVM_SRC"
+        ninja -C "$NATIVE" llvm-tblgen clang-tblgen
+    fi
+
+    # 2b: Cross-compile LLVM for target
+    rm -rf "$CROSS"
+    cmake -G Ninja -B "$CROSS" \
+        -DCMAKE_CROSSCOMPILING=True \
+        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_PROCESSOR="${TARGET%%-*}" \
+        -DCMAKE_C_COMPILER="$WRAP/cc" \
+        -DCMAKE_CXX_COMPILER="$WRAP/c++" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+        -DCMAKE_LINK_DEPENDS_USE_LINKER=OFF \
+        -DLLVM_ENABLE_ASSERTIONS=OFF \
+        -DLLVM_ENABLE_LIBCXX=ON \
+        -DLLVM_TARGETS_TO_BUILD="AArch64;X86" \
+        -DLLVM_ENABLE_PROJECTS="clang;lld" \
+        -DLLVM_ENABLE_BINDINGS=OFF \
+        -DLLVM_ENABLE_PLUGINS=OFF \
+        -DLLVM_INCLUDE_TESTS=OFF \
+        -DLLVM_INCLUDE_EXAMPLES=OFF \
+        -DLLVM_INCLUDE_BENCHMARKS=OFF \
+        -DLLVM_INCLUDE_DOCS=OFF \
+        -DLLVM_BUILD_TOOLS=OFF \
+        -DLLVM_BUILD_STATIC=ON \
+        -DLLVM_BUILD_LLVM_DYLIB=OFF \
+        -DLLVM_BUILD_SHARED_LIBS=OFF \
+        -DLLVM_ENABLE_PIC=OFF \
+        -DLLVM_ENABLE_ZSTD=OFF \
+        -DLLVM_ENABLE_ZLIB=OFF \
+        -DLLVM_ENABLE_LIBXML2=OFF \
+        -DLLVM_ENABLE_LIBEDIT=OFF \
+        -DLLVM_ENABLE_LIBPFM=OFF \
+        -DLLVM_ENABLE_Z3_SOLVER=OFF \
+        -DLLVM_TABLEGEN="$(pwd)/$NATIVE/bin/llvm-tblgen" \
+        -DCLANG_TABLEGEN="$(pwd)/$NATIVE/bin/clang-tblgen" \
+        -DCLANG_BUILD_TOOLS=OFF \
+        -DLLD_BUILD_TOOLS=OFF \
+        -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+        "$LLVM_SRC"
+    cmake --build "$CROSS"
+    cmake --install "$CROSS"
+else
+    echo "=== Step 2: LLVM already installed at $PREFIX ==="
+fi
+
+# ── Step 3: Cross-compile bake ──
+echo "=== Step 3: Cross-compiling bake for $TARGET ==="
+rm -rf out/.bake out/bin-$TARGET out/lib-$TARGET out/.obj out/.bmi
+BAKE_LLVM_DIR="$PREFIX" "$BAKE" build --target="$TARGET"
+
+echo "=== Done: out/bin-$TARGET/bake ==="
+file "out/bin-$TARGET/bake"
