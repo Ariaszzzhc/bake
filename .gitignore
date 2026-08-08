@@ -11,6 +11,7 @@
 /__cmake_systeminformation/
 /zig_native_cpp.o
 /external/llvm-install/
+/external/llvm-install-aarch64-linux-musl/
 /external/zlib-build/
 /external/zlib-install/
 /external/zstd-build/
@@ -19,3 +20,4 @@ compile_commands.json
 /.cache/
 /.superpowers/
 .DS_Store
+.tmp/

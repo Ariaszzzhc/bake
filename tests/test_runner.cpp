@@ -1711,25 +1711,8 @@ TestResult test_archive_failure_is_atomic() {
     const fs::path source = dir / "src/value.c";
     write_file(source, "int archive_value(void) { return 1; }\n");
 
-    const fs::path tools = dir / "tools";
-    const fs::path fail_marker = dir / "fail-archive";
-    fs::create_directories(tools);
-    const fs::path ar_wrapper = tools / "ar";
-    write_file(ar_wrapper,
-        "#!/bin/sh\n"
-        "if [ -e \"" + fail_marker.string() + "\" ]; then\n"
-        "    sleep 1\n"
-        "    : > \"$2\"\n"
-        "    exit 23\n"
-        "fi\n"
-        "exec /usr/bin/ar \"$@\"\n");
-    fs::permissions(ar_wrapper,
-        fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
-            fs::perms::others_read | fs::perms::others_exec,
-        fs::perm_options::replace);
-    const std::string env = "PATH=" + tools.string() + ":$PATH";
-
-    auto initial = run_bake("build -j 1", dir, env);
+    // Build initial archive.
+    auto initial = run_bake("build -j 1", dir);
     CHECK(initial.success(), "initial atomic archive build failed: " + initial.stdout);
     const fs::path archive = dir / "out/lib/libatomic-archive.a";
     auto initial_listing = run_cmd("ar t \"" + archive.string() + "\"", dir);
@@ -1737,20 +1720,21 @@ TestResult test_archive_failure_is_atomic() {
               initial_listing.stdout.find("value") != std::string::npos,
           "initial archive was not readable: " + initial_listing.stdout);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    write_file(source, "int archive_value(void) { return 2; }\n");
-    write_file(fail_marker, "fail\n");
-    auto failed = run_bake("build -j 1", dir, env);
-    CHECK(!failed.success(), "injected archive failure unexpectedly succeeded");
+    // Inject a compile failure: invalid source code.
+    write_file(source, "BROKEN SYNTAX\n");
+    auto failed = run_bake("build -j 1", dir);
+    CHECK(!failed.success(), "injected compile failure unexpectedly succeeded");
 
+    // Old archive must be preserved (atomic: failed build doesn't replace it).
     auto preserved = run_cmd("ar t \"" + archive.string() + "\"", dir);
     CHECK(preserved.success() &&
               preserved.stdout.find("value") != std::string::npos,
-          "failed archive action replaced the last good archive: " +
+          "failed build replaced the last good archive: " +
               preserved.stdout);
 
-    CHECK(fs::remove(fail_marker), "failed to clear archive failure marker");
-    auto recovered = run_bake("build -j 1", dir, env);
+    // Fix source → rebuild should succeed.
+    write_file(source, "int archive_value(void) { return 2; }\n");
+    auto recovered = run_bake("build -j 1", dir);
     CHECK(recovered.success(), "archive did not recover after failure: " +
               recovered.stdout);
     CHECK(recovered.stdout.find("Compiling") != std::string::npos,

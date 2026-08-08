@@ -28,8 +28,15 @@ int main() {
     namespace fs = std::filesystem;
     std::string here = fs::current_path().string();
     std::string ws = (fs::path(here) / "..").lexically_normal().string();
-    std::string llvm_dir = ws + "/external/llvm-install";
+
+    // Allow overriding LLVM location via env (e.g. for cross-compilation).
+    // Relative paths are resolved against the workspace root.
+    const char* env_llvm = std::getenv("BAKE_LLVM_DIR");
+    std::string llvm_dir = env_llvm
+        ? (fs::path(ws) / env_llvm).lexically_normal().string()
+        : ws + "/external/llvm-install";
     std::string llvm_lib = llvm_dir + "/lib";
+    std::string llvm_include = llvm_dir + "/include";
 
     // Collect LLVM/Clang/LLD static libraries in dependency order:
     // Clang → LLD → LLVM (consumers before providers).
@@ -52,10 +59,11 @@ int main() {
         // LLVM-interfacing sources: LLVM is built with -fno-rtti, these must match.
         .sources("src/compiler/bake_llvm.cpp", { .flags = {"-fno-rtti"} })
         .sources("src/compiler/bake_clang_cc1_main.cpp", { .flags = {"-fno-rtti"} })
+        .sources("src/compiler/bake_clang_cc1as_main.cpp", { .flags = {"-fno-rtti"} })
         .sources("src/compiler/bake_clang_driver.cpp")
         .sources("src/main.cpp")
         .include_dirs({
-            "../external/llvm-install/include",
+            llvm_include,
             "../third_party/tomlplusplus/public",
             "../third_party/nlohmann/public",
         })
@@ -65,8 +73,12 @@ int main() {
     for (auto& lib : clang_libs) b.link_system(lib);
     for (auto& lib : lld_libs)   b.link_system(lib);
     for (auto& lib : llvm_libs)  b.link_system(lib);
-    b.link_system(ws + "/external/zlib-install/lib/libz.a");
-    b.link_system(ws + "/external/zstd-install/lib/libzstd.a");
+
+    // Link zlib/zstd if present (absent in cross-compile builds where they're disabled).
+    std::string zlib = ws + "/external/zlib-install/lib/libz.a";
+    std::string zstd = ws + "/external/zstd-install/lib/libzstd.a";
+    if (fs::exists(zlib)) b.link_system(zlib);
+    if (fs::exists(zstd)) b.link_system(zstd);
 
     return b.build();
 }

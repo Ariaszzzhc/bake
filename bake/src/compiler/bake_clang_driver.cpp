@@ -61,6 +61,7 @@
 
 #include <lld/Common/Driver.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <set>
@@ -68,6 +69,7 @@
 #include <vector>
 
 import bake.util;
+import bake.compiler;
 
 using namespace clang;
 using namespace clang::driver;
@@ -339,7 +341,7 @@ static void bakeGetLLDInfo(const llvm::Triple &Triple,
 /// jobs (compile, assemble, etc.) are executed normally via Command::Execute,
 /// which for -cc1 jobs uses the CC1Main callback to stay in-process.
 static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
-                           int &Res,
+                           bool IsCxx, int &Res,
                            SmallVectorImpl<std::pair<int, const Command *>> &FailingCommands) {
   StringRef ExeName = llvm::sys::path::filename(Cmd->getExecutable());
 
@@ -349,31 +351,118 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     BakeLldFlavor Flavor = BAKE_LLD_ELF;
     bakeGetLLDInfo(Triple, LinkerName, Flavor);
 
-    std::vector<const char *> LldArgs;
-    std::vector<std::string> OwnedStrings; // keep alive for pointer stability
-    LldArgs.push_back(LinkerName); // argv[0] for LLD
-    for (const char *Arg : Cmd->getArguments())
-      LldArgs.push_back(Arg);
+    // Build a bake::Toolchain matching the LLVM Triple so runtime
+    // functions (ensure_musl_objects, ensure_cxx_runtime, etc.) produce
+    // the right target. This is the ONLY place target info is derived.
+    auto make_toolchain = [&]() {
+      bake::Toolchain xtc;
+      xtc.exe_path = bake::get_self_exe_path();
+      if (xtc.exe_path.empty()) xtc.exe_path = "bake";
+      xtc.target.native = false;  // driver always has explicit target
+      xtc.target.arch = Triple.getArchTypeName(Triple.getArch());
+      if (Triple.isOSDarwin()) {
+        xtc.target.os = "macos";
+        xtc.target.abi = "darwin";
+      } else if (Triple.getOS() == llvm::Triple::Linux) {
+        xtc.target.os = "linux";
+        xtc.target.abi = (Triple.getEnvironment() == llvm::Triple::Musl)
+                             ? "musl" : "gnu";
+      }
+      return xtc;
+    };
 
-    // macOS library/framework search paths.
-    // Follows Zig's model: when SDK is detected, use SDK's libSystem.tbd
-    // (always up-to-date with the system). When no SDK, fall back to
-    // vendored libSystem.tbd. libc++ is NEVER linked dynamically regardless.
-    if (Flavor == BAKE_LLD_MACHO) {
+    bool is_musl = Flavor == BAKE_LLD_ELF &&
+                   Triple.getOS() == llvm::Triple::Linux &&
+                   Triple.getEnvironment() == llvm::Triple::Musl;
+    bool is_darwin = Flavor == BAKE_LLD_MACHO;
+
+    // Detect shared library — crt1.o is for executables only.
+    bool is_shared = false;
+    for (const char *Arg : Cmd->getArguments()) {
+      if (Arg && (StringRef(Arg) == "-shared" ||
+                  StringRef(Arg) == "-Bshareable")) {
+        is_shared = true;
+        break;
+      }
+    }
+
+    std::vector<std::string> Prefix;  // before user args
+    std::vector<std::string> Suffix;  // after user args
+    std::vector<const char *> LldArgs;
+    LldArgs.push_back(LinkerName);
+
+    // ── Target-specific prefix ──
+    if (is_musl) {
+      auto tc = make_toolchain();
+      auto musl = bake::ensure_musl_objects(tc);
+      if (!is_shared && !musl.crt1_o.string().empty())
+        Prefix.push_back(musl.crt1_o.string());
+    } else if (is_darwin) {
+      // Ensure -platform_version (Clang driver omits it on non-macOS hosts).
+      bool has_pv = false;
+      for (const char *A : Cmd->getArguments())
+        if (A && StringRef(A) == "-platform_version") { has_pv = true; break; }
+      if (!has_pv) {
+        Prefix.push_back("-platform_version");
+        Prefix.push_back("macos");
+        Prefix.push_back("15.0");
+        Prefix.push_back("15.0");
+      }
       auto &sdk = getMacosSdkPath();
       if (!sdk.empty()) {
-        // SDK mode: libSystem.tbd + frameworks from SDK.
-        OwnedStrings.push_back("-L" + sdk + "/usr/lib");
-        OwnedStrings.push_back("-F" + sdk + "/System/Library/Frameworks");
+        Prefix.push_back("-L" + sdk + "/usr/lib");
+        Prefix.push_back("-F" + sdk + "/System/Library/Frameworks");
       } else {
-        // Vendored mode: use our own libSystem.tbd.
-        const std::string& lib = bake::find_lib_dir().string();
+        const std::string &lib = bake::find_lib_dir().string();
         if (!lib.empty())
-          OwnedStrings.push_back("-L" + lib + "/libc/darwin");
+          Prefix.push_back("-L" + lib + "/libc/darwin");
       }
-      for (auto &S : OwnedStrings)
-        LldArgs.push_back(S.c_str());
+      Prefix.push_back("-lSystem");
     }
+
+    for (auto &S : Prefix)
+      LldArgs.push_back(S.c_str());
+
+    // ── User args ──
+    // For darwin C++ links: filter out Clang's auto-added -lc++ to avoid
+    // conflict with our static archives.
+    for (const char *Arg : Cmd->getArguments()) {
+      if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
+        continue;
+      LldArgs.push_back(Arg);
+    }
+
+    // ── Target-specific suffix (runtime) ──
+    if (is_musl) {
+      auto tc = make_toolchain();
+      // C++ runtime only for C++ links.
+      if (IsCxx) {
+        auto cxx = bake::ensure_cxx_runtime(tc);
+        if (!cxx.libcxxabi_a.string().empty())
+          Suffix.push_back(cxx.libcxxabi_a.string());
+        if (!cxx.libcxx_a.string().empty())
+          Suffix.push_back(cxx.libcxx_a.string());
+        if (!cxx.libunwind_a.string().empty())
+          Suffix.push_back(cxx.libunwind_a.string());
+      }
+      auto musl = bake::ensure_musl_objects(tc);
+      if (!musl.libc_a.string().empty())
+        Suffix.push_back(musl.libc_a.string());
+      auto compiler_rt = bake::ensure_compiler_rt_objects(tc);
+      if (!compiler_rt.string().empty())
+        Suffix.push_back(compiler_rt.string());
+    } else if (is_darwin && IsCxx) {
+      auto tc = make_toolchain();
+      auto cxx = bake::ensure_cxx_runtime(tc);
+      if (!cxx.libcxxabi_a.string().empty())
+        Suffix.push_back(cxx.libcxxabi_a.string());
+      if (!cxx.libcxx_a.string().empty())
+        Suffix.push_back(cxx.libcxx_a.string());
+      // No libunwind for darwin — libSystem provides unwind.
+    }
+
+    for (auto &S : Suffix)
+      LldArgs.push_back(S.c_str());
 
     int LinkRes = bake_lld_link(static_cast<int>(Flavor),
                                 static_cast<int>(LldArgs.size()),
@@ -572,11 +661,62 @@ static int clang_main(int Argc, const char **Argv,
     }
   }
 
+  // Strip -arch <value> and -isysroot <value> — host-specific, interfere
+  // with bake's target-driven model.
+  for (size_t i = 0; i < Args.size();) {
+    if (Args[i] && (StringRef(Args[i]) == "-arch" ||
+                    StringRef(Args[i]) == "-isysroot")) {
+      size_t remove_count = (i + 1 < Args.size()) ? 2 : 1;
+      Args.erase(Args.begin() + i, Args.begin() + i + remove_count);
+    } else if (Args[i] && StringRef(Args[i]).starts_with("-isysroot=")) {
+      Args.erase(Args.begin() + i);
+    } else {
+      ++i;
+    }
+  }
+
+  // For musl links, add -nostdlib -static so Clang's driver doesn't inject
+  // default crt/libc/libgcc references.
+  if (!target_triple.empty()) {
+    bool is_compile = false;
+    for (const char *A : Args) {
+      if (A && (StringRef(A) == "-c" || StringRef(A) == "-S" ||
+                StringRef(A) == "--precompile" || StringRef(A) == "-fsyntax-only")) {
+        is_compile = true;
+        break;
+      }
+    }
+    if (!is_compile) {
+      bool is_musl_link = StringRef(target_triple).contains("musl");
+      if (is_musl_link) {
+        Args.erase(std::remove_if(Args.begin(), Args.end(),
+            [&](const char *A) {
+              if (!A) return false;
+              StringRef s(A);
+              return s == "-lrt" || s == "-ldl" || s == "-lm" ||
+                     s == "-lpthread" || s == "-lgcc_s" || s == "-lgcc" ||
+                     s == "-latomic";
+            }), Args.end());
+        Args.push_back(Saver.save("-nostdlib").data());
+        bool is_shared = false;
+        for (const char *A : Args) {
+          if (A && (StringRef(A) == "-shared" || StringRef(A) == "-Bshareable")) {
+            is_shared = true;
+            break;
+          }
+        }
+        if (!is_shared)
+          Args.push_back(Saver.save("-static").data());
+      }
+    }
+  }
+
   const std::string lib = bake::find_lib_dir().string();
 
-  bool is_cross_musl = !target_triple.empty() &&
-                       StringRef(target_triple).contains("linux") &&
-                       StringRef(target_triple).contains("musl");
+  // Determine effective target from -target flag (or host default).
+  bool is_musl = !target_triple.empty() &&
+                 StringRef(target_triple).contains("linux") &&
+                 StringRef(target_triple).contains("musl");
 
   bool IsCxx = false;
   for (const char *A : Args) {
@@ -586,81 +726,89 @@ static int clang_main(int Argc, const char **Argv,
     }
   }
 
-  if (is_cross_musl) {
-    // ── linux-musl cross-compilation headers ──
+  // ── Header injection ──
+  //
+  //   -nostdinc / -nostdinc++  → strip ALL default search paths
+  //   -isystem                  → bake's vendored headers (system group)
+  //
+  // User -I paths (from the original command line) stay in the USER group,
+  // which Clang always searches before -isystem. This is how bake's own
+  // runtime compilation works: ensure_cxx_runtime passes library-specific
+  // headers via -I, which naturally take priority over the driver's
+  // -isystem paths (e.g. libunwind's unwind.h beats Clang's builtin).
+
+  if (is_musl) {
     Args.push_back(Saver.save("-nostdinc").data());
     if (IsCxx)
       Args.push_back(Saver.save("-nostdinc++").data());
 
-    // Parse arch from triple (e.g. "x86_64-linux-musl" → "x86_64")
     StringRef arch = StringRef(target_triple).split('-').first;
-    // Map to arch-os dir name (x86_64 → "x86", aarch64 → "aarch64")
     std::string arch_os_dir = (arch == "x86_64") ? "x86" : arch.str();
 
     if (IsCxx && !lib.empty()) {
-      // Cross-compile __config_site (musl-specific values).
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
           (lib + "/libcxx/cross-config").c_str()).data());
-      // libc++ headers (C++ wrappers must shadow C library).
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
           (lib + "/libcxx/include").c_str()).data());
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(
+          (lib + "/libcxxabi/include").c_str()).data());
     }
-    // Clang builtin headers (stdarg.h, stddef.h).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save((lib + "/include").c_str()).data());
     }
-    // Per-arch musl bits (alltypes.h, syscall.h, signal.h, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/" + target_triple).c_str()).data());
     }
-    // Generic musl public headers (stdio.h, stdlib.h, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/generic-musl").c_str()).data());
     }
-    // Per-arch kernel UAPI asm (asm/types.h, asm/unistd.h, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/" + arch_os_dir + "-linux-any").c_str()).data());
     }
-    // Common kernel UAPI (linux/*, asm-generic/*, drm/*, ...).
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/include/any-linux-any").c_str()).data());
     }
   }
-#ifdef __APPLE__
-  else {
-    // ── Native darwin headers ──
+
+  // Detect darwin target: explicit -target flag, or host default.
+  bake::TargetSpec host = bake::detect_host_target();
+  bool is_darwin = !target_triple.empty()
+      ? (StringRef(target_triple).contains("darwin") ||
+         StringRef(target_triple).contains("apple"))
+      : host.is_darwin();
+
+  if (is_darwin) {
     Args.push_back(Saver.save("-nostdinc").data());
     if (IsCxx)
       Args.push_back(Saver.save("-nostdinc++").data());
 
-    // 1. libc++ headers (C++ wrappers that must shadow C builtins)
-    if (!lib.empty()) {
+    if (IsCxx && !lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save((lib + "/libcxx/include").c_str()).data());
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save((lib + "/libcxxabi/include").c_str()).data());
     }
-    // 2. Clang builtin headers
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save((lib + "/include").c_str()).data());
     }
-    // 3. Darwin C library headers
     if (!lib.empty()) {
       Args.push_back(Saver.save("-isystem").data());
       Args.push_back(Saver.save(
         (lib + "/libc/darwin/include").c_str()).data());
     }
-    // 4. macOS framework headers (from SDK)
     auto &sdk = getMacosSdkPath();
     if (!sdk.empty()) {
       Args.push_back(Saver.save("-iframework").data());
@@ -668,13 +816,10 @@ static int clang_main(int Argc, const char **Argv,
         (sdk + "/System/Library/Frameworks").c_str()).data());
     }
 
-    // Set deployment target to match running macOS version.
     const std::string& ver = getMacosVersion();
-    if (!ver.empty()) {
-      Args.push_back(Saver.save(("-mmacosx-version-min=" + ver).c_str()).data());
-    }
+    Args.push_back(Saver.save(
+        ("-mmacosx-version-min=" + (ver.empty() ? "15.0" : ver)).c_str()).data());
   }
-#endif
 
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));
 
@@ -732,7 +877,7 @@ static int clang_main(int Argc, const char **Argv,
       C->getJobs().Print(llvm::errs(), "\n", true);
     } else {
       for (const auto &Cmd : C->getJobs())
-        bakeExecuteJob(&Cmd, TargetTriple, Res, FailingCommands);
+        bakeExecuteJob(&Cmd, TargetTriple, IsCxx, Res, FailingCommands);
     }
 
     for (const auto &P : FailingCommands) {

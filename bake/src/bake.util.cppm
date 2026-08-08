@@ -442,7 +442,7 @@ export inline std::string get_self_exe_path() {
 //
 // All paths are resolved at runtime relative to the executable, eliminating
 // compile-time defines that break when the binary is relocated or packaged.
-// Mirrors Zig's approach: find lib/ by walking up from the exe.
+// Find lib/ by walking up from the exe.
 
 // Walk up from an executable path looking for a lib/ directory that
 // contains libcxx/include. Returns an empty path if not found within
