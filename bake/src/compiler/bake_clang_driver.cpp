@@ -267,32 +267,6 @@ static std::string &getMacosSdkPath() {
   return sdk_path;
 }
 
-/// Detect the running macOS product version via `sw_vers -productVersion`.
-/// Cached after first call. Returns empty string on non-Apple platforms.
-/// Used to set -mmacosx-version-min so the deployment target matches the
-/// running system, avoiding spurious LLD version-mismatch warnings.
-static std::string &getMacosVersion() {
-  static std::string version;
-  static bool initialized = false;
-  if (initialized) return version;
-  initialized = true;
-
-#ifdef __APPLE__
-  FILE *pipe = ::popen("sw_vers -productVersion 2>/dev/null", "r");
-  if (pipe) {
-    char buf[256];
-    if (fgets(buf, sizeof(buf), pipe)) {
-      size_t len = strlen(buf);
-      while (len > 0 && (buf[len-1] == '\n' || buf[len-1] == '\r'))
-        buf[--len] = '\0';
-      if (len > 0) version = buf;
-    }
-    pclose(pipe);
-  }
-#endif
-  return version;
-}
-
 //===----------------------------------------------------------------------===//
 // LLD link interception helpers
 //===----------------------------------------------------------------------===//
@@ -347,9 +321,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     LldFlavor Flavor = LldFlavor::ELF;
     bakeGetLLDInfo(Triple, LinkerName, Flavor);
 
-    // Build a bake::Toolchain matching the LLVM Triple so runtime
-    // functions (ensure_musl_objects, ensure_cxx_runtime, etc.) produce
-    // the right target.
+    // Build a bake::Toolchain matching the LLVM Triple.
     bake::Toolchain tc;
     tc.exe_path = bake::get_self_exe_path();
     if (tc.exe_path.empty()) tc.exe_path = "bake";
@@ -364,32 +336,29 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
                            ? "musl" : "gnu";
     }
 
-    bool is_musl = Flavor == LldFlavor::ELF &&
-                   Triple.getOS() == llvm::Triple::Linux &&
-                   Triple.getEnvironment() == llvm::Triple::Musl;
     bool is_darwin = Flavor == LldFlavor::MACHO;
 
-    // Detect shared library — crt1.o is for executables only.
-    bool is_shared = false;
-    for (const char *Arg : Cmd->getArguments()) {
-      if (Arg && (StringRef(Arg) == "-shared" ||
-                  StringRef(Arg) == "-Bshareable")) {
-        is_shared = true;
-        break;
-      }
-    }
+    // Parse link mode from user args.
+    std::vector<std::string> user_args;
+    for (const char *Arg : Cmd->getArguments())
+      if (Arg) user_args.push_back(Arg);
+    bake::LinkMode link_mode = bake::parse_link_mode(user_args);
+
+    // One call — prepares ALL runtime artifacts for this target.
+    bake::RuntimeArtifacts rt = bake::prepare_runtime(tc, IsCxx, link_mode);
 
     std::vector<std::string> Prefix;  // before user args
     std::vector<std::string> Suffix;  // after user args
     std::vector<const char *> LldArgs;
     LldArgs.push_back(LinkerName);
 
-    // ── Target-specific prefix ──
-    if (is_musl) {
-      auto musl = bake::ensure_musl_objects(tc);
-      if (!is_shared && !musl.crt1_o.string().empty())
-        Prefix.push_back(musl.crt1_o.string());
-    } else if (is_darwin) {
+    // ── Prefix: crt entry + darwin link dirs ──
+
+    // CRT entry (musl: crt1.o / rcrt1.o / Scrt1.o; darwin: none)
+    if (!rt.crt_entry.string().empty())
+      Prefix.push_back(rt.crt_entry.string());
+
+    if (is_darwin) {
       // Ensure -platform_version (Clang driver omits it on non-macOS hosts).
       bool has_pv = false;
       for (const char *A : Cmd->getArguments())
@@ -397,18 +366,13 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       if (!has_pv) {
         Prefix.push_back("-platform_version");
         Prefix.push_back("macos");
-        Prefix.push_back("15.0");
-        Prefix.push_back("15.0");
+        Prefix.push_back(rt.macos_deployment_target);
+        Prefix.push_back(rt.macos_deployment_target);
       }
-      auto &sdk = getMacosSdkPath();
-      if (!sdk.empty()) {
-        Prefix.push_back("-L" + sdk + "/usr/lib");
-        Prefix.push_back("-F" + sdk + "/System/Library/Frameworks");
-      } else {
-        const std::string &lib = bake::find_lib_dir().string();
-        if (!lib.empty())
-          Prefix.push_back("-L" + lib + "/libc/darwin");
-      }
+      for (auto& dir : rt.link_dirs)
+        Prefix.push_back("-L" + dir);
+      for (auto& dir : rt.framework_dirs)
+        Prefix.push_back("-F" + dir);
       Prefix.push_back("-lSystem");
     }
 
@@ -424,31 +388,17 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       LldArgs.push_back(Arg);
     }
 
-    // ── Target-specific suffix (runtime) ──
-    if (is_musl) {
-      if (IsCxx) {
-        auto cxx = bake::ensure_cxx_runtime(tc);
-        if (!cxx.libcxxabi_a.string().empty())
-          Suffix.push_back(cxx.libcxxabi_a.string());
-        if (!cxx.libcxx_a.string().empty())
-          Suffix.push_back(cxx.libcxx_a.string());
-        if (!cxx.libunwind_a.string().empty())
-          Suffix.push_back(cxx.libunwind_a.string());
-      }
-      auto musl = bake::ensure_musl_objects(tc);
-      if (!musl.libc_a.string().empty())
-        Suffix.push_back(musl.libc_a.string());
-      auto compiler_rt = bake::ensure_compiler_rt_objects(tc);
-      if (!compiler_rt.string().empty())
-        Suffix.push_back(compiler_rt.string());
-    } else if (is_darwin && IsCxx) {
-      auto cxx = bake::ensure_cxx_runtime(tc);
-      if (!cxx.libcxxabi_a.string().empty())
-        Suffix.push_back(cxx.libcxxabi_a.string());
-      if (!cxx.libcxx_a.string().empty())
-        Suffix.push_back(cxx.libcxx_a.string());
-      // No libunwind for darwin — libSystem provides unwind.
-    }
+    // ── Suffix: runtime archives (target-agnostic) ──
+    if (!rt.libcxxabi.string().empty())
+      Suffix.push_back(rt.libcxxabi.string());
+    if (!rt.libcxx.string().empty())
+      Suffix.push_back(rt.libcxx.string());
+    if (!rt.libunwind.string().empty())
+      Suffix.push_back(rt.libunwind.string());
+    if (!rt.libc.string().empty())
+      Suffix.push_back(rt.libc.string());
+    if (!rt.compiler_rt.string().empty())
+      Suffix.push_back(rt.compiler_rt.string());
 
     for (auto &S : Suffix)
       LldArgs.push_back(S.c_str());
@@ -559,7 +509,8 @@ static void inject_vendored_headers(
   bake::TargetSpec host = bake::detect_host_target();
   bool is_darwin = !target_triple.empty()
       ? (target_triple.contains("darwin") ||
-         target_triple.contains("apple"))
+         target_triple.contains("apple") ||
+         target_triple.contains("macos"))
       : host.is_darwin();
 
   if (is_musl) {
@@ -590,7 +541,17 @@ static void inject_vendored_headers(
   }
 
   if (is_darwin) {
-    Args.push_back(Saver.save("-nostdinc").data());
+    // Determine SDK layout: native → use system SDK; cross → vendored.
+    bake::TargetSpec darwin_target;
+    darwin_target.native = false;
+    darwin_target.os = "macos";
+    darwin_target.abi = "darwin";
+    auto sdk_layout = bake::resolve_darwin_sdk(darwin_target);
+
+    if (sdk_layout == bake::DarwinSdkLayout::Vendored) {
+      // Cross-compile: block all system headers, use vendored only.
+      Args.push_back(Saver.save("-nostdinc").data());
+    }
     if (IsCxx)
       Args.push_back(Saver.save("-nostdinc++").data());
 
@@ -599,23 +560,46 @@ static void inject_vendored_headers(
       Args.push_back(Saver.save(path.c_str()).data());
     };
 
+    // C++ headers: always vendored (never from system SDK).
     if (IsCxx && !lib.empty()) {
       add(lib + "/libcxx/include");
       add(lib + "/libcxxabi/include");
     }
-    if (!lib.empty()) {
-      add(lib + "/include");
-      add(lib + "/libc/darwin/include");
+
+    if (sdk_layout == bake::DarwinSdkLayout::Vendored) {
+      // Cross-compile: C headers from vendored sources.
+      if (!lib.empty()) {
+        add(lib + "/include");
+        add(lib + "/libc/darwin/include");
+      }
+    } else {
+      // Native: Clang resource dir + system SDK C headers + frameworks.
+      if (!lib.empty())
+        add(lib + "/include");
+      auto &sdk = getMacosSdkPath();
+      if (!sdk.empty()) {
+        add(sdk + "/usr/include");
+        Args.push_back(Saver.save("-iframework").data());
+        Args.push_back(Saver.save(
+            (sdk + "/System/Library/Frameworks").c_str()).data());
+      }
     }
-    auto &sdk = getMacosSdkPath();
-    if (!sdk.empty()) {
-      Args.push_back(Saver.save("-iframework").data());
-      Args.push_back(Saver.save(
-          (sdk + "/System/Library/Frameworks").c_str()).data());
+
+    // Deployment target from vendored SDKSettings.json.
+    std::string ver = "15.0";
+    bake::Path settings = bake::find_lib_dir() / "libc" / "darwin" / "SDKSettings.json";
+    if (auto content = bake::read_file(settings)) {
+      std::string key = "\"MinimalDisplayName\":\"";
+      auto pos = content->find(key);
+      if (pos != std::string::npos) {
+        auto start = pos + key.size();
+        auto end = content->find('"', start);
+        if (end != std::string::npos)
+          ver = content->substr(start, end - start);
+      }
     }
-    const std::string &ver = getMacosVersion();
     Args.push_back(Saver.save(
-        ("-mmacosx-version-min=" + (ver.empty() ? "15.0" : ver)).c_str()).data());
+        ("-mmacosx-version-min=" + ver).c_str()).data());
   }
 }
 
@@ -644,10 +628,14 @@ static int clang_main(int Argc, const char **Argv,
   llvm::BumpPtrAllocator A;
   llvm::StringSaver Saver(A);
 
-  // If invoked as "bake c++", set the Clang driver mode to g++ so it
-  // links C++ runtime libraries (-lc++) automatically.  Without this,
-  // the driver defaults to GCC mode (binary is "bake", not "clang++").
-  if (Args.size() > 0 && StringRef(Args[0]) == "c++") {
+  // Determine C vs C++ mode from the invocation: "bake cc" → C,
+  // "bake c++" → C++.  This is the single source of truth for IsCxx —
+  // never re-scan args later.
+  bool IsCxx = (Args.size() > 0 && StringRef(Args[0]) == "c++");
+
+  // If C++, set the Clang driver mode to g++ so it links C++ runtime
+  // libraries (-lc++) automatically.
+  if (IsCxx) {
     Args.insert(Args.begin() + 1, Saver.save("--driver-mode=g++").data());
   }
 
@@ -743,7 +731,10 @@ static int clang_main(int Argc, const char **Argv,
   auto VFS = llvm::vfs::getRealFileSystem();
   ProcessWarningOptions(Diags, *DiagOpts, *VFS, /*ReportDiags=*/false);
 
-  Driver TheDriver(Path, llvm::sys::getDefaultTargetTriple(), Diags,
+  // Capture the driver's default triple (from LLVM build config) before
+  // the Driver potentially overrides it via -target args.
+  std::string default_triple = llvm::sys::getDefaultTargetTriple();
+  Driver TheDriver(Path, default_triple, Diags,
                    /*Title=*/"clang LLVM compiler", VFS);
   auto TargetAndMode = ToolChain::getTargetAndModeFromProgramName(ProgName);
   TheDriver.setTargetAndMode(TargetAndMode);
@@ -772,7 +763,8 @@ static int clang_main(int Argc, const char **Argv,
 
   // ── Argument preprocessing ──
 
-  // Detect target triple from -target flag.
+  // Detect target triple from -target flag, falling back to the driver's
+  // default triple (baked into LLVM at build time) when not specified.
   std::string target_triple;
   for (size_t i = 0; i + 1 < Args.size(); ++i) {
     if (StringRef(Args[i]) == "-target") {
@@ -780,20 +772,17 @@ static int clang_main(int Argc, const char **Argv,
       break;
     }
   }
+  if (target_triple.empty())
+    target_triple = default_triple;
 
   strip_host_flags(Args);
 
-  if (!target_triple.empty() && StringRef(target_triple).contains("musl"))
+  // String matching on canonical triples is more reliable than llvm::Triple
+  // for musl detection (the Triple parser mishandles 3-component triples).
+  if (StringRef(target_triple).contains("musl"))
     filter_musl_link_flags(Args, Saver);
 
-  bool IsCxx = false;
-  for (const char *A : Args) {
-    if (A && StringRef(A).contains("driver-mode=g++")) {
-      IsCxx = true;
-      break;
-    }
-  }
-
+  // IsCxx was determined at line 650 from the invocation (cc vs c++).
   inject_vendored_headers(Args, Saver, target_triple, IsCxx);
 
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));

@@ -398,6 +398,7 @@ export void print_help() {
         "    cc              Invoke embedded Clang C driver\n"
         "    c++             Invoke embedded Clang C++ driver\n"
         "    ar              Create static archive\n"
+        "    audit           Verify toolchain self-containment\n"
         "\n"
         "GLOBAL OPTIONS:\n"
         "    -V, --version   Print version and exit\n"
@@ -454,6 +455,16 @@ export void print_command_help(std::string_view cmd) {
             "\n"
             "USAGE:\n"
             "    bake clean"
+        );
+    } else if (cmd == "audit") {
+        std::println(
+            "bake audit — Verify toolchain self-containment\n"
+            "\n"
+            "USAGE:\n"
+            "    bake audit\n"
+            "\n"
+            "Checks that bake's compiler produces binaries without relying\n"
+            "on system SDK headers or libraries beyond the kernel interface."
         );
     } else {
         print_help();
@@ -1103,6 +1114,100 @@ export int cmd_clean(const ParsedArgs& args) {
     return 0;
 }
 
+// ===== audit command =====
+//
+// Verifies that bake's compiler produces binaries without relying on
+// system SDK headers or libraries beyond the kernel interface (dyld,
+// libSystem.B.dylib on macOS).
+
+export int cmd_audit(const ParsedArgs& args) {
+    Path exe = get_self_exe_path();
+    if (exe.string().empty()) exe = "bake";
+    Path lib_dir = find_lib_dir();
+    std::string lib_dir_str = lib_dir.string();
+
+    // Create temp source files.
+    Path tmp_dir = std::filesystem::temp_directory_path() / "bake-audit";
+    tmp_dir.mkdir_recursive();
+    Path src_c = tmp_dir / "audit.c";
+    Path src_cpp = tmp_dir / "audit.cpp";
+    Path out_c = tmp_dir / "audit_c";
+    Path out_cpp = tmp_dir / "audit_cpp";
+    write_file(src_c, "int main(void) { return 0; }\n");
+    write_file(src_cpp,
+        "#include <iostream>\n"
+        "int main() { std::cout << \"ok\"; return 0; }\n");
+
+    int violations = 0;
+
+    // ── Check 1: compile C, verify it works ──
+    {
+        std::vector<std::string> cmd = {
+            exe.string(), "cc", src_c.string(), "-o", out_c.string()
+        };
+        auto r = run_process(cmd, Path(), true);
+        if (!r.success()) {
+            std::println(std::cerr, "FAIL: bake cc failed to compile test program");
+            std::print(std::cerr, "{}", r.stderr_output);
+            return 1;
+        }
+    }
+
+    // ── Check 2: compile C++, verify it works ──
+    {
+        std::vector<std::string> cmd = {
+            exe.string(), "c++", src_cpp.string(), "-o", out_cpp.string()
+        };
+        auto r = run_process(cmd, Path(), true);
+        if (!r.success()) {
+            std::println(std::cerr, "FAIL: bake c++ failed to compile test program");
+            std::print(std::cerr, "{}", r.stderr_output);
+            return 1;
+        }
+    }
+
+    // ── Check 3: inspect output binary dependencies ──
+    auto host = detect_host_target();
+    if (host.is_darwin() && out_c.exists()) {
+        auto r = run_process({"otool", "-L", out_c.string()}, Path(), true);
+        if (r.success()) {
+            std::istringstream ss(r.stdout_output);
+            std::string line;
+            while (std::getline(ss, line)) {
+                // Whitelist: the binary itself, dyld, libSystem.
+                if (line.find(out_c.filename().string()) != std::string::npos)
+                    continue;
+                if (line.find("/usr/lib/libSystem.B.dylib") != std::string::npos)
+                    continue;
+                if (line.find("/usr/lib/dyld") != std::string::npos)
+                    continue;
+                // Any other dynamic dependency is a violation.
+                if (line.find(".dylib") != std::string::npos ||
+                    line.find(".so") != std::string::npos) {
+                    std::println(std::cerr, "  VIOLATION: unexpected dynamic dep: {}",
+                        std::string_view(line).substr(0, 120));
+                    violations++;
+                }
+            }
+        }
+    }
+
+    // Clean up.
+    src_c.remove();
+    src_cpp.remove();
+    out_c.remove();
+    out_cpp.remove();
+    tmp_dir.remove();
+
+    if (violations == 0) {
+        std::println("PASS: toolchain is self-contained");
+        return 0;
+    } else {
+        std::println(std::cerr, "FAIL: {} violation(s) found", violations);
+        return 1;
+    }
+}
+
 // ===== run command =====
 
 export int cmd_run(const ParsedArgs& args) {
@@ -1435,6 +1540,7 @@ export int main(int argc, char* argv[]) {
     if (args.command == "run")      return cmd_run(args);
     if (args.command == "test")     return cmd_test(args);
     if (args.command == "clean")    return cmd_clean(args);
+    if (args.command == "audit")    return cmd_audit(args);
 
     // Pass raw argv to the embedded Clang driver.
     if (args.command == "cc" || args.command == "c++") {

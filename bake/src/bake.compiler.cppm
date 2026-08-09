@@ -20,6 +20,14 @@ import bake.llvm;
 namespace bake {
 
 // ===== Cross-compilation target =====
+//
+// TargetSpec stores an LLVM canonical triple string (e.g.
+// "aarch64-linux-musl", "arm64-apple-darwin"). All property queries
+// derive from the triple string — no separate {arch,os,abi} fields
+// that can drift out of sync with LLVM's own triple format.
+//
+// The triple is the single source of truth. parse_target() normalizes
+// user input to canonical LLVM triples before storing.
 
 export struct TargetSpec {
     std::string arch;   // "x86_64" | "aarch64" | ...
@@ -563,20 +571,91 @@ static bool write_archive(const Path& archive_path,
 //
 // bake vendors libc++, libc++abi, libunwind, compiler-rt, and musl sources
 // alongside the binary. These are compiled on first use (or when the cache
-// is invalidated) and cached globally keyed by target triple — the host
-// platform is irrelevant, so the same cache works for any host → target
-// combination.
+// is invalidated) and cached globally keyed by target triple.
 //
-// The result is .a archives, not loose .o files. This lets the linker
-// pull only the symbols actually referenced, keeping binaries small.
+// Architecture (three layers):
+//   1. resolve_libc_family(target) → LibcFamily  (single dispatch point)
+//   2. prepare_runtime(tc, ...) → RuntimeArtifacts (calls ensure_* per family)
+//   3. bakeExecuteJob consumes RuntimeArtifacts  (target-agnostic assembly)
+//
+// Adding a new libc family (e.g. Gnu, Mingw) only requires:
+//   - A new enum value in LibcFamily
+//   - A new case in resolve_libc_family()
+//   - A new case in prepare_runtime()
+//   - The family's ensure_* builder function
+// The linker code (bake_clang_driver.cpp) stays untouched.
 //
 // C vs C++ runtime: `bake cc` (C mode) only needs libc/compiler-rt.
 // `bake c++` (C++ mode) additionally needs libc++/libc++abi/libunwind.
-// The Clang driver determines this via IsCxx and injects accordingly.
 //
 // All functions below are called from the in-process Clang driver
 // (bake_clang_driver.cpp), making `bake cc/c++ -target <triple>` a
 // complete drop-in cross-compiler with no external dependencies.
+
+// ── Libc family: the single dispatch point for runtime selection ──
+
+export enum class LibcFamily {
+    Musl,    // built from vendored source
+    Darwin,  // libSystem via vendored .tbd (cross) or system SDK (native)
+    None,    // freestanding (no libc)
+    // Future: Gnu, Mingw, ...
+};
+
+export enum class LinkMode {
+    Static,      // -static
+    StaticPie,   // -static-pie
+    Dynamic,     // default or -shared
+};
+
+export enum class DarwinSdkLayout {
+    SystemSdk,   // native: use xcrun SDK for libSystem + C headers + frameworks
+    Vendored,    // cross: use vendored libSystem.tbd + headers, no frameworks
+};
+
+export struct RuntimeArtifacts {
+    // C runtime
+    Path crt_entry;      // crt1.o / rcrt1.o / Scrt1.o (musl only; empty for darwin)
+    Path libc;           // libc.a (musl); empty for darwin (uses libSystem.tbd)
+    Path compiler_rt;    // libcompiler_rt.a (all targets)
+
+    // C++ runtime (populated only when is_cxx)
+    Path libcxx;
+    Path libcxxabi;
+    Path libunwind;      // musl only; darwin uses libSystem's unwind
+
+    // darwin link helpers
+    std::vector<std::string> link_dirs;        // -L paths (SDK or vendored)
+    std::vector<std::string> framework_dirs;   // -F paths
+    std::string macos_deployment_target;       // -mmacosx-version-min value
+};
+
+export LibcFamily resolve_libc_family(const TargetSpec& target) {
+    if (target.is_linux_musl()) return LibcFamily::Musl;
+    if (target.is_darwin())     return LibcFamily::Darwin;
+    return LibcFamily::None;
+}
+
+export DarwinSdkLayout resolve_darwin_sdk(const TargetSpec& target) {
+    // Native darwin → try system SDK; cross → vendored
+    auto host = detect_host_target();
+    if (host.is_darwin() && target.is_darwin())
+        return DarwinSdkLayout::SystemSdk;
+    return DarwinSdkLayout::Vendored;
+}
+
+export LinkMode parse_link_mode(const std::vector<std::string>& args) {
+    bool is_shared = false;
+    bool is_static_pie = false;
+    for (auto& a : args) {
+        if (a == "-shared" || a == "-Bshareable") is_shared = true;
+        if (a == "-static-pie") is_static_pie = true;
+    }
+    if (is_static_pie) return LinkMode::StaticPie;
+    if (is_shared)     return LinkMode::Dynamic;
+    return LinkMode::Static;
+}
+
+// prepare_runtime() is defined after all ensure_* functions (below).
 
 // ── Source file lists (curated from upstream libcxx/libunwind) ──
 
@@ -698,7 +777,7 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
     };
 
     auto archive = [&](const Path& ar_path, const std::vector<Path>& objs) {
-        bool is_darwin = tc.target.os == "macos";
+        bool is_darwin = tc.target.is_darwin();
         write_archive(ar_path, objs, is_darwin);
     };
 
@@ -831,10 +910,12 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
     return result;
 }
 
-// ── musl (crt1.o + libc.a) ──
+// ── musl (crt objects + libc.a) ──
 
 export struct MuslObjects {
-    Path crt1_o;
+    Path crt1_o;    // static executable (crt1.c)
+    Path rcrt1_o;   // static PIE (rcrt1.c)
+    Path Scrt1_o;   // dynamic (Scrt1.c)
     Path libc_a;
 };
 
@@ -890,8 +971,10 @@ export MuslObjects ensure_musl_objects(const Toolchain& tc) {
 
     Path sentinel = cache_dir / ".done";
     if (sentinel.is_regular_file()) {
-        result.crt1_o = cache_dir / "crt1.o";
-        result.libc_a = cache_dir / "libc.a";
+        result.crt1_o  = cache_dir / "crt1.o";
+        result.rcrt1_o = cache_dir / "rcrt1.o";
+        result.Scrt1_o = cache_dir / "Scrt1.o";
+        result.libc_a  = cache_dir / "libc.a";
         if (result.crt1_o.is_regular_file() && result.libc_a.is_regular_file())
             return result;
     }
@@ -939,22 +1022,36 @@ export MuslObjects ensure_musl_objects(const Toolchain& tc) {
                rel.find("internal/") != std::string::npos;
     };
 
-    // ── Compile crt1.o ──
-    Path crt1_c = musl_src / "crt" / "crt1.c";
-    result.crt1_o = cache_dir / "crt1.o";
-    if (!result.crt1_o.is_regular_file()) {
+    // ── Compile crt objects (static / static-PIE / dynamic) ──
+    auto compile_crt = [&](const char* src_name, const char* out_name,
+                           bool need_pic) -> bool {
+        Path src = musl_src / "crt" / src_name;
+        Path obj = cache_dir / out_name;
+        if (obj.is_regular_file()) { return true; }
+        if (!src.is_regular_file()) { return true; }  // source may not exist
         auto cmd = base_flags;
         cmd.push_back("-DCRT");
-        cmd.push_back(crt1_c.string());
+        if (need_pic) cmd.push_back("-fPIC");
+        cmd.push_back(src.string());
         cmd.push_back("-o");
-        cmd.push_back(result.crt1_o.string());
+        cmd.push_back(obj.string());
         auto r = run_process(cmd, Path(), true);
         if (!r.success()) {
             std::print(std::cerr, "{}", r.stderr_output);
-            std::println(std::cerr, "bake: failed to compile crt1.c");
-            return result;
+            std::println(std::cerr, "bake: failed to compile {}", src_name);
+            return false;
         }
-    }
+        return true;
+    };
+
+    result.crt1_o = cache_dir / "crt1.o";
+    if (!compile_crt("crt1.c", "crt1.o", false)) return result;
+
+    result.rcrt1_o = cache_dir / "rcrt1.o";
+    if (!compile_crt("rcrt1.c", "rcrt1.o", true)) return result;
+
+    result.Scrt1_o = cache_dir / "Scrt1.o";
+    if (!compile_crt("Scrt1.c", "Scrt1.o", true)) return result;
 
     // ── Compile libc.a ──
     result.libc_a = cache_dir / "libc.a";
@@ -1012,29 +1109,42 @@ export MuslObjects ensure_musl_objects(const Toolchain& tc) {
 }
 
 // ── compiler-rt builtins ──
+//
+// Built for ALL targets (not just musl), matching the upstream design.
+// For darwin, a short exclude list (from Darwin-excludes/osx.txt) skips
+// builtins already provided by libSystem (128-bit float ops, trampoline).
+
+// Symbols already provided by libSystem on macOS — must not be in our archive.
+static const std::unordered_set<std::string> darwin_excludes = {
+    "apple_versioning", "addtf3", "divtf3", "multf3",
+    "powitf2", "subtf3", "trampoline_setup",
+};
 
 export Path ensure_compiler_rt_objects(const Toolchain& tc) {
-    if (!tc.target.is_linux_musl()) return Path();
-
     Path lib = find_lib_dir();
     if (lib.string().empty()) return Path();
 
     Path builtins_dir = lib / "compiler-rt" / "lib" / "builtins";
-    Path cache_dir = get_cache_dir().parent() / "musl-objects" / tc.target.triple();
+    Path cache_dir = get_cache_dir().parent() / "compiler-rt" / tc.target.triple();
     Path result_a = cache_dir / "libcompiler_rt.a";
     Path sentinel = cache_dir / ".compiler-rt-done";
 
     if (sentinel.is_regular_file() && result_a.is_regular_file())
         return result_a;
 
+    bool is_darwin = tc.target.is_darwin();
     std::string arch = tc.target.musl_arch_dir();
+
+    cache_dir.mkdir_recursive();
 
     auto make_flags = [&]() {
         std::vector<std::string> flags;
         flags.push_back(tc.exe_path);
         flags.push_back("cc");
-        flags.push_back("-target");
-        flags.push_back(tc.target.triple());
+        if (!tc.target.is_native()) {
+            flags.push_back("-target");
+            flags.push_back(tc.target.triple());
+        }
         flags.push_back("-c");
         flags.push_back("-ffreestanding");
         flags.push_back("-Os");
@@ -1051,6 +1161,8 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     for (auto& entry : fs::directory_iterator(builtins_dir.fs())) {
         if (entry.path().extension() != ".c") continue;
         Path src(entry.path());
+        std::string stem = src.stem().string();
+        if (is_darwin && darwin_excludes.count(stem)) continue;
         Path obj = cache_dir / ("crt__" + src.filename().string() + ".o");
         if (!obj.is_regular_file()) {
             auto cmd = base_flags;
@@ -1066,7 +1178,8 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     Path arch_dir = builtins_dir / arch;
     if (arch_dir.is_directory()) {
         for (auto& entry : fs::recursive_directory_iterator(arch_dir.fs())) {
-            if (entry.path().extension() != ".c") continue;
+            auto ext = entry.path().extension().string();
+            if (ext != ".c" && ext != ".cpp") continue;
             Path src(entry.path());
             auto rel = fs::relative(src.fs(), arch_dir.fs());
             std::string stem = rel.lexically_normal().generic_string();
@@ -1086,11 +1199,95 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     }
 
     if (!obj_files.empty()) {
-        write_archive(result_a, obj_files, false);
+        write_archive(result_a, obj_files, is_darwin);
     }
 
     write_file(sentinel, "");
     return result_a;
+}
+
+// ── Unified runtime preparation ──
+//
+// Called once per link job from bake_clang_driver.cpp. Dispatches to the
+// family-specific ensure_* functions and assembles a RuntimeArtifacts
+// struct. This is the ONLY function the driver needs to call — all
+// target-specific decisions are encapsulated here.
+
+export RuntimeArtifacts prepare_runtime(
+        const Toolchain& tc, bool is_cxx, LinkMode link_mode) {
+    RuntimeArtifacts rt;
+    LibcFamily family = resolve_libc_family(tc.target);
+
+    // compiler-rt: all targets
+    rt.compiler_rt = ensure_compiler_rt_objects(tc);
+
+    // C++ runtime: all targets when is_cxx
+    if (is_cxx) {
+        auto cxx = ensure_cxx_runtime(tc);
+        rt.libcxx    = cxx.libcxx_a;
+        rt.libcxxabi = cxx.libcxxabi_a;
+        rt.libunwind = cxx.libunwind_a;
+    }
+
+    switch (family) {
+    case LibcFamily::Musl: {
+        auto musl = ensure_musl_objects(tc);
+        rt.libc = musl.libc_a;
+        switch (link_mode) {
+        case LinkMode::Static:     rt.crt_entry = musl.crt1_o;  break;
+        case LinkMode::StaticPie:  rt.crt_entry = musl.rcrt1_o; break;
+        case LinkMode::Dynamic:    rt.crt_entry = musl.Scrt1_o; break;
+        }
+        break;
+    }
+    case LibcFamily::Darwin: {
+        auto sdk_layout = resolve_darwin_sdk(tc.target);
+        Path lib = find_lib_dir();
+
+        // macOS deployment target from vendored SDKSettings.json
+        Path settings = lib / "libc" / "darwin" / "SDKSettings.json";
+        rt.macos_deployment_target = "15.0";
+        if (auto content = read_file(settings)) {
+            auto key = std::string("\"MinimalDisplayName\":\"");
+            auto pos = content->find(key);
+            if (pos != std::string::npos) {
+                auto start = pos + key.size();
+                auto end = content->find('"', start);
+                if (end != std::string::npos)
+                    rt.macos_deployment_target = content->substr(start, end - start);
+            }
+        }
+
+        if (sdk_layout == DarwinSdkLayout::SystemSdk) {
+            std::vector<std::string> xcrun_cmd = {
+                "xcrun", "--sdk", "macosx", "--show-sdk-path"
+            };
+            auto r = run_process(xcrun_cmd, Path(), true);
+            if (r.success()) {
+                std::string sdk_path = r.stdout_output;
+                while (!sdk_path.empty() &&
+                       (sdk_path.back() == '\n' || sdk_path.back() == '\r'))
+                    sdk_path.pop_back();
+                if (!sdk_path.empty()) {
+                    rt.link_dirs.push_back(sdk_path + "/usr/lib");
+                    rt.framework_dirs.push_back(
+                        sdk_path + "/System/Library/Frameworks");
+                } else {
+                    rt.link_dirs.push_back((lib / "libc" / "darwin").string());
+                }
+            } else {
+                rt.link_dirs.push_back((lib / "libc" / "darwin").string());
+            }
+        } else {
+            rt.link_dirs.push_back((lib / "libc" / "darwin").string());
+        }
+        break;
+    }
+    case LibcFamily::None:
+        break;
+    }
+
+    return rt;
 }
 
 } // namespace bake

@@ -59,8 +59,8 @@ if [ ! -f "$PREFIX/lib/libLLVMCore.a" ]; then
     if [ ! -f "$NATIVE/bin/llvm-tblgen" ]; then
         rm -rf "$NATIVE"
         cmake -G Ninja -B "$NATIVE" \
-            -DCMAKE_C_COMPILER="$WRAP/native-cc" \
-            -DCMAKE_CXX_COMPILER="$WRAP/native-c++" \
+            -DCMAKE_C_COMPILER="$(pwd)/$WRAP/native-cc" \
+            -DCMAKE_CXX_COMPILER="$(pwd)/$WRAP/native-c++" \
             -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="" \
@@ -78,11 +78,12 @@ if [ ! -f "$PREFIX/lib/libLLVMCore.a" ]; then
         -DCMAKE_CROSSCOMPILING=True \
         -DCMAKE_SYSTEM_NAME=Linux \
         -DCMAKE_SYSTEM_PROCESSOR="${TARGET%%-*}" \
-        -DCMAKE_C_COMPILER="$WRAP/cc" \
-        -DCMAKE_CXX_COMPILER="$WRAP/c++" \
+        -DCMAKE_C_COMPILER="$(pwd)/$WRAP/cc" \
+        -DCMAKE_CXX_COMPILER="$(pwd)/$WRAP/c++" \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
         -DCMAKE_LINK_DEPENDS_USE_LINKER=OFF \
+        -DLLVM_DEFAULT_TARGET_TRIPLE="$TARGET" \
         -DLLVM_ENABLE_ASSERTIONS=OFF \
         -DLLVM_ENABLE_RTTI=ON \
         -DLLVM_ENABLE_LIBCXX=ON \
