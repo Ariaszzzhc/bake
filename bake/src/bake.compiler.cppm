@@ -624,7 +624,7 @@ export enum class LibcFamily {
     Musl,    // built from vendored source
     Darwin,  // libSystem via vendored .tbd (cross) or system SDK (native)
     None,    // freestanding (no libc)
-    // Future: Gnu, Mingw, ...
+    // Future: Windows (mingw-w64), Glibc, Ohos
 };
 
 export enum class LinkMode {
