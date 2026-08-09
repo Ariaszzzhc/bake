@@ -21,74 +21,100 @@ namespace bake {
 
 // ===== Cross-compilation target =====
 //
-// TargetSpec stores an LLVM canonical triple string (e.g.
-// "aarch64-linux-musl", "arm64-apple-darwin"). All property queries
-// derive from the triple string — no separate {arch,os,abi} fields
-// that can drift out of sync with LLVM's own triple format.
+// TargetSpec stores a canonical triple string in arch-os-abi format
+// (no vendor field), matching the multiarch directory convention used
+// by libc header paths and cache keys. When passed to Clang via
+// -target, LLVM's normalize() inserts the implicit "unknown" vendor
+// automatically — the canonical form is always recoverable.
 //
-// The triple is the single source of truth. parse_target() normalizes
-// user input to canonical LLVM triples before storing.
+// The triple string is the single source of truth. All property
+// queries (is_darwin, is_linux_musl, arch, …) derive from it.
 
 export struct TargetSpec {
-    std::string arch;   // "x86_64" | "aarch64" | ...
-    std::string os;     // "linux" | "macos"
-    std::string abi;    // "musl" | "gnu" | "darwin"
-    bool native = true; // true = compiling for host (no -target flag)
+    std::string triple_;  // "arch-os[-abi]" (empty when native)
+    bool native_ = true;  // true = compiling for host (no -target flag)
 
-    bool is_native() const { return native; }
-    bool is_linux_musl() const { return os == "linux" && abi == "musl"; }
-    bool is_linux() const { return os == "linux"; }
-    bool is_darwin() const { return os == "macos" || abi == "darwin"; }
+    bool is_native() const { return native_; }
 
-    std::string triple() const {
-        if (native) return "";
-        if (os == "macos") {
-            std::string apple_arch = (arch == "aarch64") ? "arm64" : arch;
-            return apple_arch + "-apple-darwin";
-        }
-        return arch + "-" + os + "-" + abi;
+    bool is_darwin() const {
+        return triple_.contains("macos") || triple_.contains("darwin")
+            || triple_.contains("apple");
     }
 
-    std::string musl_arch_dir() const { return arch; }
+    bool is_linux() const { return triple_.contains("linux"); }
+
+    bool is_linux_musl() const {
+        return triple_.contains("linux") && triple_.contains("musl");
+    }
+
+    // Architecture component — first segment of the triple.
+    std::string arch() const {
+        auto pos = triple_.find('-');
+        return pos == std::string::npos ? triple_ : triple_.substr(0, pos);
+    }
+
+    // Returns the triple string for the -target flag, or "" for native.
+    std::string triple() const { return native_ ? "" : triple_; }
 };
 
 // Detect host platform. This is the ONLY place with #ifdef for host detection.
 export TargetSpec detect_host_target() {
     TargetSpec t;
-    t.native = true;
+    t.native_ = true;
 #if defined(__APPLE__) && defined(__aarch64__)
-    t.arch = "aarch64"; t.os = "macos"; t.abi = "darwin";
+    t.triple_ = "aarch64-macos";
 #elif defined(__APPLE__) && defined(__x86_64__)
-    t.arch = "x86_64";  t.os = "macos"; t.abi = "darwin";
+    t.triple_ = "x86_64-macos";
 #elif defined(__linux__) && defined(__aarch64__)
-    t.arch = "aarch64"; t.os = "linux"; t.abi = "gnu";
+    t.triple_ = "aarch64-linux";
 #elif defined(__linux__) && defined(__x86_64__)
-    t.arch = "x86_64";  t.os = "linux"; t.abi = "gnu";
+    t.triple_ = "x86_64-linux";
 #else
-    t.arch = "unknown"; t.os = "unknown"; t.abi = "unknown";
+    t.triple_ = "unknown";
 #endif
     return t;
 }
 
-// Parse "x86_64-linux-musl" → TargetSpec.
-// "" / "native" / "host" → native (all fields empty).
+// Parse a user-supplied target spec into a canonical arch-os-abi triple.
+// Handles both 3-component (Zig-style "aarch64-linux-musl") and
+// 4-component (LLVM-style "aarch64-unknown-linux-musl") inputs by
+// discarding the vendor field. Architecture aliases are normalized
+// (arm64→aarch64, amd64→x86_64) to match LLVM/Clang canonical names.
 export TargetSpec parse_target(std::string_view spec) {
     TargetSpec t;
     if (spec.empty() || spec == "native" || spec == "host") return t;
-    t.native = false;
+    t.native_ = false;
 
-    auto pos1 = spec.find('-');
-    if (pos1 == std::string_view::npos) return t;
-    t.arch = std::string(spec.substr(0, pos1));
+    // Split on '-', discarding known vendor components.
+    static constexpr std::string_view vendors[] = {
+        "unknown", "apple", "pc", "squeakboard", "wrs", "img", "myriad"
+    };
 
-    auto rest = spec.substr(pos1 + 1);
-    auto pos2 = rest.find('-');
-    if (pos2 == std::string_view::npos) {
-        t.os = std::string(rest);
-        return t;
+    std::vector<std::string> kept;
+    size_t start = 0;
+    for (size_t i = 0; i <= spec.size(); ++i) {
+        if (i == spec.size() || spec[i] == '-') {
+            if (i > start) {
+                std::string_view comp = spec.substr(start, i - start);
+                bool is_vendor = false;
+                for (auto v : vendors)
+                    if (comp == v) { is_vendor = true; break; }
+                if (!is_vendor) kept.emplace_back(comp);
+            }
+            start = i + 1;
+        }
     }
-    t.os = std::string(rest.substr(0, pos2));
-    t.abi = std::string(rest.substr(pos2 + 1));
+
+    if (kept.empty()) return t;
+
+    // Normalize architecture aliases to LLVM canonical names.
+    if (kept[0] == "arm64")  kept[0] = "aarch64";
+    if (kept[0] == "amd64")  kept[0] = "x86_64";
+
+    t.triple_ = kept[0];
+    for (size_t i = 1; i < kept.size(); ++i)
+        t.triple_ += "-" + kept[i];
+
     return t;
 }
 
@@ -964,7 +990,7 @@ export MuslObjects ensure_musl_objects(const Toolchain& tc) {
     if (lib.string().empty()) return result;
 
     Path musl_src = lib / "libc" / "musl";
-    std::string arch = tc.target.musl_arch_dir();
+    std::string arch = tc.target.arch();
 
     Path cache_root = get_cache_dir().parent() / "musl-objects";
     Path cache_dir = cache_root / tc.target.triple();
@@ -1133,7 +1159,7 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
         return result_a;
 
     bool is_darwin = tc.target.is_darwin();
-    std::string arch = tc.target.musl_arch_dir();
+    std::string arch = tc.target.arch();
 
     cache_dir.mkdir_recursive();
 

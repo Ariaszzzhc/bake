@@ -325,16 +325,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     bake::Toolchain tc;
     tc.exe_path = bake::get_self_exe_path();
     if (tc.exe_path.empty()) tc.exe_path = "bake";
-    tc.target.native = false;
-    tc.target.arch = Triple.getArchTypeName(Triple.getArch());
-    if (Triple.isOSDarwin()) {
-      tc.target.os = "macos";
-      tc.target.abi = "darwin";
-    } else if (Triple.getOS() == llvm::Triple::Linux) {
-      tc.target.os = "linux";
-      tc.target.abi = (Triple.getEnvironment() == llvm::Triple::Musl)
-                           ? "musl" : "gnu";
-    }
+    tc.target = bake::parse_target(Triple.getTriple());
 
     bool is_darwin = Flavor == LldFlavor::MACHO;
 
@@ -542,10 +533,7 @@ static void inject_vendored_headers(
 
   if (is_darwin) {
     // Determine SDK layout: native → use system SDK; cross → vendored.
-    bake::TargetSpec darwin_target;
-    darwin_target.native = false;
-    darwin_target.os = "macos";
-    darwin_target.abi = "darwin";
+    bake::TargetSpec darwin_target = bake::parse_target("aarch64-macos");
     auto sdk_layout = bake::resolve_darwin_sdk(darwin_target);
 
     if (sdk_layout == bake::DarwinSdkLayout::Vendored) {
