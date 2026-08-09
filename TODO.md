@@ -98,13 +98,24 @@ Zig's OHOS support is limited to:
 - Link flags: `-lm -lc -ldl` (same as Android)
 - LLVM codegen environment name: `"ohos"`
 
+This is NOT a license issue — OpenHarmony's musl is MIT licensed (same as
+upstream musl), fully compatible with vendoring. Zig treats OHOS the same as
+Android (Bionic): ABI tag + link flags only, no self-contained libc. The
+reasons are technical complexity (OHOS musl is heavily patched with
+OHOS-specific syscalls and capability model) and low priority. OHOS NDK is
+the official cross-compilation path.
+
 ### bake TODO
+
+bake has two options, unlike Zig:
+1. **Self-contained** — vendor OpenHarmony's musl source (MIT), build from
+   source like we do with upstream musl. Requires tracking OHOS patches.
+2. **NDK-dependent** — same as Zig, recognize the target + inject NDK
+   headers/libs from user-provided sysroot.
 
 - [ ] LLVM built with OHOS target support (check if our LLVM build includes it)
 - [ ] `TargetSpec::is_ohos()` — `triple_.contains("ohos")`
-- [ ] Vendor OHOS NDK headers (based on musl + OHOS extensions)
-- [ ] Vendor OHOS CRT objects (OHOS uses a patched musl)
-- [ ] `ensure_ohos_objects()` or reuse `LibcFamily::Musl` with OHOS-specific headers
 - [ ] Link flags: `-lm -lc -ldl` (Android-style)
 - [ ] Driver: `inject_vendored_headers` OHOS header block
-- [ ] Decide: self-contained (build from OHOS musl source) vs NDK-dependent
+- [ ] If self-contained: vendor OHOS musl source + `ensure_ohos_objects()`
+- [ ] If NDK-dependent: sysroot discovery + header injection from NDK path
