@@ -44,9 +44,11 @@ The dispatch chain in `bake.compiler.cppm`:
 Each libc family is self-contained:
 - **Darwin**: SDK stubs (`libSystem.tbd`) shipped in `lib/libc/darwin/`. No Xcode needed.
 - **Musl**: full musl source in `lib/libc/musl/`, built from source → static CRT.
-- **Windows**: MinGW-w64 v14 in `lib/libc/mingw/`, CRT + winpthreads + import libraries built from `.def` files. LLD MinGW driver. `_mingw.h` patched for UCRT default.
+- **Windows**: MinGW-w64 v14 in `lib/libc/mingw/`, CRT + winpthreads from source. Import libraries generated on-demand from `.def` files (only libraries referenced by `-l` flags). LLD MinGW driver. UCRT default via `_mingw.h`.
 
 libc++ config site varies per target (`lib/libcxx/cross-config/` for musl, `lib/libcxx/mingw-config/` for windows).
+
+compiler-rt `chkstk.S` patched with `__chkstk`/`_alloca`/`__alloca` aliases — normally provided by `libgcc.a`, bake provides them since it doesn't use GCC runtime.
 
 ## Design
 
@@ -85,7 +87,7 @@ Multi-package like Cargo. Each member has its own `bake.toml`. Root declares `[w
 
 ### `bake.build` module
 
-`lib/bake/bake.build.cppm` is the `build.cpp` API — source-distributed (like a header), compiled fresh per project when `build.cpp` is present. Context arrives via environment variables (`BAKE_MOID_ID`, `BAKE_SOURCE_DIR`, `BAKE_DEPS`, …). The script writes a `MoidDeclaration` JSON to `BAKE_DECLARATION_PATH`.
+`lib/bake/bake.build.cppm` is the `build.cpp` API — source-distributed (like a header), compiled fresh per project when `build.cpp` is present. Context arrives via environment variables (`BAKE_MOID_ID`, `BAKE_SOURCE_DIR`, `BAKE_TARGET`, `BAKE_DEPS`, …). The `Builder` exposes `target()` for target-conditional logic (e.g. linking platform-specific system libraries). The script writes a `MoidDeclaration` JSON to `BAKE_DECLARATION_PATH`.
 
 ## Directory Layout
 
@@ -93,6 +95,8 @@ Multi-package like Cargo. Each member has its own `bake.toml`. Root declares `[w
 bake/
 ├── bake.toml               [workspace] members = ["bake"]
 ├── CMakeLists.txt          Stage 0 bootstrap (permanent)
+├── bootstrap/
+│   └── build                cross-compile bake to any target
 ├── bake/                   the bake executable package
 │   ├── bake.toml
 │   ├── build.cpp           self-hosting build script

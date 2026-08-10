@@ -31,6 +31,7 @@ bake combines both ideas: Cargo's ergonomics with zig cc's self-contained toolch
 |---|---|
 | macOS | aarch64 (Apple Silicon), x86_64 (Intel) |
 | Linux | aarch64, x86_64 |
+| Windows | x86_64 |
 
 ### Cross-compile targets
 

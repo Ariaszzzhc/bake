@@ -29,6 +29,7 @@ bake 结合了两者：Cargo 的人体工学 + zig cc 的自包含工具链，�
 |---|---|
 | macOS | aarch64（Apple Silicon）、x86_64（Intel） |
 | Linux | aarch64、x86_64 |
+| Windows | x86_64 |
 
 ### 交叉编译目标
 

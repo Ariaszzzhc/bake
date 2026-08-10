@@ -2,6 +2,8 @@
 
 Current targets: **linux-musl** (aarch64, x86_64), **macos/darwin** (aarch64, x86_64), **windows-gnu** (x86_64, aarch64).
 
+bake can self-host on all three platforms. Use `./bootstrap/build <target>` to cross-compile bake itself.
+
 Extension point: `resolve_libc_family()` + `prepare_runtime()` switch in
 `bake.compiler.cppm`. Adding a new libc family only requires a new enum value,
 a resolve case, a prepare case, and a builder function. The linker dispatch
