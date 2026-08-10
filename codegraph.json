@@ -1,0 +1,12 @@
+{
+  "exclude": [
+    "third_party/**",
+    "lib/libc/**",
+    "lib/libcxx/**",
+    "lib/libcxxabi/**",
+    "lib/libunwind/**",
+    "lib/compiler-rt/**",
+    "lib/include/**",
+    "external/**"
+  ]
+}
