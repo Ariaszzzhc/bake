@@ -278,6 +278,10 @@ public:
             version_ = value;
         if (const char* value = std::getenv("BAKE_MOID_TYPE"))
             type_ = value;
+        if (const char* value = std::getenv("BAKE_MOID_CXX_STD"))
+            cxx_std_ = value;
+        if (const char* value = std::getenv("BAKE_MOID_C_STD"))
+            c_std_ = value;
         if (const char* value = std::getenv("BAKE_SOURCE_DIR"))
             source_dir_ = value;
         if (const char* value = std::getenv("BAKE_BUILD_DIR"))
@@ -304,25 +308,6 @@ public:
         }
     }
 
-    Builder& executable(std::string name) {
-        name_ = std::move(name); type_ = "executable"; return *this;
-    }
-    Builder& lib(std::string name) {
-        name_ = std::move(name); type_ = "lib"; return *this;
-    }
-    Builder& dylib(std::string name) {
-        name_ = std::move(name); type_ = "dylib"; return *this;
-    }
-
-    Builder& cxx_std(std::string_view version) {
-        cxx_std_ = version;
-        return *this;
-    }
-    Builder& c_std(std::string_view version) {
-        c_std_ = version;
-        return *this;
-    }
-
     Builder& sources(std::string_view pattern) {
         for (auto& file : expand_glob(std::string(pattern), source_dir_)) {
             source_groups_.push_back({std::move(file), false});
@@ -334,6 +319,19 @@ public:
         return *this;
     }
 
+    // Public module interface files — compiled and exported to consumers.
+    Builder& public_modules(std::string_view pattern) {
+        for (auto& file : expand_glob(std::string(pattern), source_dir_)) {
+            source_groups_.push_back({std::move(file), true});
+        }
+        return *this;
+    }
+    Builder& public_modules(std::initializer_list<std::string_view> patterns) {
+        for (auto pattern : patterns) public_modules(pattern);
+        return *this;
+    }
+
+    // Private include paths — visible during compilation only.
     Builder& include_dirs(std::string_view directory) {
         include_dirs_.emplace_back(directory);
         return *this;
@@ -343,12 +341,13 @@ public:
         return *this;
     }
 
+    // Public header directories — exposed to consumers as include paths.
     Builder& public_headers(std::string_view path) {
-        include_dirs_.emplace_back(path);
+        public_include_dirs_.emplace_back(path);
         return *this;
     }
     Builder& public_headers(std::initializer_list<std::string_view> paths) {
-        for (auto path : paths) include_dirs_.emplace_back(path);
+        for (auto path : paths) public_headers(path);
         return *this;
     }
 
@@ -415,12 +414,12 @@ private:
         }
         json += source_groups_.empty() ? "],\n" : "\n  ],\n";
 
-        json += "  \"public_include_dirs\": " + json_array(include_dirs_) + ",\n";
+        json += "  \"public_include_dirs\": " + json_array(public_include_dirs_) + ",\n";
         json += "  \"link\": {\"libraries\": [], \"frameworks\": []},\n";
         json += "  \"dependencies\": " + declaration_dependencies_ + ",\n";
         json += "  \"flags\": [],\n";
         json += "  \"defines\": [],\n";
-        json += "  \"include_dirs\": [],\n";
+        json += "  \"include_dirs\": " + json_array(include_dirs_) + ",\n";
         json += "  \"link_flags\": [],\n";
         json += "  \"prebuilt_libs\": " + json_array(prebuilt_libs_) + ",\n";
 
@@ -475,6 +474,7 @@ private:
     std::string declaration_dependencies_ = "[]";
     std::vector<SourceGroup> source_groups_;
     std::vector<std::string> include_dirs_;
+    std::vector<std::string> public_include_dirs_;
     std::vector<std::string> prebuilt_libs_;
     std::vector<BinaryBuilder> binaries_;
     std::vector<TestRegistration> tests_;

@@ -44,29 +44,27 @@ int main() {
     auto lld_libs   = glob_static_libs(llvm_lib, "liblld");
     auto llvm_libs  = glob_static_libs(llvm_lib, "libLLVM");
 
-    b.executable("bake")
-        .cxx_std("c++23")
-        .sources({
-            "src/bake.util.cppm",
-            "src/bake.project.cppm",
-            "src/bake.moid.cppm",
-            "src/bake.graph.cppm",
-            "src/compiler/bake.llvm.cppm",
-            "src/bake.compiler.cppm",
-            "src/bake.engine.cppm",
-            "src/bake.package.cppm",
-            "src/cli.cppm",
-        })
-        .sources("src/compiler/bake_llvm.cpp")
-        .sources("src/compiler/bake_clang_cc1_main.cpp")
-        .sources("src/compiler/bake_clang_cc1as_main.cpp")
-        .sources("src/compiler/bake_clang_driver.cpp")
-        .sources("src/main.cpp")
-        .include_dirs({
-            llvm_include,
-            "../third_party/tomlplusplus/public",
-            "../third_party/nlohmann/public",
-        });
+    b.sources({
+        "src/bake.util.cppm",
+        "src/bake.project.cppm",
+        "src/bake.moid.cppm",
+        "src/bake.graph.cppm",
+        "src/compiler/bake.llvm.cppm",
+        "src/bake.compiler.cppm",
+        "src/bake.engine.cppm",
+        "src/bake.package.cppm",
+        "src/cli.cppm",
+    });
+    b.sources("src/compiler/bake_llvm.cpp");
+    b.sources("src/compiler/bake_clang_cc1_main.cpp");
+    b.sources("src/compiler/bake_clang_cc1as_main.cpp");
+    b.sources("src/compiler/bake_clang_driver.cpp");
+    b.sources("src/main.cpp");
+    b.include_dirs({
+        llvm_include,
+        "../third_party/tomlplusplus/public",
+        "../third_party/nlohmann/public",
+    });
 
     // Prebuilt LLVM/Clang/LLD static libraries.
     for (auto& lib : clang_libs) b.prebuilt_lib(lib);

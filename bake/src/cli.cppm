@@ -731,6 +731,8 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
     ScopedEnv version_env("BAKE_MOID_VERSION", manifest.moid->version);
     ScopedEnv type_env("BAKE_MOID_TYPE",
                        std::string(moid_type_str(manifest.moid->type)));
+    ScopedEnv cxx_std_env("BAKE_MOID_CXX_STD", manifest.moid->cxx_std);
+    ScopedEnv c_std_env("BAKE_MOID_C_STD", manifest.moid->c_std);
     ScopedEnv declaration_env("BAKE_DECLARATION_PATH",
                               declaration_path.string());
     ScopedEnv options_env("BAKE_OPTIONS", opts_str);
@@ -770,6 +772,10 @@ namespace {
 void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
                            const Toolchain &tc,
                            const std::string &profile_name) {
+  // Language standards — manifest is the sole source of truth.
+  decl.cxx_std = manifest.moid->cxx_std;
+  decl.c_std = manifest.moid->c_std;
+
   // Profile → flags / link_flags / defines
   auto profile = manifest.resolve_profile(profile_name);
   bool is_release = (profile_name == "release");
@@ -830,7 +836,8 @@ void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
                                 : std::pair{d, std::string{}});
   }
 
-  decl.extra_include_dirs = std::move(tgt_includes);
+  for (auto &i : tgt_includes)
+    decl.extra_include_dirs.push_back(i);
 
   // Libraries + frameworks: [link] + matching [target.*]
   decl.libraries.clear();
