@@ -1,46 +1,11 @@
 # Platform Roadmap
 
-Current targets: **linux-musl** (aarch64, x86_64), **macos/darwin** (aarch64, x86_64).
+Current targets: **linux-musl** (aarch64, x86_64), **macos/darwin** (aarch64, x86_64), **windows-gnu** (x86_64, aarch64).
 
 Extension point: `resolve_libc_family()` + `prepare_runtime()` switch in
 `bake.compiler.cppm`. Adding a new libc family only requires a new enum value,
 a resolve case, a prepare case, and a builder function. The linker dispatch
 (`bake_clang_driver.cpp`) stays untouched.
-
----
-
-## windows-gnu (MinGW-w64)
-
-Triple: `x86_64-windows-gnu` / `aarch64-windows-gnu`
-
-### Zig's approach
-
-Zig vendors full MinGW-w64 source in `lib/libc/mingw/` and builds CRT from
-source (source-distributed, same model as musl):
-
-- **CRT**: 3 artifacts built from vendored C sources:
-  - `crt2.o` — exe entry point (from `crt/crtexe.c`)
-  - `dllcrt2.o` — DLL entry point (from `crt/crtdll.c`)
-  - `libmingw32.a` — static helper library (from `lib-common/`, `lib64/`, etc.)
-- **Always-link libs** (20): `api-ms-win-crt-*` (14), `advapi32`, `kernel32`,
-  `ntdll`, `shell32`, `user32`
-- **Import libraries**: built on demand from `.def` files for system DLLs
-- **Headers**: vendored in `lib/libc/mingw/include/`
-- LLD COFF flavor (`lld-link`) handles linking
-
-### bake TODO
-
-- [ ] `LibcFamily::Windows` + case in `resolve_libc_family()`
-- [ ] `TargetSpec::is_windows()` — `triple_.contains("windows")`
-- [ ] `parse_target`: normalize `w64-mingw32` → `windows-gnu`
-- [ ] Vendor MinGW-w64 source (headers + CRT sources + lib sources)
-- [ ] `ensure_mingw_objects()`: build `crt2.o`, `dllcrt2.o`, `libmingw32.a` from source
-- [ ] Link libs: inject `always_link_libs` (kernel32, advapi32, etc.)
-- [ ] Driver: `inject_vendored_headers` Windows header block
-- [ ] compiler-rt / write_archive: COFF object format support
-- [ ] Import library generation (.def → .lib) for system DLLs
-
----
 
 ## linux-gnu (glibc)
 

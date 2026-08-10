@@ -1,76 +1,55 @@
 # bake
 
-bake is a build system and compiler toolchain for C and C++ that doesn't need anything else installed.
+**An all-in-one C/C++ build system and compiler toolchain.**
 
-Think Cargo for C++, crossed with `zig cc`. You get a build tool, a package manager, and a complete compiler — all in one binary. No system clang, no system libc++, no system linker. bake ships its own.
+One binary, one command. No system clang, no system libc++, no system linker, no Makefiles.
 
-## Why
+---
 
-Building C and C++ projects is painful. You need the right compiler, the right linker, the right standard library, a build system, a dependency manager, and they all have to agree on versions. If you've ever tried to set up a CI pipeline for a C++ project, you know the feeling.
+## What is bake
 
-bake makes it simple. One binary, one command, done.
+bake is a build tool, a package manager, and a complete compiler — bundled into a single executable. It compiles C and C++ source code using an embedded LLVM/Clang toolchain, links with an embedded LLD, and vendors its own libc++, libc++abi, libunwind, compiler-rt, and libc. The result: a reproducible build environment that works identically on any machine, with zero external dependencies.
 
-```bash
-bake build
-```
+### Vision
 
-That's it. bake will compile your sources, resolve your dependencies, link everything, and put the result in `out/bin/`. No Makefiles, no CMakeLists, no `brew install llvm`.
+Building C and C++ should be as simple as `cargo build` in Rust. You write code, you run one command, you get a binary. No hunting for the right compiler version, no wrangling CMake presets, no `brew install llvm`, no "works on my machine."
 
-## Getting started
+bake makes that real. Every bake installation ships the same compiler, the same standard library, and the same libc — regardless of what's installed on the host. Cross-compilation to macOS, Linux, and Windows works out of the box, from any host.
 
-### Build bake from source (Stage 0)
+### Inspirations
 
-bake bootstraps itself with CMake + your system Clang. This is the only time you need an external compiler.
+- **Cargo** (Rust) — convention-based builds, workspace model, package management, lockfiles.
+- **zig cc** — a C/C++ compiler distributed as a single binary with its own libc, capable of cross-compiling to any target from any host.
 
-```bash
-git clone --recursive https://github.com/arias/bake-compiler.git
-cd bake-compiler
-cmake -G Ninja -B build && cmake --build build
-```
+bake combines both ideas: Cargo's ergonomics with zig cc's self-contained toolchain, for C and C++.
 
-Now you have `./build/bake` — a working bake built with the system toolchain.
+## Supported Platforms
 
-### Self-host (Stage 1)
+### Host (where bake runs)
 
-bake can build itself using its own integrated compiler and vendored libc++:
+| OS | Arch |
+|---|---|
+| macOS | aarch64 (Apple Silicon), x86_64 (Intel) |
 
-```bash
-./build/bake build
-```
+### Cross-compile targets
 
-The result in `out/bin/bake` is fully self-contained — no system toolchain dependencies.
+| Target triple | libc | Arch |
+|---|---|---|
+| `aarch64-darwin`, `x86_64-darwin` | host libSystem (macOS) | aarch64, x86_64 |
+| `aarch64-linux-musl`, `x86_64-linux-musl` | musl (vendored source) | aarch64, x86_64 |
+| `x86_64-windows-gnu`, `aarch64-windows-gnu` | MinGW-w64 v14 (vendored source) | x86_64, aarch64 |
 
-### Create a new project
+All three libc families are self-contained — no SDK, no sysroot, no NDK needed.
 
-```bash
-bake init myapp
-cd myapp
-bake build
-./out/bin/myapp
-```
+## Features
 
-### Project layout (convention mode)
+### Convention-based builds
 
-If your project follows the convention, you don't need a build script at all:
+Drop a `bake.toml` next to `src/` and bake does the rest. It discovers sources, compiles them, links the result. No build script required.
 
-```
-myapp/
-├── bake.toml
-└── src/
-    └── main.c
-```
+### The `build.cpp` escape hatch
 
-```toml
-[package]
-name = "myapp"
-version = "0.1.0"
-```
-
-bake discovers `src/`, compiles everything, and links an executable. Put headers in `public/` to share them with dependents.
-
-### The build.cpp escape hatch
-
-When conventions aren't enough, drop a `build.cpp` next to `bake.toml`:
+When conventions aren't enough, write a `build.cpp`:
 
 ```cpp
 import bake.build;
@@ -88,66 +67,64 @@ int main() {
 }
 ```
 
-bake compiles and runs this script during its configure phase. The builder API is source-distributed (like a header) — no linking against bake internals.
+bake compiles and runs this script during configure. Both paths produce the same internal representation — no second-class citizen.
 
-## Dependencies
+### Cross-compilation
 
-### Path dependencies
-
-```toml
-[dependencies]
-mylib = { path = "../mylib" }
+```bash
+bake build -t x86_64-linux-musl
+bake build -t x86_64-windows-gnu
 ```
 
-Local packages with their own `bake.toml`. Workspace members resolve instantly; no copying, no caching.
+No extra toolchain to install. bake vendors musl and MinGW-w64 source and builds the CRT from source on demand.
 
-### Remote dependencies
+### Package management
 
 ```toml
 [dependencies]
 curl = { url = "https://github.com/curl/curl", tag = "curl-8_21_0" }
 ```
 
-Run `bake update` to resolve tags to commits, download sources, and lock them in `bake.lock`. Subsequent `bake build` uses the locked versions. If the source cache is missing, bake re-downloads automatically using the locked commits.
+`bake update` resolves tags to commits, downloads sources, and locks them. Dependencies don't need to be bake projects — a `build.cpp` wrapper is all it takes to consume any C/C++ library.
 
-### Non-moid packages
+### `import std` support
 
-A dependency doesn't need to be a bake project. If it's just source code, provide a `build.cpp` alongside it (or in your project) that tells bake how to compile it. This is how bake wraps existing C/C++ libraries — no CMake or Meson integration needed.
+Full C++23 module support including `import std;`. bake pre-builds `std.pcm` from vendored libc++ sources and caches it globally.
 
-## What's inside
+### Incremental builds
 
-bake is a single executable with no external runtime dependencies:
+Content-based fingerprinting — change a source file and only the affected actions re-run. Touch a file without changing content and nothing rebuilds.
 
-- **LLVM + Clang** — compiled in-process. No `clang` subprocess.
-- **LLD** — linked in-process. No system `ld` or `ld64`.
-- **libc++ + libc++abi** — vendored as source, compiled on demand and cached. No `libc++.1.dylib`.
-- **libunwind, compiler-rt** — vendored.
-- **Darwin SDK stubs** — `libSystem.tbd` and friends shipped with bake. No Xcode needed for linking.
+## Getting Started
 
-On macOS, the only system dependency is the kernel-provided `libSystem.B.dylib` (which every macOS binary needs). Everything else comes from bake.
+### Build bake from source (Stage 0)
 
-## Moid types
+Requires: CMake ≥ 3.30, Ninja, Clang ≥ 19 with libc++.
 
-A "moid" (模具, Chinese for mold/template) is bake's unit of compilation. Each `bake.toml` describes one moid:
-
-| Type | What it produces | What consumers get |
-|------|-----------------|-------------------|
-| `executable` (default) | A binary in `out/bin/` | — |
-| `lib` | A static archive in `out/lib/` + module PCMs | Public headers, module interfaces, linked objects |
-| `dylib` | A shared library in `out/lib/` | Public headers, module interfaces |
-
-## Build output
-
-```
-out/
-├── bin/               your executables
-├── lib/               static/shared libraries
-├── .obj/              object files (content-hashed)
-├── .bmi/              precompiled module interfaces
-└── .bake/             configure artifacts (DAG, fingerprints, scripts)
+```bash
+git clone --recursive https://github.com/arias/bake-compiler.git
+cd bake-compiler
+cmake -G Ninja -B build && cmake --build build
 ```
 
-Incremental builds use content-based fingerprinting. Change a source file and only the affected actions re-run. Touch a file without changing its content and nothing rebuilds.
+### Self-host (Stage 1)
+
+bake builds itself with its own integrated compiler:
+
+```bash
+./build/bake build
+```
+
+`out/bin/bake` is fully self-contained — no system toolchain dependencies.
+
+### Create a project
+
+```bash
+bake init myapp
+cd myapp
+bake build
+./out/bin/myapp
+```
 
 ## Commands
 
@@ -161,14 +138,8 @@ bake update                Re-resolve tags to commits, update lock
 bake test                  Build and run tests (if configured)
 ```
 
-Build flags: `-j <n>` (parallelism), `-p <member>` (workspace member), `-v` (verbose per-file progress), `--locked`, `--offline`, `--frozen`.
+Build flags: `-t <triple>` (cross-compile target), `-j <n>` (parallelism), `-p <member>` (workspace member), `-v` (verbose), `--locked`, `--offline`, `--frozen`.
 
-## Status
+---
 
-Pre-release. Everything works but APIs are not frozen. Don't build production pipelines on this yet — things will change.
-
-## Requirements
-
-**Stage 0 bootstrap**: CMake ≥ 3.30, Ninja, Clang ≥ 19 with libc++.
-
-**Stage 1+ (self-hosted)**: Just bake. That's the whole point.
+[中文](README.zh.md)
