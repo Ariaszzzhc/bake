@@ -4,7 +4,7 @@
 
 bake is an all-in-one C/C++ build system and compiler toolchain. Think "Cargo for C++" meets `zig cc`: convention-based builds, a `build.cpp` escape hatch, package management, and an integrated LLVM/Clang toolchain — all in one binary, zero external dependencies.
 
-The project is pre-release. APIs are not frozen.
+APIs are not frozen — make changes clean, not backward-compatible.
 
 ## Build & Test
 
