@@ -15,7 +15,7 @@ export struct MoidId {
 export struct MoidEdge {
     std::string alias;
     MoidId target;
-    std::map<std::string, BuildOption> options;
+    std::vector<std::string> options;
 };
 
 export struct MoidNode {
@@ -122,7 +122,8 @@ MoidDeclaration manifest_declaration(const Manifest& manifest,
     declaration.version = manifest.moid->version;
     declaration.type = manifest.moid->type;
     declaration.root = source_root.string();
-    declaration.std_version = manifest.moid->std_version;
+    declaration.cxx_std = manifest.moid->cxx_std;
+    declaration.c_std = manifest.moid->c_std;
     declaration.options = manifest.options;
     return declaration;
 }
@@ -130,11 +131,6 @@ MoidDeclaration manifest_declaration(const Manifest& manifest,
 std::string alias_path_string(const std::vector<std::string>& path) {
     return join(path, " -> ");
 }
-
-struct OptionRequest {
-    BuildOption value;
-    std::string path;
-};
 
 } // namespace
 
@@ -575,103 +571,49 @@ resolve_moid_graph(const Manifest& root,
     auto topology = configuration_topological_moids(graph);
     if (!topology) return std::unexpected(topology.error());
 
-    std::map<MoidId, std::vector<std::string>> paths;
-    std::deque<MoidId> path_queue;
-    for (const auto& id : graph.roots) {
-        if (paths.contains(id)) continue;
-        paths[id] = {graph.nodes.at(id).declaration.name};
-        path_queue.push_back(id);
-    }
-    while (!path_queue.empty()) {
-        const MoidId source_id = path_queue.front();
-        path_queue.pop_front();
-        for (const auto& edge : graph.nodes.at(source_id).dependencies) {
-            if (paths.contains(edge.target)) continue;
-            auto target_path = paths.at(source_id);
-            target_path.push_back(edge.alias);
-            paths.emplace(edge.target, std::move(target_path));
-            path_queue.push_back(edge.target);
-        }
-    }
-
-    std::map<MoidId, std::map<std::string, OptionRequest>> requests;
-    auto request_option = [&](const MoidId& target_id,
-                              const std::string& option_name,
-                              const BuildOption& value,
-                              std::string request_path,
-                              bool dependency_option)
-            -> std::expected<void, std::string> {
-        const auto& target = sources.at(target_id).manifest;
-        auto declared = target.options.find(option_name);
-        const std::string package_name = target.moid->name;
-        const std::string kind = dependency_option
-            ? "dependency option" : "build option";
-
-        if (declared == target.options.end()) {
-            return std::unexpected(
-                kind + " '" + option_name +
-                "' is not declared by package '" + package_name + "'");
-        }
-        if (declared->second.type != value.type) {
-            return std::unexpected(
-                kind + " '" + option_name + "' for package '" +
-                package_name + "' expects " +
-                std::string(build_option_type_name(declared->second.type)) +
-                ", got " +
-                std::string(build_option_type_name(value.type)));
-        }
-
-        auto& package_requests = requests[target_id];
-        auto existing = package_requests.find(option_name);
-        if (existing != package_requests.end() &&
-            existing->second.value != value) {
-            return std::unexpected(
-                "option conflict for package '" + package_name +
-                "': option '" + option_name + "' requested as " +
-                format_build_option(existing->second.value) + " by " +
-                existing->second.path + " and " +
-                format_build_option(value) + " by " + request_path);
-        }
-        if (existing == package_requests.end()) {
-            package_requests.emplace(
-                option_name, OptionRequest{value, std::move(request_path)});
-        }
-        return {};
-    };
-
-    for (const auto& root_id : graph.roots) {
-        const std::string root_path_label =
-            alias_path_string(paths.at(root_id));
-        for (const auto& [name, option] : selection.root_options) {
-            auto requested = request_option(
-                root_id, name, option, root_path_label, false);
-            if (!requested) return std::unexpected(requested.error());
-        }
-    }
-
-    for (const auto& [source_id, node] : graph.nodes) {
-        const auto source_path = paths.contains(source_id)
-            ? paths.at(source_id)
-            : std::vector<std::string>{node.declaration.name};
-        for (const auto& edge : node.dependencies) {
-            auto request_path = source_path;
-            request_path.push_back(edge.alias);
-            const std::string path_label = alias_path_string(request_path);
-            for (const auto& [name, option] : edge.options) {
-                auto requested = request_option(
-                    edge.target, name, option, path_label, true);
-                if (!requested) return std::unexpected(requested.error());
-            }
-        }
-    }
+    // ── Option resolution (bool-only, OR merge) ──
+    //
+    // For each moid:
+    //   1. Start with manifest defaults
+    //   2. OR with all dependency feature activations
+    //   3. Apply CLI overrides (root_options) last
 
     for (auto& [id, node] : graph.nodes) {
         auto effective = sources.at(id).manifest.options;
-        auto configured = requests.find(id);
-        if (configured != requests.end()) {
-            for (const auto& [name, request] : configured->second)
-                effective[name] = request.value;
+
+        // Collect feature activations from all dependency edges targeting this moid
+        for (auto& [_, src_node] : graph.nodes) {
+            for (auto& edge : src_node.dependencies) {
+                if (edge.target != id) continue;
+                for (auto& opt_name : edge.options) {
+                    auto it = effective.find(opt_name);
+                    if (it == effective.end()) {
+                        return std::unexpected(
+                            "option '" + opt_name +
+                            "' is not declared by package '" +
+                            node.declaration.name + "'");
+                    }
+                    it->second.value = true;  // OR merge
+                }
+            }
         }
+
+        // CLI overrides for root moids
+        bool is_root = std::ranges::any_of(graph.roots,
+            [&](const MoidId& r) { return r == id; });
+        if (is_root) {
+            for (auto& [name, opt] : selection.root_options) {
+                auto it = effective.find(name);
+                if (it == effective.end()) {
+                    return std::unexpected(
+                        "build option '" + name +
+                        "' is not declared by package '" +
+                        node.declaration.name + "'");
+                }
+                it->second = opt;  // CLI override replaces value
+            }
+        }
+
         node.declaration.options = std::move(effective);
     }
 

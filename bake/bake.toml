@@ -2,8 +2,13 @@
 name = "bake"
 version = "0.1.0"
 type = "executable"
-std = "c++23"
 
 [dependencies]
 tomlplusplus = { path = "../third_party/tomlplusplus" }
 nlohmann_json = { path = "../third_party/nlohmann" }
+
+[target."*-windows-gnu"]
+libraries = ["ole32", "version"]
+
+[language]
+cxx = "c++23"

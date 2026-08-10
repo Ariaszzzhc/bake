@@ -1,0 +1,13 @@
+[package]
+name = "header-only"
+version = "2.4.6"
+type = "lib"
+
+[options]
+fast-path = true
+
+[link]
+libraries = ["m"]
+
+[language]
+cxx = "c++23"

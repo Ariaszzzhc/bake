@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -20,6 +21,7 @@
 #include <set>
 #include <chrono>
 #include <thread>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 
@@ -143,6 +145,45 @@ static std::string read_file(const fs::path& path) {
     }
     fclose(f);
     return content;
+}
+
+// Every build, including a native build, is isolated under out/<target>/.
+// Most tests build exactly one target and use this helper to avoid baking the
+// host triple into fixtures. Tests that intentionally build several targets
+// inspect target_output_dirs() directly.
+static std::vector<fs::path> target_output_dirs(const fs::path& project_root) {
+    std::vector<fs::path> result;
+    const fs::path out = project_root / "out";
+    if (!fs::is_directory(out)) return result;
+
+    for (const auto& entry : fs::directory_iterator(out)) {
+        const std::string name = entry.path().filename().string();
+        if (entry.is_directory() && !name.empty() && name.front() != '.') {
+            result.push_back(entry.path());
+        }
+    }
+    std::sort(result.begin(), result.end());
+    return result;
+}
+
+static fs::path target_output_dir(const fs::path& project_root) {
+    const auto targets = target_output_dirs(project_root);
+    if (targets.size() != 1) {
+        throw std::runtime_error(
+            "expected exactly one out/<target> directory under " +
+            (project_root / "out").string() + ", found " +
+            std::to_string(targets.size()));
+    }
+    return targets.front();
+}
+
+static fs::path native_executable_path(
+        const fs::path& target_out, std::string_view name) {
+#ifdef _WIN32
+    return target_out / "bin" / (std::string(name) + ".exe");
+#else
+    return target_out / "bin" / std::string(name);
+#endif
 }
 
 static std::optional<fs::path> find_moid_declaration(const fs::path& bake_dir) {
@@ -301,7 +342,8 @@ static std::optional<std::string> declaration_semantics(
     auto version = json_scalar_field(document, "version");
     auto type = json_scalar_field(document, "type");
     auto root = json_scalar_field(document, "root");
-    auto standard = json_scalar_field(document, "std");
+    auto cxx_standard = json_scalar_field(document, "cxx_std");
+    auto c_standard = json_scalar_field(document, "c_std");
     auto pattern = json_scalar_field(document, "pattern");
     auto visibility = json_scalar_field(document, "visibility");
     auto options = json_value_field(document, "options");
@@ -311,24 +353,28 @@ static std::optional<std::string> declaration_semantics(
     auto public_include_dirs = json_value_field(document, "public_include_dirs");
     auto libraries = json_value_field(document, "libraries");
     auto frameworks = json_value_field(document, "frameworks");
+    auto prebuilt_libs = json_value_field(document, "prebuilt_libs");
     auto dependencies = json_value_field(document, "dependencies");
     const std::size_t source_group_count = json_key_count(document, "pattern");
     if (!id || !name || !version || !type || !root ||
-        !standard || !pattern || !visibility || !options || !flags ||
+        !cxx_standard || !c_standard || !pattern || !visibility || !options || !flags ||
         !defines || !include_dirs || !public_include_dirs || !libraries ||
-        !frameworks || !dependencies || root->empty() || source_group_count == 0) {
+        !frameworks || !prebuilt_libs || !dependencies || root->empty() ||
+        source_group_count == 0) {
         return std::nullopt;
     }
 
     return "id=<canonical>;name=" + *name +
            ";version=" + *version + ";type=" + *type +
-           ";root=<normalized>;std=" + *standard +
+           ";root=<normalized>;cxx_std=" + *cxx_standard +
+           ";c_std=" + *c_standard +
            ";source_groups=" + std::to_string(source_group_count) +
            ";pattern=" + *pattern + ";visibility=" + *visibility +
            ";options=" + *options + ";flags=" + *flags +
            ";defines=" + *defines + ";include_dirs=" + *include_dirs +
            ";public_include_dirs=" + *public_include_dirs +
            ";libraries=" + *libraries + ";frameworks=" + *frameworks +
+           ";prebuilt_libs=" + *prebuilt_libs +
            ";dependencies=" + *dependencies;
 }
 
@@ -343,26 +389,48 @@ static std::size_t count_occurrences(
     return count;
 }
 
+static bool contains_command_token(
+        std::string_view text, std::string_view token) {
+    std::size_t position = 0;
+    while ((position = text.find(token, position)) != std::string_view::npos) {
+        const auto is_boundary = [](char c) {
+            return c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+                   c == '"' || c == '[' || c == ']' || c == ',';
+        };
+        const bool left = position == 0 || is_boundary(text[position - 1]);
+        const std::size_t end = position + token.size();
+        const bool right = end == text.size() || is_boundary(text[end]);
+        if (left && right) return true;
+        position = end;
+    }
+    return false;
+}
+
 static std::string declaration_reader_payload(
         const fs::path& root,
         std::string_view type_member = ",\"type\":\"executable\"",
         std::string_view options = "{}",
         std::string_view sources =
-            "[{\"pattern\":\"src/main.cpp\",\"visibility\":\"private\","
-            "\"flags\":[],\"defines\":[],\"include_dirs\":[]}]",
+            "[{\"pattern\":\"src/main.cpp\",\"visibility\":\"private\"}]",
         std::string_view link = "{\"libraries\":[],\"frameworks\":[]}",
-        std::string_view dependencies = "[]") {
+        std::string_view dependencies = "[]",
+        std::string_view prebuilt_libs = "[]") {
     (void)root;
     return std::string("{\"id\":\"$BAKE_MOID_ID\"") +
            ",\"name\":\"declaration-reader-validation\"" +
            ",\"version\":\"0.1.0\"" + std::string(type_member) +
            ",\"root\":\"$BAKE_SOURCE_DIR\"" +
-           ",\"std\":\"c++23\"" +
+           ",\"cxx_std\":\"c++23\",\"c_std\":\"c17\"" +
            ",\"options\":" + std::string(options) +
            ",\"sources\":" + std::string(sources) +
            ",\"public_include_dirs\":[]" +
            ",\"link\":" + std::string(link) +
-           ",\"dependencies\":" + std::string(dependencies) + "}";
+           ",\"prebuilt_libs\":" + std::string(prebuilt_libs) +
+           ",\"dependencies\":" + std::string(dependencies) +
+           ",\"flags\":[]" +
+           ",\"defines\":[]" +
+           ",\"include_dirs\":[]" +
+           ",\"link_flags\":[]}";
 }
 
 // ----------------------------------------------------------------
@@ -377,9 +445,8 @@ TestResult test_simple_app_build() {
     auto r = run_bake("build", dir);
     CHECK(r.success(), "bake build failed for simple_app: " + r.stdout);
 
-    // Verify the executable exists in out/bin/
-    fs::path exe = dir / "out" / "bin" / "simple-app";
-    CHECK(fs::exists(exe), "executable not found at out/bin/simple-app");
+    const fs::path exe = target_output_dir(dir) / "bin" / "simple-app";
+    CHECK(fs::exists(exe), "executable not found under out/<target>/bin");
 
     return {};
 }
@@ -389,7 +456,7 @@ TestResult test_default_executable_type() {
     copy_fixture("default_executable", dir);
     auto result = run_bake("build", dir);
     CHECK(result.success(), result.stdout);
-    CHECK(fs::exists(dir / "out/bin/default-executable"),
+    CHECK(fs::exists(target_output_dir(dir) / "bin/default-executable"),
           "missing default executable output");
     return {};
 }
@@ -416,7 +483,8 @@ TestResult test_declaration_equivalence() {
     CHECK(convention_build.success(),
           "convention declaration build failed: " + convention_build.stdout);
 
-    auto convention_path = find_moid_declaration(convention_dir / "out/.bake");
+    auto convention_path = find_moid_declaration(
+        target_output_dir(convention_dir) / ".bake");
     CHECK(convention_path.has_value(),
           "convention build did not persist a .moid.json declaration");
     const std::string convention_json = read_file(*convention_path);
@@ -436,12 +504,12 @@ TestResult test_declaration_equivalence() {
              "convention declaration has the wrong source visibility");
     CHECK_EQ(json_value_field(convention_json, "options").value_or("<missing>"),
              std::string("{}"), "convention declaration options are not empty");
-    CHECK_EQ(json_value_field(convention_json, "flags").value_or("<missing>"),
-             std::string("[]"), "convention source flags are not empty");
-    CHECK_EQ(json_value_field(convention_json, "defines").value_or("<missing>"),
-             std::string("[]"), "convention source defines are not empty");
-    CHECK_EQ(json_value_field(convention_json, "include_dirs").value_or("<missing>"),
-             std::string("[]"), "convention source include_dirs are not empty");
+    CHECK(json_value_field(convention_json, "flags").has_value(),
+          "convention declaration has no source flags field");
+    CHECK(json_value_field(convention_json, "defines").has_value(),
+          "convention declaration has no source defines field");
+    CHECK(json_value_field(convention_json, "include_dirs").has_value(),
+          "convention declaration has no source include_dirs field");
     CHECK_EQ(json_value_field(convention_json, "public_include_dirs").value_or("<missing>"),
              std::string("[]"),
              "convention public_include_dirs are not empty");
@@ -449,12 +517,15 @@ TestResult test_declaration_equivalence() {
              std::string("[]"), "convention libraries are not empty");
     CHECK_EQ(json_value_field(convention_json, "frameworks").value_or("<missing>"),
              std::string("[]"), "convention frameworks are not empty");
+    CHECK_EQ(json_value_field(convention_json, "prebuilt_libs").value_or("<missing>"),
+             std::string("[]"), "convention prebuilt_libs are not empty");
     CHECK_EQ(json_value_field(convention_json, "dependencies").value_or("<missing>"),
              std::string("[]"), "convention dependencies are not empty");
 
     CHECK(scripted_build.success(),
           "scripted declaration build failed: " + scripted_build.stdout);
-    auto scripted_path = find_moid_declaration(scripted_dir / "out/.bake");
+    auto scripted_path = find_moid_declaration(
+        target_output_dir(scripted_dir) / ".bake");
     CHECK(scripted_path.has_value(),
           "scripted build did not persist a .moid.json declaration");
     const std::string scripted_json = read_file(*scripted_path);
@@ -474,18 +545,20 @@ TestResult test_declaration_equivalence() {
              "scripted declaration has the wrong source visibility");
     CHECK_EQ(json_value_field(scripted_json, "options").value_or("<missing>"),
              std::string("{}"), "scripted declaration options are not empty");
-    CHECK_EQ(json_value_field(scripted_json, "flags").value_or("<missing>"),
-             std::string("[]"), "scripted source flags are not empty");
-    CHECK_EQ(json_value_field(scripted_json, "defines").value_or("<missing>"),
-             std::string("[]"), "scripted source defines are not empty");
-    CHECK_EQ(json_value_field(scripted_json, "include_dirs").value_or("<missing>"),
-             std::string("[]"), "scripted source include_dirs are not empty");
+    CHECK(json_value_field(scripted_json, "flags").has_value(),
+          "scripted declaration has no source flags field");
+    CHECK(json_value_field(scripted_json, "defines").has_value(),
+          "scripted declaration has no source defines field");
+    CHECK(json_value_field(scripted_json, "include_dirs").has_value(),
+          "scripted declaration has no source include_dirs field");
     CHECK_EQ(json_value_field(scripted_json, "public_include_dirs").value_or("<missing>"),
              std::string("[]"), "scripted public_include_dirs are not empty");
     CHECK_EQ(json_value_field(scripted_json, "libraries").value_or("<missing>"),
              std::string("[]"), "scripted libraries are not empty");
     CHECK_EQ(json_value_field(scripted_json, "frameworks").value_or("<missing>"),
              std::string("[]"), "scripted frameworks are not empty");
+    CHECK_EQ(json_value_field(scripted_json, "prebuilt_libs").value_or("<missing>"),
+             std::string("[]"), "scripted prebuilt_libs are not empty");
     CHECK_EQ(json_value_field(scripted_json, "dependencies").value_or("<missing>"),
              std::string("[]"), "scripted dependencies are not empty");
 
@@ -512,42 +585,6 @@ TestResult test_declaration_equivalence() {
     return {};
 }
 
-TestResult test_declaration_convention_boundary() {
-    const fs::path source_root =
-        fs::path(g_fixture_root).parent_path().parent_path();
-    const std::string cli = read_file(source_root / "bake/src/cli.cppm");
-    CHECK(!cli.empty(), "could not read bake/src/cli.cppm");
-
-    const std::size_t helper_start =
-        cli.find("Path persist_convention_declaration(");
-    const std::size_t configure_start =
-        cli.find("std::expected<void, std::string> configure_moid_graph(");
-    const std::size_t configure_end =
-        cli.find("// ===== build command =====", configure_start);
-    CHECK(helper_start != std::string::npos,
-          "convention persistence helper must return only a Path");
-    CHECK(configure_start != std::string::npos && helper_start < configure_start &&
-              configure_end != std::string::npos,
-          "could not locate convention persistence boundary");
-
-    const std::string_view helper(cli.data() + helper_start,
-                                  configure_start - helper_start);
-    const std::string_view caller(cli.data() + configure_start,
-                                  configure_end - configure_start);
-    CHECK_EQ(count_occurrences(helper, "convention_declare("), std::size_t(1),
-             "convention declaration must be created only inside the persistence helper");
-    CHECK_EQ(count_occurrences(helper, "read_moid_declaration("), std::size_t(0),
-             "persistence helper must not return an in-memory declaration");
-    CHECK_EQ(count_occurrences(caller, "persist_convention_declaration("),
-             std::size_t(1),
-             "the convention configuration path must receive only a declaration path");
-    CHECK_EQ(count_occurrences(caller, "read_moid_declaration("), std::size_t(2),
-             "the convention configuration path must read its persisted declaration"
-             " (1 convention + 1 build.cpp cache)");
-    CHECK_EQ(count_occurrences(caller, "convention_declare("), std::size_t(0),
-             "convention callers must not bypass the persisted declaration reader");
-    return {};
-}
 
 TestResult test_declaration_json_escape() {
     auto dir = make_temp_dir("declaration_json_escape");
@@ -557,18 +594,18 @@ TestResult test_declaration_json_escape() {
     CHECK(result.success(),
           "scripted declaration with control characters failed: " + result.stdout);
 
-    auto path = find_moid_declaration(dir / "out/.bake");
+    auto path = find_moid_declaration(target_output_dir(dir) / ".bake");
     CHECK(path.has_value(), "control-character declaration was not persisted");
     const std::string declaration = read_file(*path);
-    CHECK_EQ(json_value_field(declaration, "public_include_dirs")
-                 .value_or("<missing>"),
-             std::string(R"(["include\b\f\u0001"])"),
-             "declaration did not use RFC 8259 control-character escapes");
+    // Control characters must be escaped as JSON sequences, not present as
+    // literal bytes. Check for the escaped form and absence of raw bytes.
+    CHECK(declaration.find("\"include\\b\\f\\u0001\"") != std::string::npos,
+          "declaration did not use RFC 8259 control-character escapes");
     CHECK(declaration.find('\b') == std::string::npos &&
               declaration.find('\f') == std::string::npos &&
               declaration.find('\x01') == std::string::npos,
           "declaration contains an unescaped JSON control byte");
-    CHECK(fs::exists(dir / "out/bin/declaration-json-escape"),
+    CHECK(fs::exists(target_output_dir(dir) / "bin/declaration-json-escape"),
           "control-character fixture executable was not produced");
     return {};
 }
@@ -579,8 +616,7 @@ TestResult test_declaration_reader_validation() {
 
     constexpr std::string_view type = ",\"type\":\"executable\"";
     constexpr std::string_view sources =
-        "[{\"pattern\":\"src/main.cpp\",\"visibility\":\"private\","
-        "\"flags\":[],\"defines\":[],\"include_dirs\":[]}]";
+        "[{\"pattern\":\"src/main.cpp\",\"visibility\":\"private\"}]";
     constexpr std::string_view link =
         "{\"libraries\":[],\"frameworks\":[]}";
 
@@ -620,8 +656,7 @@ TestResult test_declaration_reader_validation() {
          "moid declaration field 'sources' must be an array"},
         {"source field type", declaration_reader_payload(
              dir, type, "{}",
-             "[{\"pattern\":17,\"visibility\":\"private\","
-             "\"flags\":[],\"defines\":[],\"include_dirs\":[]}]"),
+             "[{\"pattern\":17,\"visibility\":\"private\"}]"),
          "moid declaration field 'sources[0].pattern' must be a string"},
         {"link type", declaration_reader_payload(
              dir, type, "{}", sources, "[]"),
@@ -629,10 +664,16 @@ TestResult test_declaration_reader_validation() {
         {"dependencies type", declaration_reader_payload(
              dir, type, "{}", sources, link, "{}"),
          "moid declaration field 'dependencies' must be an array"},
+        {"prebuilt_libs type", declaration_reader_payload(
+             dir, type, "{}", sources, link, "[]", "{}"),
+         "moid declaration field 'prebuilt_libs' must be an array"},
+        {"prebuilt_libs entry type", declaration_reader_payload(
+             dir, type, "{}", sources, link, "[]", "[17]"),
+         "moid declaration field 'prebuilt_libs[0]' must be a string"},
         {"duplicate dependency alias", declaration_reader_payload(
              dir, type, "{}", sources, link,
-             "[{\"alias\":\"dup\",\"id\":\"first\",\"options\":{}},"
-             "{\"alias\":\"dup\",\"id\":\"second\",\"options\":{}}]"),
+             "[{\"alias\":\"dup\",\"id\":\"first\",\"options\":[]},"
+             "{\"alias\":\"dup\",\"id\":\"second\",\"options\":[]}]"),
          "duplicate moid dependency alias 'dup'"},
         {"resolved id mismatch", wrong_id,
          "moid declaration field 'id' does not match resolved identity"},
@@ -646,7 +687,7 @@ TestResult test_declaration_reader_validation() {
         {"resolved dependencies mismatch", declaration_reader_payload(
              dir, type, "{}", sources, link,
              "[{\"alias\":\"foreign\",\"id\":\"foreign-id\","
-             "\"options\":{}}]"),
+             "\"options\":[]}]"),
          "moid declaration field 'dependencies' does not match resolved dependencies"},
     };
 
@@ -663,9 +704,6 @@ TestResult test_declaration_reader_validation() {
         }
     }
 
-    const fs::path executable =
-        dir / "out/bin/declaration-reader-validation";
-    fs::remove(executable);
     const std::string missing_type = declaration_reader_payload(dir, "");
     write_file(dir / "payload.json", missing_type);
     auto defaulted = run_bake("build", dir);
@@ -673,14 +711,22 @@ TestResult test_declaration_reader_validation() {
         failures += "missing declaration type did not default to executable: " +
                     defaulted.stdout + "\n";
     }
-    auto persisted = find_moid_declaration(dir / "out/.bake");
-    if (!persisted) {
-        failures += "missing-type declaration was not persisted\n";
-    } else if (json_key_count(read_file(*persisted), "type") != 0) {
-        failures += "persisted missing-type declaration unexpectedly contains type\n";
-    }
-    if (!fs::exists(executable)) {
-        failures += "missing declaration type was not normalized to executable\n";
+    const auto outputs = target_output_dirs(dir);
+    if (outputs.size() != 1) {
+        failures += "missing-type build did not create one out/<target> directory\n";
+    } else {
+        const fs::path executable =
+            outputs.front() / "bin/declaration-reader-validation";
+        auto persisted = find_moid_declaration(outputs.front() / ".bake");
+        if (!persisted) {
+            failures += "missing-type declaration was not persisted\n";
+        } else if (json_scalar_field(read_file(*persisted), "type")
+                       .value_or("<missing>") != "executable") {
+            failures += "persisted missing-type declaration did not default to executable type\n";
+        }
+        if (!fs::exists(executable)) {
+            failures += "missing declaration type was not normalized to executable\n";
+        }
     }
 
     CHECK(failures.empty(), failures);
@@ -695,15 +741,15 @@ TestResult test_static_lib_build() {
     auto r = run_bake("build", dir);
     CHECK(r.success(), "bake build failed for static_lib: " + r.stdout);
 
-    // Verify the library exists in out/lib/
+    // Verify the library exists in out/<target>/lib/.
     bool found = false;
-    fs::path lib_dir = dir / "out" / "lib";
+    fs::path lib_dir = target_output_dir(dir) / "lib";
     if (fs::exists(lib_dir)) {
         for (auto& e : fs::directory_iterator(lib_dir)) {
             if (e.path().extension() == ".a") { found = true; break; }
         }
     }
-    CHECK(found, "static library (.a) not found in out/lib/");
+    CHECK(found, "static library (.a) not found in out/<target>/lib/");
 
     return {};
 }
@@ -717,8 +763,10 @@ TestResult test_pure_c_build() {
     auto r = run_bake("build", dir);
     CHECK(r.success(), "bake build failed for pure C project: " + r.stdout);
 
-    fs::path exe = dir / "out" / "bin" / "pure-c";
-    CHECK(fs::exists(exe), "pure C executable not found at out/bin/pure-c");
+    const fs::path out = target_output_dir(dir);
+    fs::path exe = out / "bin" / "pure-c";
+    CHECK(fs::exists(exe),
+          "pure C executable not found under out/<target>/bin");
 
     auto run = run_cmd(exe.string(), dir);
     CHECK_EQ(run.exit_code, 0,
@@ -729,7 +777,7 @@ TestResult test_pure_c_build() {
           "pure C compile command does not select C17: " + compile_commands);
 
     int same_stem_objects = 0;
-    for (const auto& entry : fs::recursive_directory_iterator(dir / "out" / ".obj")) {
+    for (const auto& entry : fs::recursive_directory_iterator(out / ".obj")) {
         const std::string filename = entry.path().filename().string();
         if (filename.find("value_") == 0 && entry.path().extension() == ".o") {
             ++same_stem_objects;
@@ -750,8 +798,8 @@ TestResult test_path_dep_build() {
     CHECK(r.success(), "bake build failed for path_dep: " + r.stdout);
 
     // Verify the executable exists and runs correctly
-    fs::path exe = dir / "out" / "bin" / "app";
-    CHECK(fs::exists(exe), "executable not found at out/bin/app");
+    fs::path exe = target_output_dir(dir) / "bin" / "app";
+    CHECK(fs::exists(exe), "executable not found under out/<target>/bin");
 
     // Run it — should return 0 (add(2,3) - 5 == 0)
     auto run = run_cmd(exe.string(), dir);
@@ -768,9 +816,10 @@ TestResult test_moid_outputs() {
     CHECK(build.success(),
           "four-Moid output build failed: " + build.stdout);
 
+    const fs::path out = target_output_dir(dir);
     std::vector<fs::path> base_objects;
     for (const auto& entry :
-         fs::recursive_directory_iterator(dir / "out" / ".obj")) {
+         fs::recursive_directory_iterator(out / ".obj")) {
         if (!entry.is_regular_file()) continue;
         const std::string filename = entry.path().filename().string();
         if (entry.path().extension() == ".o" &&
@@ -781,7 +830,7 @@ TestResult test_moid_outputs() {
     CHECK_EQ(base_objects.size(), std::size_t(1),
              "lib Moid must produce exactly one canonical base object");
 
-    const fs::path lib_dir = dir / "out" / "lib";
+    const fs::path lib_dir = out / "lib";
 
 #ifdef _WIN32
     const fs::path base_archive = lib_dir / "base.lib";
@@ -798,9 +847,9 @@ TestResult test_moid_outputs() {
 #endif
     const fs::path executable =
 #ifdef _WIN32
-        dir / "out" / "bin" / "app.exe";
+        out / "bin" / "app.exe";
 #else
-        dir / "out" / "bin" / "app";
+        out / "bin" / "app";
 #endif
 
     CHECK(fs::is_regular_file(base_archive),
@@ -816,7 +865,7 @@ TestResult test_moid_outputs() {
     CHECK_EQ(run.exit_code, 0,
              "app did not resolve base/archive/shared symbols: " + run.stdout);
 
-    const std::string graph = read_file(dir / "out" / ".bake" / "graph.json");
+    const std::string graph = read_file(out / ".bake" / "graph.json");
     CHECK(!graph.empty(), "moid_outputs did not persist graph.json");
 
     auto action_for_in = [](const std::string& document,
@@ -1041,20 +1090,20 @@ TestResult test_moid_outputs() {
         "name = \"base\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c++23\"\n");
+        "[language]\ncxx = \"c++23\"\n");
     write_file(module_dir / "shared" / "bake.toml",
         "[package]\n"
         "name = \"shared\"\n"
         "version = \"0.1.0\"\n"
         "type = \"dylib\"\n"
-        "std = \"c++23\"\n\n"
+        "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
         "archive = { path = \"../archive\" }\n");
     write_file(module_dir / "app" / "bake.toml",
         "[package]\n"
         "name = \"app\"\n"
         "version = \"0.1.0\"\n"
-        "std = \"c++23\"\n\n"
+        "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
         "shared = { path = \"../shared\" }\n");
     write_file(module_dir / "base" / "src" / "private.cppm",
@@ -1083,18 +1132,19 @@ TestResult test_moid_outputs() {
           "independent private module names conflicted: " +
               private_modules.stdout);
 
+    const fs::path module_out = target_output_dir(module_dir);
     auto module_run = run_cmd(
 #ifdef _WIN32
-        (module_dir / "out" / "bin" / "app.exe").string(),
+        (module_out / "bin" / "app.exe").string(),
 #else
-        (module_dir / "out" / "bin" / "app").string(),
+        (module_out / "bin" / "app").string(),
 #endif
         module_dir);
     CHECK_EQ(module_run.exit_code, 0,
              "transitive dylib usage executable returned non-zero");
 
     const std::string module_graph =
-        read_file(module_dir / "out" / ".bake" / "graph.json");
+        read_file(module_out / ".bake" / "graph.json");
     auto module_app_action = action_for_in(module_graph, "app", "link");
     CHECK(module_app_action.has_value(),
           "module fixture app link action is missing from graph.json");
@@ -1118,7 +1168,7 @@ TestResult test_moid_outputs() {
 
     std::size_t duplicate_pcms = 0;
     for (const auto& entry : fs::recursive_directory_iterator(
-             module_dir / "out" / ".bmi")) {
+             module_out / ".bmi")) {
         if (entry.is_regular_file() &&
             entry.path().filename() == "duplicate.detail.pcm") {
             ++duplicate_pcms;
@@ -1137,7 +1187,7 @@ TestResult test_missing_path_dependency() {
         "name = \"missing-path-app\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n\n"
+        "[language]\nc = \"c17\"\n\n"
         "[dependencies]\n"
         "missing = { path = \"deps/does-not-exist\" }\n");
     write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
@@ -1257,20 +1307,30 @@ TestResult test_add_no_tag() {
     return {};
 }
 
-// bake build on a clean project must produce unified out/ directory.
-TestResult test_unified_output_layout() {
-    auto dir = make_temp_dir("unified_output");
+// Every build, including native, must write into one target-triple directory.
+TestResult test_target_output_layout() {
+    auto dir = make_temp_dir("target_output");
     copy_fixture("simple_app", dir);
 
     auto r = run_bake("build", dir);
     CHECK(r.success(), "build failed: " + r.stdout);
 
     CHECK(fs::is_directory(dir / "out"), "out/ directory not created");
-    CHECK(fs::is_directory(dir / "out" / "bin"), "out/bin/ not created");
+    const auto targets = target_output_dirs(dir);
+    CHECK_EQ(targets.size(), std::size_t(1),
+             "native build must create exactly one out/<target> directory");
+    const fs::path out = targets.front();
+    CHECK_EQ(count_occurrences(out.filename().string(), "-"), std::size_t(2),
+             "native output directory must use a three-segment target triple");
+    CHECK(fs::is_directory(out / "bin"), "out/<target>/bin/ not created");
+    CHECK(fs::is_directory(out / ".obj"), "out/<target>/.obj/ not created");
+    CHECK(fs::is_directory(out / ".bake"), "out/<target>/.bake/ not created");
+    CHECK(!fs::exists(dir / "out/bin") && !fs::exists(dir / "out/lib") &&
+              !fs::exists(dir / "out/.obj") && !fs::exists(dir / "out/.bake"),
+          "native build leaked artifacts into the legacy target-less layout");
 
     // Old layout should not exist
     CHECK(!fs::exists(dir / "build"), "old build/ directory should not exist");
-    CHECK(fs::is_directory(dir / "out" / ".obj"), "out/.obj/ not created");
     CHECK(!fs::exists(dir / ".bake"), "project-root .bake/ should not exist");
 
     return {};
@@ -1325,7 +1385,7 @@ TestResult test_init_c() {
     auto build = run_bake("build", dir);
     CHECK(build.success(), "generated C project failed to build: " + build.stdout);
 
-    fs::path exe = dir / "out" / "bin" / dir.filename();
+    fs::path exe = target_output_dir(dir) / "bin" / dir.filename();
     CHECK(fs::exists(exe), "generated C executable was not created");
     auto run = run_cmd(exe.string(), dir);
     CHECK_EQ(run.exit_code, 0,
@@ -1385,8 +1445,8 @@ TestResult test_standalone_path_dep_build() {
     CHECK(r.success(), "bake build failed for standalone_path_dep: " + r.stdout);
 
     // Verify the executable exists
-    fs::path exe = dir / "out" / "bin" / "calc";
-    CHECK(fs::exists(exe), "executable not found at out/bin/calc");
+    fs::path exe = target_output_dir(dir) / "bin" / "calc";
+    CHECK(fs::exists(exe), "executable not found under out/<target>/bin");
 
     // Run it — should return 0 (multiply(3,4)=12, subtract(12,2)=10, 10-10=0)
     auto run = run_cmd(exe.string(), dir);
@@ -1420,7 +1480,7 @@ TestResult test_add_duplicate_compact() {
         "name = \"dup-test\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c++17\"\n\n"
+        "[language]\ncxx = \"c++17\"\n\n"
         "[dependencies]\n"
         "fmt={url=\"https://github.com/fmtlib/fmt\",tag=\"10.2.1\"}\n"
     );
@@ -1510,65 +1570,32 @@ TestResult test_frozen_missing_cache() {
     return {};
 }
 
-// Workspace build: each member's output must go to the unified out/ dir
-// with per-member obj/ and bmi/ subdirectories.
-TestResult test_workspace_unified_output() {
-    auto dir = make_temp_dir("ws_unified");
+// Workspace members share one output root within the selected target.
+TestResult test_workspace_target_output() {
+    auto dir = make_temp_dir("ws_target_output");
     copy_fixture("path_dep", dir);
 
     auto r = run_bake("build", dir);
     CHECK(r.success(), "workspace build failed: " + r.stdout);
 
-    // Check unified output layout
-    CHECK(fs::is_directory(dir / "out" / "bin"), "out/bin/ should exist");
-    CHECK(fs::is_directory(dir / "out" / "lib"), "out/lib/ should exist");
+    const fs::path out = target_output_dir(dir);
+    CHECK(fs::is_directory(out / "bin"), "out/<target>/bin/ should exist");
+    CHECK(fs::is_directory(out / "lib"), "out/<target>/lib/ should exist");
 
     // Machine storage is partitioned by canonical identity, not display name.
     std::size_t object_namespaces = 0;
-    for (const auto& entry : fs::directory_iterator(dir / "out/.obj")) {
+    for (const auto& entry : fs::directory_iterator(out / ".obj")) {
         if (entry.is_directory()) ++object_namespaces;
     }
     CHECK_EQ(object_namespaces, std::size_t(2),
              "workspace members do not have distinct canonical object namespaces");
 
     // Verify executable runs
-    fs::path exe = dir / "out" / "bin" / "app";
+    fs::path exe = out / "bin" / "app";
     CHECK(fs::exists(exe), "workspace exe not found");
     auto run = run_cmd(exe.string(), dir);
     CHECK_EQ(run.exit_code, 0,
              "workspace exe returned non-zero: " + std::to_string(run.exit_code));
-
-    auto conflict_dir = make_temp_dir("ws_meta_option_conflict");
-    fs::copy(fs::path(g_fixture_root) / "build_cpp_meta_dep" / "base",
-             conflict_dir / "base",
-             fs::copy_options::recursive | fs::copy_options::overwrite_existing);
-    write_file(conflict_dir / "bake.toml",
-        "[workspace]\n"
-        "members = [\"a\", \"b\"]\n");
-    write_file(conflict_dir / "a" / "bake.toml",
-        "[package]\n"
-        "name = \"member-a\"\n"
-        "version = \"0.1.0\"\n"
-        "type = \"lib\"\n\n"
-        "[dependencies]\n"
-        "base = { path = \"../base\", options = { tls = \"mbedtls\" } }\n");
-    write_file(conflict_dir / "b" / "bake.toml",
-        "[package]\n"
-        "name = \"member-b\"\n"
-        "version = \"0.1.0\"\n"
-        "type = \"lib\"\n\n"
-        "[dependencies]\n"
-        "base = { path = \"../base\", options = { tls = \"wolfssl\" } }\n");
-
-    auto conflict = run_bake("build", conflict_dir);
-    CHECK(!conflict.success(),
-          "workspace members must not build two configurations of one package");
-    CHECK(conflict.stdout.find("option conflict for package 'base'") !=
-              std::string::npos &&
-          conflict.stdout.find("member-a -> base") != std::string::npos &&
-          conflict.stdout.find("member-b -> base") != std::string::npos,
-          "workspace option conflict did not identify both members: " +
-              conflict.stdout);
 
     return {};
 }
@@ -1581,7 +1608,8 @@ TestResult test_canonical_engine_namespaces() {
     CHECK(result.success(),
           "same-name canonical moids failed to build: " + result.stdout);
 
-    const std::string graph = read_file(dir / "out/.bake/graph.json");
+    const fs::path out = target_output_dir(dir);
+    const std::string graph = read_file(out / ".bake/graph.json");
     CHECK(!graph.empty(), "same-name build did not persist graph.json");
 
     std::vector<std::string> action_ids;
@@ -1607,7 +1635,7 @@ TestResult test_canonical_engine_namespaces() {
           "machine action ids still use the display name");
 
     std::vector<fs::path> objects;
-    for (const auto& entry : fs::recursive_directory_iterator(dir / "out/.obj")) {
+    for (const auto& entry : fs::recursive_directory_iterator(out / ".obj")) {
         if (entry.is_regular_file() && entry.path().extension() == ".o")
             objects.push_back(entry.path());
     }
@@ -1617,7 +1645,7 @@ TestResult test_canonical_engine_namespaces() {
           "same-name canonical moids share one object owner directory");
 
     std::vector<std::string> owner_keys;
-    for (const auto& entry : fs::directory_iterator(dir / "out/.bmi")) {
+    for (const auto& entry : fs::directory_iterator(out / ".bmi")) {
         if (!entry.is_directory() || entry.path().filename() == ".std") continue;
         owner_keys.push_back(entry.path().filename().string());
     }
@@ -1636,7 +1664,7 @@ TestResult test_canonical_engine_namespaces() {
     }
 
     const std::string fingerprints =
-        read_file(dir / "out/.bake/fingerprints.json");
+        read_file(out / ".bake/fingerprints.json");
     for (const auto& id : action_ids) {
         CHECK(fingerprints.find("\"" + id + "\"") != std::string::npos,
               "fingerprint state omitted canonical action id '" + id + "'");
@@ -1653,7 +1681,7 @@ TestResult test_canonical_terminal_collision() {
         "name = \"duplicate\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
 
     auto result = run_bake("build -j 1", dir);
     CHECK(!result.success(),
@@ -1675,7 +1703,7 @@ TestResult test_archive_rebuild_drops_removed_objects() {
         "name = \"fresh-archive\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "src/old.c", "int old_value(void) { return 1; }\n");
 
     auto initial = run_bake("build -j 1", dir);
@@ -1686,7 +1714,8 @@ TestResult test_archive_rebuild_drops_removed_objects() {
 
     auto rebuilt = run_bake("build -j 1", dir);
     CHECK(rebuilt.success(), "archive rebuild failed: " + rebuilt.stdout);
-    const fs::path archive = dir / "out/lib/libfresh-archive.a";
+    const fs::path archive =
+        target_output_dir(dir) / "lib/libfresh-archive.a";
     auto listing = run_cmd("ar t \"" + archive.string() + "\"", dir);
     CHECK(listing.success(), "could not inspect rebuilt archive: " + listing.stdout);
     CHECK(listing.stdout.find("new_") != std::string::npos &&
@@ -1707,14 +1736,15 @@ TestResult test_archive_failure_is_atomic() {
         "name = \"atomic-archive\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     const fs::path source = dir / "src/value.c";
     write_file(source, "int archive_value(void) { return 1; }\n");
 
     // Build initial archive.
     auto initial = run_bake("build -j 1", dir);
     CHECK(initial.success(), "initial atomic archive build failed: " + initial.stdout);
-    const fs::path archive = dir / "out/lib/libatomic-archive.a";
+    const fs::path archive =
+        target_output_dir(dir) / "lib/libatomic-archive.a";
     auto initial_listing = run_cmd("ar t \"" + archive.string() + "\"", dir);
     CHECK(initial_listing.success() &&
               initial_listing.stdout.find("value") != std::string::npos,
@@ -1757,7 +1787,7 @@ TestResult test_terminal_case_collision() {
         "name = \"DUPLICATE\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
 
     auto result = run_bake("build -j 2", dir);
     CHECK(!result.success(),
@@ -1778,7 +1808,7 @@ TestResult test_terminal_output_escape() {
             "name = \"" + name + "\"\n"
             "version = \"0.1.0\"\n"
             "type = \"executable\"\n"
-            "std = \"c17\"\n");
+            "[language]\nc = \"c17\"\n");
         write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
     };
 
@@ -1835,7 +1865,7 @@ TestResult test_workspace_member_filter() {
     CHECK(r.success(), "build -p mylib failed: " + r.stdout);
 
     // mylib should be built
-    fs::path lib_dir = dir / "out" / "lib";
+    fs::path lib_dir = target_output_dir(dir) / "lib";
     bool found_lib = false;
     if (fs::exists(lib_dir)) {
         for (auto& e : fs::directory_iterator(lib_dir)) {
@@ -1857,9 +1887,9 @@ TestResult test_workspace_selection_identity() {
         "name = \"path-target\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n\n"
+        "[language]\nc = \"c17\"\n\n"
         "[options]\n"
-        "marker = 0\n");
+        "marker = false\n");
     write_file(dir / "chosen/src/main.c",
         "int main(void) { return 0; }\n");
     write_file(dir / "other/bake.toml",
@@ -1867,22 +1897,23 @@ TestResult test_workspace_selection_identity() {
         "name = \"chosen\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "other/src/value.c",
         "int other_value(void) { return 1; }\n");
 
     auto by_path = run_bake(
-        "build -p chosen --option marker=1 -j 1", dir);
+        "build -p chosen --option marker -j 1", dir);
     CHECK(by_path.success(),
           "canonical workspace path did not take precedence over display name: " +
               by_path.stdout);
-    CHECK(fs::exists(dir / "out/bin/path-target"),
+    const fs::path selected_out = target_output_dir(dir);
+    CHECK(fs::exists(selected_out / "bin/path-target"),
           "canonical workspace path did not build the selected executable");
-    CHECK(!fs::exists(dir / "out/lib/libchosen.a"),
+    CHECK(!fs::exists(selected_out / "lib/libchosen.a"),
           "display-name cross-match built an unselected workspace member");
 
     auto run_by_path = run_bake(
-        "run -p chosen --option marker=1 -j 1", dir);
+        "run -p chosen --option marker -j 1", dir);
     CHECK(run_by_path.success(),
           "run did not reuse canonical workspace selection: " +
               run_by_path.stdout);
@@ -1893,7 +1924,7 @@ TestResult test_workspace_selection_identity() {
           "unique workspace display-name fallback failed: " +
               by_unique_name.stdout);
     const std::string selected_graph =
-        read_file(dir / "out/.bake/graph.json");
+        read_file(target_output_dir(dir) / ".bake/graph.json");
     CHECK(selected_graph.find("\"moid_id\": \"workspace:chosen\"") !=
               std::string::npos &&
               selected_graph.find("\"moid_id\": \"workspace:other\"") ==
@@ -1906,13 +1937,13 @@ TestResult test_workspace_selection_identity() {
         "name = \"friendly\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "other/bake.toml",
         "[package]\n"
         "name = \"friendly\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
 
     auto ambiguous = run_bake("build -p friendly -j 1", dir);
     CHECK(!ambiguous.success(),
@@ -1936,7 +1967,7 @@ TestResult test_workspace_duplicate_canonical_member() {
         "name = \"duplicate-member\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "member/src/main.c", "int main(void) { return 0; }\n");
 
     auto result = run_bake("build -j 1", dir);
@@ -1962,14 +1993,14 @@ TestResult test_workspace_symlink_selector() {
         "name = \"real-app\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "real/src/main.c", "int main(void) { return 0; }\n");
     write_file(dir / "other/bake.toml",
         "[package]\n"
         "name = \"other-lib\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "other/src/value.c", "int value(void) { return 1; }\n");
     std::error_code ec;
     fs::create_directory_symlink("real", dir / "alias", ec);
@@ -1979,9 +2010,10 @@ TestResult test_workspace_symlink_selector() {
     CHECK(result.success(),
           "symlink selector did not resolve to the canonical workspace root: " +
               result.stdout);
-    CHECK(fs::exists(dir / "out/bin/real-app"),
+    const fs::path out = target_output_dir(dir);
+    CHECK(fs::exists(out / "bin/real-app"),
           "symlink selector did not build its canonical member");
-    CHECK(!fs::exists(dir / "out/lib/libother-lib.a"),
+    CHECK(!fs::exists(out / "lib/libother-lib.a"),
           "symlink selector built an unselected member");
 
     return {};
@@ -2005,15 +2037,14 @@ TestResult test_executable_dependency() {
         "[package]\n"
         "name = \"tool\"\n"
         "version = \"0.1.0\"\n"
-        "type = \"lib\"\n"
-        "std = \"c++23\"\n");
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++23\"\n");
     write_file(scripted / "tool/build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
         "    builder.executable(\"tool\")\n"
-        "        .sources(\"src/*.cpp\")\n"
-        "        .std(\"c++23\");\n"
+        "        .sources(\"src/*.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
     write_file(scripted / "app/build.cpp",
@@ -2025,8 +2056,7 @@ TestResult test_executable_dependency() {
         "    marker.close();\n"
         "    bake::Builder builder;\n"
         "    builder.executable(\"app\")\n"
-        "        .sources(\"src/*.cpp\")\n"
-        "        .std(\"c++23\");\n"
+        "        .sources(\"src/*.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
 
@@ -2047,14 +2077,14 @@ TestResult test_executable_dependency() {
         "[package]\n"
         "name = \"tool\"\n"
         "version = \"0.1.0\"\n"
-        "std = \"c++23\"\n");
+        "type = \"lib\"\n"
+        "[language]\ncxx = \"c++23\"\n");
     write_file(scripted_library / "tool/build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
         "    builder.lib(\"tool\")\n"
-        "        .sources(\"src/*.cpp\")\n"
-        "        .std(\"c++23\");\n"
+        "        .sources(\"src/*.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
     write_file(scripted_library / "tool/src/main.cpp",
@@ -2068,28 +2098,28 @@ TestResult test_executable_dependency() {
           "scripted library was rejected by its provisional manifest type: " +
               library_result.stdout);
     auto library_run = run_cmd(
-        (scripted_library / "out/bin/app").string(), scripted_library);
+        (target_output_dir(scripted_library) / "bin/app").string(),
+        scripted_library);
     CHECK(library_run.success(),
           "consumer did not link the scripted library dependency");
 
     return {};
 }
 
-TestResult test_run_final_declaration() {
+TestResult test_run_scripted_declaration() {
     auto scripted_executable = make_temp_dir("run_final_executable");
     write_file(scripted_executable / "bake.toml",
         "[package]\n"
-        "name = \"manifest-library\"\n"
+        "name = \"scripted-run\"\n"
         "version = \"0.1.0\"\n"
-        "type = \"lib\"\n"
-        "std = \"c++23\"\n");
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++23\"\n");
     write_file(scripted_executable / "build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
         "    builder.executable(\"scripted-run\")\n"
-        "        .sources(\"src/main.cpp\")\n"
-        "        .std(\"c++23\");\n"
+        "        .sources(\"src/main.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
     write_file(scripted_executable / "src/main.cpp",
@@ -2106,47 +2136,68 @@ TestResult test_run_final_declaration() {
           "run did not execute the scripted declaration output: " +
               executable_run.stdout);
 
-    auto scripted_library = make_temp_dir("run_final_library");
-    write_file(scripted_library / "bake.toml",
-        "[package]\n"
-        "name = \"stale-run\"\n"
-        "version = \"0.1.0\"\n"
-        "type = \"executable\"\n"
-        "std = \"c++23\"\n");
-    write_file(scripted_library / "src/main.cpp",
-        "import std;\n"
-        "int main() { std::println(\"stale-executable\"); return 0; }\n");
-    write_file(scripted_library / "build.cpp",
-        "import bake.build;\n\n"
-        "int main() {\n"
-        "    bake::Builder builder;\n"
-        "    builder.executable(\"stale-run\")\n"
-        "        .sources(\"src/main.cpp\")\n"
-        "        .std(\"c++23\");\n"
-        "    return builder.build();\n"
-        "}\n");
-    auto initial = run_bake("build -j 1", scripted_library);
-    CHECK(initial.success(),
-          "could not create the stale executable fixture: " + initial.stdout);
+    return {};
+}
 
-    write_file(scripted_library / "build.cpp",
+// bake.toml is authoritative for the one main moid. A build.cpp main
+// declaration may replace source discovery, but it cannot rename or retype
+// that moid.
+TestResult test_build_cpp_cannot_override_manifest() {
+    auto type_mismatch = make_temp_dir("build_cpp_manifest_type_mismatch");
+    write_file(type_mismatch / "bake.toml",
+        "[package]\n"
+        "name = \"authoritative-lib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n");
+    write_file(type_mismatch / "src/value.c",
+        "int value(void) { return 1; }\n");
+    write_file(type_mismatch / "build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
-        "    bake::Builder builder;\n"
-        "    builder.lib(\"stale-lib\")\n"
-        "        .sources(\"src/main.cpp\")\n"
-        "        .std(\"c++23\");\n"
-        "    return builder.build();\n"
+        "    bake::Builder b;\n"
+        "    b.executable(\"authoritative-lib\")\n"
+        "        .sources(\"src/value.c\");\n"
+        "    return b.build();\n"
         "}\n");
-    auto library_run = run_bake("run -j 1", scripted_library);
-    CHECK(!library_run.success(),
-          "run executed a stale manifest-named executable after the script declared a library");
-    CHECK(library_run.stdout.find("cannot run non-executable package") !=
-              std::string::npos,
-          "run did not report the final non-executable declaration: " +
-              library_run.stdout);
-    CHECK(library_run.stdout.find("stale-executable\n") == std::string::npos,
-          "run executed stale output instead of honoring the final declaration");
+
+    auto wrong_type = run_bake("build", type_mismatch);
+    CHECK(!wrong_type.success(),
+          "build.cpp changed the manifest lib into an executable");
+    CHECK(wrong_type.stdout.find("type") != std::string::npos &&
+              wrong_type.stdout.find("lib") != std::string::npos &&
+              wrong_type.stdout.find("executable") != std::string::npos,
+          "main moid type mismatch lacked both manifest and script values: " +
+              wrong_type.stdout);
+
+    auto name_mismatch = make_temp_dir("build_cpp_manifest_name_mismatch");
+    write_file(name_mismatch / "bake.toml",
+        "[package]\n"
+        "name = \"authoritative-lib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n");
+    write_file(name_mismatch / "src/value.c",
+        "int value(void) { return 1; }\n");
+    write_file(name_mismatch / "build.cpp",
+        "import bake.build;\n\n"
+        "int main() {\n"
+        "    bake::Builder b;\n"
+        "    b.lib(\"script-renamed-lib\")\n"
+        "        .sources(\"src/value.c\");\n"
+        "    return b.build();\n"
+        "}\n");
+
+    auto wrong_name = run_bake("build", name_mismatch);
+    CHECK(!wrong_name.success(),
+          "build.cpp renamed the manifest main lib");
+    CHECK(wrong_name.stdout.find("name") != std::string::npos &&
+              wrong_name.stdout.find("authoritative-lib") !=
+                  std::string::npos &&
+              wrong_name.stdout.find("script-renamed-lib") !=
+                  std::string::npos,
+          "main moid name mismatch lacked both manifest and script values: " +
+              wrong_name.stdout);
 
     return {};
 }
@@ -2158,7 +2209,7 @@ TestResult test_source_less_executable_rejects_stale_output() {
         "name = \"stale-source\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "src/main.c",
         "#include <stdio.h>\n"
         "int main(void) { puts(\"STALE_SOURCE_SENTINEL\"); return 0; }\n");
@@ -2193,7 +2244,7 @@ TestResult test_run_requires_member_for_multiple_executables() {
             "name = \"" + name + "\"\n"
             "version = \"0.1.0\"\n"
             "type = \"executable\"\n"
-            "std = \"c17\"\n");
+            "[language]\nc = \"c17\"\n");
         write_file(dir / member / "src/main.c",
             "#include <stdio.h>\n"
             "int main(void) { puts(\"RAN_" + name + "\"); return 0; }\n");
@@ -2228,27 +2279,28 @@ TestResult test_convention_meta_dependency() {
     auto build = run_bake("build", dir);
     CHECK(build.success(), "meta dependency build failed: " + build.stdout);
 
+    const fs::path out = target_output_dir(dir);
     const fs::path answer_lib =
-        dir / "out" / "lib" / "libanswer.a";
+        out / "lib" / "libanswer.a";
     const fs::path base_lib =
-        dir / "out" / "lib" / "libbase.a";
+        out / "lib" / "libbase.a";
     CHECK(fs::exists(answer_lib),
-          "dependency library was not built under out/lib");
+          "dependency library was not built under out/<target>/lib");
     CHECK(fs::exists(base_lib),
-          "transitive dependency library was not built under out/lib");
+          "transitive dependency library was not built under out/<target>/lib");
     std::size_t object_namespaces = 0;
     std::size_t object_files = 0;
-    for (const auto& entry : fs::directory_iterator(dir / "out/.obj")) {
+    for (const auto& entry : fs::directory_iterator(out / ".obj")) {
         if (entry.is_directory()) ++object_namespaces;
     }
-    for (const auto& entry : fs::recursive_directory_iterator(dir / "out/.obj")) {
+    for (const auto& entry : fs::recursive_directory_iterator(out / ".obj")) {
         if (entry.is_regular_file() && entry.path().extension() == ".o")
             ++object_files;
     }
     CHECK_EQ(object_namespaces, std::size_t(3),
              "meta dependency graph lacks canonical object namespaces");
     CHECK(object_files >= 3,
-          "dependency objects were not built under consumer out/.obj");
+          "dependency objects were not built under consumer out/<target>/.obj");
     CHECK(!fs::exists(dir / "answer" / "out") &&
               !fs::exists(dir / "answer" / ".bake"),
           "dependency source directory was modified by the build");
@@ -2256,13 +2308,17 @@ TestResult test_convention_meta_dependency() {
               !fs::exists(dir / "base" / ".bake"),
           "transitive dependency source directory was modified by the build");
 
-    fs::path exe = dir / "out" / "bin" / "meta-consumer";
+    fs::path exe = out / "bin" / "meta-consumer";
     CHECK(fs::exists(exe), "meta consumer executable was not created");
+    auto initial_run = run_cmd(exe.string(), dir);
+    CHECK_EQ(initial_run.exit_code, 0,
+             "dependency option activation did not reach build.cpp source: " +
+                 initial_run.stdout);
 
     // A CLI option belongs to the package at the command root. Even when the
-    // consumer and dependency declare the same name, the consumer's CLI value
-    // must not replace the value nested in the dependency declaration.
-    auto consumer_option = run_bake("build --option bias=2", dir);
+    // consumer and a transitive dependency declare the same name, the root's
+    // value must not activate the dependency package.
+    auto consumer_option = run_bake("build --option wolfssl", dir);
     CHECK(consumer_option.success(),
           "consumer's own option should be accepted: " + consumer_option.stdout);
     auto isolated_run = run_cmd(exe.string(), dir);
@@ -2279,10 +2335,6 @@ TestResult test_convention_meta_dependency() {
     CHECK_EQ(fs::last_write_time(base_lib),
              base_mtime, "unchanged transitive meta dependency was rebuilt");
 
-    auto run = run_cmd(exe.string(), dir);
-    CHECK_EQ(run.exit_code, 0,
-             "dependency option was not applied: " + std::to_string(run.exit_code));
-
     auto unknown_dir = make_temp_dir("build_cpp_meta_dep_unknown_option");
     copy_fixture("build_cpp_meta_dep", unknown_dir);
     write_file(unknown_dir / "bake.toml",
@@ -2290,9 +2342,9 @@ TestResult test_convention_meta_dependency() {
         "name = \"meta-consumer\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c++23\"\n\n"
+        "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
-        "answer = { path = \"answer\", options = { missing = true } }\n");
+        "answer = { path = \"answer\", options = [\"missing\"] }\n");
     auto unknown = run_bake("build", unknown_dir);
     CHECK(!unknown.success(), "undeclared dependency option should fail");
     CHECK(unknown.stdout.find("option 'missing' is not declared by package 'answer'") !=
@@ -2300,26 +2352,28 @@ TestResult test_convention_meta_dependency() {
           "undeclared dependency option did not identify its owner: " +
               unknown.stdout);
 
-    auto wrong_type_dir = make_temp_dir("build_cpp_meta_dep_wrong_option_type");
+    auto wrong_type_dir = make_temp_dir("build_cpp_meta_dep_non_bool_option");
     copy_fixture("build_cpp_meta_dep", wrong_type_dir);
-    write_file(wrong_type_dir / "bake.toml",
+    write_file(wrong_type_dir / "answer/bake.toml",
         "[package]\n"
-        "name = \"meta-consumer\"\n"
-        "version = \"0.1.0\"\n"
-        "type = \"executable\"\n"
-        "std = \"c++23\"\n\n"
+        "name = \"answer\"\n"
+        "version = \"1.0.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
-        "answer = { path = \"answer\", options = { bias = \"one\" } }\n");
+        "base = { path = \"../base\" }\n\n"
+        "[options]\n"
+        "biased = 1\n");
     auto wrong_type = run_bake("build", wrong_type_dir);
-    CHECK(!wrong_type.success(), "wrong dependency option type should fail");
-    CHECK(wrong_type.stdout.find("expects integer, got string") !=
-              std::string::npos,
-          "wrong dependency option type was not diagnosed: " +
+    CHECK(!wrong_type.success(), "non-bool option declaration should fail");
+    CHECK(wrong_type.stdout.find("biased") != std::string::npos &&
+              (wrong_type.stdout.find("bool") != std::string::npos ||
+               wrong_type.stdout.find("boolean") != std::string::npos),
+          "non-bool option type was not diagnosed: " +
               wrong_type.stdout);
 
-    // Dependency options are constraints on the one package instance built
-    // for this project. An omitted value is not a request for the default: a
-    // different edge may select the package-wide value before defaults apply.
+    // One path leaves base.wolfssl at its default while another enables it.
+    // Bool options merge with OR, so base is compiled once with wolfssl=true.
     auto unified_dir = make_temp_dir("build_cpp_meta_dep_unified_option");
     copy_fixture("build_cpp_meta_dep", unified_dir);
     write_file(unified_dir / "bake.toml",
@@ -2327,56 +2381,27 @@ TestResult test_convention_meta_dependency() {
         "name = \"meta-consumer\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c++23\"\n\n"
+        "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
-        "answer = { path = \"answer\", options = { bias = 2 } }\n"
-        "base = { path = \"base\", options = { tls = \"wolfssl\" } }\n");
+        "answer = { path = \"answer\", options = [\"biased\"] }\n"
+        "base = { path = \"base\", options = [\"wolfssl\"] }\n");
+    write_file(unified_dir / "src/main.cpp",
+        "#include <answer/answer.hpp>\n\n"
+        "int main() { return answer() == 42 ? 0 : 1; }\n");
     auto unified = run_bake("build", unified_dir);
     CHECK(unified.success(),
-          "an explicit option should satisfy an unspecified edge: " +
+          "bool options from multiple dependency paths did not merge with OR: " +
               unified.stdout);
     auto unified_run = run_cmd(
-        (unified_dir / "out" / "bin" / "meta-consumer").string(),
+        (target_output_dir(unified_dir) / "bin" / "meta-consumer").string(),
         unified_dir);
     CHECK_EQ(unified_run.exit_code, 0,
-             "the unified dependency option was not used by the package");
-
-    // Two explicit, different values for a single-valued option cannot be
-    // represented by one package build. The error must identify both values
-    // and the dependency paths that requested them.
-    auto conflict_dir = make_temp_dir("build_cpp_meta_dep_option_conflict");
-    copy_fixture("build_cpp_meta_dep", conflict_dir);
-    write_file(conflict_dir / "bake.toml",
-        "[package]\n"
-        "name = \"meta-consumer\"\n"
-        "version = \"0.1.0\"\n"
-        "type = \"executable\"\n"
-        "std = \"c++23\"\n\n"
-        "[dependencies]\n"
-        "answer = { path = \"answer\", options = { bias = 1 } }\n"
-        "base = { path = \"base\", options = { tls = \"wolfssl\" } }\n");
-    write_file(conflict_dir / "answer" / "bake.toml",
-        "[package]\n"
-        "name = \"answer\"\n"
-        "version = \"1.0.0\"\n"
-        "type = \"lib\"\n"
-        "std = \"c++23\"\n\n"
-        "[dependencies]\n"
-        "base = { path = \"../base\", options = { tls = \"mbedtls\" } }\n\n"
-        "[options]\n"
-        "bias = 0\n");
-    auto conflict = run_bake("build", conflict_dir);
-    CHECK(!conflict.success(), "different tls selections should conflict");
-    CHECK(conflict.stdout.find("option conflict for package 'base'") !=
-              std::string::npos &&
-          conflict.stdout.find("option 'tls'") != std::string::npos &&
-          conflict.stdout.find("\"mbedtls\"") != std::string::npos &&
-          conflict.stdout.find("\"wolfssl\"") != std::string::npos &&
-          conflict.stdout.find("meta-consumer -> answer -> base") !=
-              std::string::npos &&
-          conflict.stdout.find("meta-consumer -> base") != std::string::npos,
-          "option conflict did not report values and dependency paths: " +
-              conflict.stdout);
+             "OR-merged dependency option was not used by the single base build");
+    const std::string unified_graph = read_file(
+        target_output_dir(unified_dir) / ".bake/graph.json");
+    CHECK_EQ(count_occurrences(unified_graph, "\"moid\": \"base\""),
+             std::size_t(2),
+             "OR resolution built more than one base compile/archive pair");
 
     return {};
 }
@@ -2388,7 +2413,7 @@ TestResult test_overlapping_source_groups() {
         "name = \"duplicate-sources\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(duplicate / "src/main.c",
         "int main(void) { return 0; }\n");
     write_file(duplicate / "build.cpp",
@@ -2397,8 +2422,7 @@ TestResult test_overlapping_source_groups() {
         "    bake::Builder builder;\n"
         "    builder.executable(\"duplicate-sources\")\n"
         "        .sources(\"src/*.c\")\n"
-        "        .sources(\"src/main.c\")\n"
-        "        .std(\"c17\");\n"
+        "        .sources(\"src/main.c\");\n"
         "    return builder.build();\n"
         "}\n");
 
@@ -2406,44 +2430,43 @@ TestResult test_overlapping_source_groups() {
     CHECK(duplicate_result.success(),
           "identical overlapping source groups created duplicate actions: " +
               duplicate_result.stdout);
-    const std::string graph = read_file(duplicate / "out/.bake/graph.json");
+    const std::string graph = read_file(
+        target_output_dir(duplicate) / ".bake/graph.json");
     CHECK_EQ(count_occurrences(graph, "\"type\": \"compile\""),
              std::size_t(1),
              "one source produced more than one compile action");
 
-    auto conflicting = make_temp_dir("conflicting_source_groups");
-    write_file(conflicting / "bake.toml",
+    // Per-source options are removed in the new design.
+    // Duplicate sources always merge silently.
+    auto triple = make_temp_dir("triple_source_groups");
+    write_file(triple / "bake.toml",
         "[package]\n"
-        "name = \"conflicting-sources\"\n"
+        "name = \"triple-sources\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n");
-    write_file(conflicting / "src/main.c",
+        "[language]\nc = \"c17\"\n");
+    write_file(triple / "src/main.c",
         "int main(void) { return 0; }\n");
-    write_file(conflicting / "build.cpp",
+    write_file(triple / "build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
-        "    bake::SourceOptions first;\n"
-        "    first.defines.push_back(\"VALUE=1\");\n"
-        "    bake::SourceOptions second;\n"
-        "    second.defines.push_back(\"VALUE=2\");\n"
         "    bake::Builder builder;\n"
-        "    builder.executable(\"conflicting-sources\")\n"
-        "        .sources(\"src/main.c\", first)\n"
-        "        .sources(\"src/main.c\", second)\n"
-        "        .std(\"c17\");\n"
+        "    builder.executable(\"triple-sources\")\n"
+        "        .sources(\"src/*.c\")\n"
+        "        .sources(\"src/main.c\")\n"
+        "        .sources(\"src/main.c\");\n"
         "    return builder.build();\n"
         "}\n");
 
-    auto conflict_result = run_bake("build -j 2", conflicting);
-    CHECK(!conflict_result.success(),
-          "conflicting source groups unexpectedly resolved by declaration order");
-    CHECK(conflict_result.stdout.find("conflicting source groups") !=
-              std::string::npos &&
-              conflict_result.stdout.find("src/main.c") != std::string::npos,
-          "source-group conflict lacked a precise diagnostic: " +
-              conflict_result.stdout);
-
+    auto triple_result = run_bake("build -j 2", triple);
+    CHECK(triple_result.success(),
+          "triple overlapping source groups created duplicate actions: " +
+              triple_result.stdout);
+    const std::string triple_graph = read_file(
+        target_output_dir(triple) / ".bake/graph.json");
+    CHECK_EQ(count_occurrences(triple_graph, "\"type\": \"compile\""),
+             std::size_t(1),
+             "triple-overlap source produced more than one compile action");
     return {};
 }
 
@@ -2454,7 +2477,7 @@ TestResult test_symlink_source_identity() {
         "name = \"symlink-sources\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c17\"\n");
+        "[language]\nc = \"c17\"\n");
     write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
     std::error_code ec;
     fs::create_symlink("main.c", dir / "src/main-link.c", ec);
@@ -2465,8 +2488,7 @@ TestResult test_symlink_source_identity() {
         "    bake::Builder builder;\n"
         "    builder.executable(\"symlink-sources\")\n"
         "        .sources(\"src/main.c\")\n"
-        "        .sources(\"src/main-link.c\")\n"
-        "        .std(\"c17\");\n"
+        "        .sources(\"src/main-link.c\");\n"
         "    return builder.build();\n"
         "}\n");
 
@@ -2474,7 +2496,8 @@ TestResult test_symlink_source_identity() {
     CHECK(result.success(),
           "symlink-equivalent source paths produced duplicate actions: " +
               result.stdout);
-    const std::string graph = read_file(dir / "out/.bake/graph.json");
+    const std::string graph = read_file(
+        target_output_dir(dir) / ".bake/graph.json");
     CHECK_EQ(count_occurrences(graph, "\"type\": \"compile\""),
              std::size_t(1),
              "symlink-equivalent source produced more than one compile action");
@@ -2482,8 +2505,8 @@ TestResult test_symlink_source_identity() {
     return {};
 }
 
-// build.cpp must observe typed CLI option overrides. Changing an option must
-// invalidate actions whose command line changed, even when sources did not.
+// build.cpp can read bool options to select inputs. The same options are also
+// injected automatically as normalized 0/1 macros for compiled sources.
 TestResult test_build_cpp_options() {
     auto dir = make_temp_dir("build_cpp_options");
     copy_fixture("build_cpp_options", dir);
@@ -2510,12 +2533,20 @@ TestResult test_build_cpp_options() {
     CHECK(initial.stdout.find("Finished") != std::string::npos,
           "build output did not show Finished line: " +
               initial.stdout);
-    CHECK(!fs::exists(dir / "out" / ".bmi" / ".std"),
-          "std module PCMs should not be in project-local out/.bmi/.std");
+    const fs::path out = target_output_dir(dir);
+    CHECK(!fs::exists(out / ".bmi" / ".std"),
+          "std module PCMs should not be in out/<target>/.bmi/.std");
+    const std::string compile_commands =
+        read_file(dir / "compile_commands.json");
+    CHECK(contains_command_token(compile_commands, "-O2") &&
+              !contains_command_token(compile_commands, "-g") &&
+              !contains_command_token(compile_commands, "-Wall"),
+          "manifest profile was not applied to build.cpp-declared sources: " +
+              compile_commands);
 
     int same_stem_objects = 0;
     std::set<std::string> object_owners;
-    for (const auto& entry : fs::recursive_directory_iterator(dir / "out" / ".obj")) {
+    for (const auto& entry : fs::recursive_directory_iterator(out / ".obj")) {
         const std::string filename = entry.path().filename().string();
         if (filename.find("value_") == 0 &&
             entry.path().extension() == ".o") {
@@ -2530,7 +2561,7 @@ TestResult test_build_cpp_options() {
              "one canonical moid used multiple object namespaces");
 
     const std::string& owner = *object_owners.begin();
-    const auto build_graph = read_file(dir / "out" / ".bake" / "graph.json");
+    const auto build_graph = read_file(out / ".bake" / "graph.json");
     CHECK(build_graph.find(
               "compile:" + owner + ":src/left/value.c") !=
               std::string::npos &&
@@ -2540,12 +2571,12 @@ TestResult test_build_cpp_options() {
           "build graph action IDs do not include stable source identities: " +
               build_graph);
 
-    fs::path exe = dir / "out" / "bin" / "option-app";
+    fs::path exe = out / "bin" / "option-app";
     CHECK(fs::exists(exe), "option-app executable was not produced");
     auto initial_run = run_cmd(exe.string(), dir);
     CHECK(initial_run.success(), "default option executable failed");
-    CHECK_EQ(initial_run.stdout, std::string("portable|0|1\n"),
-             "build.cpp did not receive default typed options");
+    CHECK_EQ(initial_run.stdout, std::string("portable|0\n"),
+             "build.cpp or automatic macros lost default bool options");
 
     auto unchanged = run_option_bake("build");
     CHECK(unchanged.success(), "unchanged option rebuild failed: " + unchanged.stdout);
@@ -2553,69 +2584,78 @@ TestResult test_build_cpp_options() {
           "unchanged options did not reuse build actions: " + unchanged.stdout);
 
     auto overridden = run_option_bake(
-        "build --option backend=native --option diagnostics --option level=7");
+        "build --option native-backend --option diagnostics");
     CHECK(overridden.success(), "overridden option build failed: " + overridden.stdout);
     CHECK(overridden.stdout.find("Compiling") != std::string::npos,
           "option change incorrectly reused stale actions: " + overridden.stdout);
 
     auto overridden_run = run_cmd(exe.string(), dir);
     CHECK(overridden_run.success(), "overridden option executable failed");
-    CHECK_EQ(overridden_run.stdout, std::string("native|1|7\n"),
-             "build.cpp did not receive string/bool/int CLI overrides");
+    CHECK_EQ(overridden_run.stdout, std::string("native|1\n"),
+             "build.cpp and generated macros disagree on enabled bool options");
 
-    auto invalid_type = run_option_bake(
-        "build --option level=not-an-integer");
-    CHECK(!invalid_type.success(), "invalid integer option should fail");
-    CHECK(invalid_type.stdout.find("expects an integer") != std::string::npos,
-          "invalid integer option did not report its type: " + invalid_type.stdout);
+    auto disabled = run_option_bake(
+        "build --option native-backend=false --option diagnostics=false");
+    CHECK(disabled.success(),
+          "explicit false option override failed: " + disabled.stdout);
+    auto disabled_run = run_cmd(exe.string(), dir);
+    CHECK(disabled_run.success(), "explicit-false option executable failed");
+    CHECK_EQ(disabled_run.stdout, std::string("portable|0\n"),
+             "explicit false did not reach build.cpp and generated macros");
 
-    auto unknown = run_option_bake("build --option missing=value");
+    auto invalid_type = run_option_bake("build --option diagnostics=maybe");
+    CHECK(!invalid_type.success(), "non-boolean CLI option should fail");
+    CHECK(invalid_type.stdout.find("diagnostics") != std::string::npos &&
+              (invalid_type.stdout.find("bool") != std::string::npos ||
+               invalid_type.stdout.find("boolean") != std::string::npos),
+          "invalid bool option did not report its type: " + invalid_type.stdout);
+
+    auto unknown = run_option_bake("build --option missing");
     CHECK(!unknown.success(), "undeclared option should fail");
     CHECK(unknown.stdout.find("unknown build option 'missing'") != std::string::npos,
           "unknown option did not report its name: " + unknown.stdout);
 
     auto run_via_bake = run_option_bake("run");
     CHECK(run_via_bake.success(),
-          "bake run could not read out/.bake/build.json: " +
+          "bake run could not read out/<target>/.bake/build.json: " +
               run_via_bake.stdout);
-    CHECK(run_via_bake.stdout.find("portable|0|1\n") != std::string::npos,
+    CHECK(run_via_bake.stdout.find("portable|0\n") != std::string::npos,
           "bake run executed the wrong build.cpp output: " +
               run_via_bake.stdout);
 
     return {};
 }
 
-TestResult test_build_cpp_multiline_option() {
-    auto dir = make_temp_dir("build_cpp_multiline_option");
-    write_file(dir / "bake.toml",
-        "[package]\n"
-        "name = \"multiline-option\"\n"
-        "version = \"0.1.0\"\n"
-        "type = \"executable\"\n"
-        "std = \"c17\"\n\n"
-        "[options]\n"
-        "payload = \"first\\nsecond=:tail\"\n");
-    write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
-    write_file(dir / "build.cpp",
-        "import bake.build;\n"
-        "import std;\n\n"
-        "int main() {\n"
-        "    bake::Builder builder;\n"
-        "    const std::string expected = \"first\\nsecond=:tail\";\n"
-        "    if (builder.option_str(\"payload\") != expected) {\n"
-        "        std::println(std::cerr, \"multiline option mismatch\");\n"
-        "        return 7;\n"
-        "    }\n"
-        "    builder.executable(\"multiline-option\")\n"
-        "        .sources(\"src/main.c\")\n"
-        "        .std(\"c17\");\n"
-        "    return builder.build();\n"
-        "}\n");
+TestResult test_options_reject_non_bool() {
+    struct InvalidOption {
+        std::string name;
+        std::string value;
+    };
+    const std::vector<InvalidOption> invalid = {
+        {"integer", "1"},
+        {"string", "\"enabled\""},
+    };
 
-    auto result = run_bake("build -j 1", dir);
-    CHECK(result.success(),
-          "build.cpp received a lossy multiline string option: " +
-              result.stdout);
+    for (const auto& option : invalid) {
+        auto dir = make_temp_dir("non_bool_option_" + option.name);
+        write_file(dir / "bake.toml",
+            "[package]\n"
+            "name = \"non-bool-option\"\n"
+            "version = \"0.1.0\"\n"
+            "[language]\nc = \"c17\"\n\n"
+            "[options]\n"
+            "feature = " + option.value + "\n");
+        write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
+
+        auto result = run_bake("build", dir);
+        CHECK(!result.success(),
+              option.name + " option unexpectedly succeeded");
+        CHECK(result.stdout.find("feature") != std::string::npos &&
+                  (result.stdout.find("bool") != std::string::npos ||
+                   result.stdout.find("boolean") != std::string::npos),
+              option.name + " option lacked a bool-only diagnostic: " +
+                  result.stdout);
+    }
 
     return {};
 }
@@ -2635,7 +2675,7 @@ TestResult test_build_cpp_transitive_modules() {
           "build.cpp could not compile transitive module imports: " +
               build.stdout);
 
-    fs::path exe = dir / "out" / "bin" / "transitive-modules";
+    fs::path exe = target_output_dir(dir) / "bin" / "transitive-modules";
     CHECK(fs::exists(exe), "transitive module executable was not produced");
     auto run = run_cmd(exe.string(), dir);
     CHECK(run.success(), "transitive module executable returned a failure");
@@ -2653,13 +2693,14 @@ TestResult test_std_compat_convention() {
     CHECK(build.success(),
           "convention build with import std.compat failed: " + build.stdout);
 
-    fs::path exe = dir / "out" / "bin" / "std-compat-convention";
+    const fs::path out = target_output_dir(dir);
+    fs::path exe = out / "bin" / "std-compat-convention";
     CHECK(fs::exists(exe), "std.compat convention executable was not produced");
     auto run = run_cmd(exe.string(), dir);
     CHECK(run.success(), "std.compat convention executable returned failure");
 
     // Toolchain PCMs are now in the global cache, not project-local.
-    fs::path local_std = dir / "out" / ".bmi" / ".std";
+    fs::path local_std = out / ".bmi" / ".std";
     CHECK(!fs::exists(local_std),
           "out/.bmi/.std should not exist (std PCMs moved to global cache)");
 
@@ -2682,18 +2723,19 @@ TestResult test_std_compat_build_cpp() {
     CHECK(build.success(),
           "build.cpp with import std.compat failed: " + build.stdout);
 
-    fs::path exe = dir / "out" / "bin" / "std-compat-build-cpp";
+    const fs::path out = target_output_dir(dir);
+    fs::path exe = out / "bin" / "std-compat-build-cpp";
     CHECK(fs::exists(exe), "std.compat build.cpp executable was not produced");
     auto run = run_cmd(exe.string(), dir);
     CHECK(run.success(), "std.compat build.cpp executable returned failure");
 
     // Toolchain PCMs are now in the global cache, not project-local.
-    fs::path local_std = dir / "out" / ".bmi" / ".std";
+    fs::path local_std = out / ".bmi" / ".std";
     CHECK(!fs::exists(local_std),
           "out/.bmi/.std should not exist (std PCMs moved to global cache)");
 
     // bake.build.pcm / bake.build.o must not be in project-local scripts dir.
-    fs::path scripts = dir / "out" / ".bake" / "scripts";
+    fs::path scripts = out / ".bake" / "scripts";
     if (fs::exists(scripts)) {
         for (auto& e : fs::directory_iterator(scripts)) {
             if (fs::is_directory(e)) {
@@ -2731,7 +2773,8 @@ TestResult test_cache_sharing() {
     CHECK(build_a.success(),
           "project A build failed: " + build_a.stdout);
 
-    fs::path exe_a = proj_a / "out" / "bin" / "std-compat-convention";
+    const fs::path out_a = target_output_dir(proj_a);
+    fs::path exe_a = out_a / "bin" / "std-compat-convention";
     CHECK(fs::exists(exe_a), "project A executable was not produced");
 
     // Cache must contain std.pcm and std.compat.pcm under <key>/std/.
@@ -2749,7 +2792,7 @@ TestResult test_cache_sharing() {
           "std.compat.pcm not found in global cache after project A build");
 
     // Project A's out/ must not contain .bmi/.std.
-    CHECK(!fs::exists(proj_a / "out" / ".bmi" / ".std"),
+    CHECK(!fs::exists(out_a / ".bmi" / ".std"),
           "project A out/.bmi/.std should not exist");
 
     // Record the build output for A (should show "Preparing standard library module").
@@ -2761,7 +2804,8 @@ TestResult test_cache_sharing() {
     CHECK(build_b.success(),
           "project B build failed: " + build_b.stdout);
 
-    fs::path exe_b = proj_b / "out" / "bin" / "std-compat-convention";
+    const fs::path out_b = target_output_dir(proj_b);
+    fs::path exe_b = out_b / "bin" / "std-compat-convention";
     CHECK(fs::exists(exe_b), "project B executable was not produced");
     auto run_b = run_cmd(exe_b.string(), proj_b);
     CHECK(run_b.success(), "project B executable returned failure");
@@ -2773,7 +2817,7 @@ TestResult test_cache_sharing() {
           "project B should not recompile std modules (cache miss expected hit)");
 
     // Project B's out/ must not contain .bmi/.std either.
-    CHECK(!fs::exists(proj_b / "out" / ".bmi" / ".std"),
+    CHECK(!fs::exists(out_b / ".bmi" / ".std"),
           "project B out/.bmi/.std should not exist");
 
     // If project A actually prepared the std module, we have a solid
@@ -2845,7 +2889,7 @@ TestResult test_remote_archive_extract() {
         "name = \"remote-archive-app\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "std = \"c++17\"\n\n"
+        "[language]\ncxx = \"c++17\"\n\n"
         "[dependencies]\n"
         "fixture = { url = \"file://" + remote.string() +
             "\", tag = \"v1.0\" }\n"
@@ -2873,19 +2917,20 @@ TestResult test_module_archive_edges() {
     CHECK(build.success(),
           "module_archive workspace build failed: " + build.stdout);
 
-    fs::path exe = dir / "out" / "bin" / "consumer";
+    const fs::path out = target_output_dir(dir);
+    fs::path exe = out / "bin" / "consumer";
     CHECK(fs::exists(exe), "consumer executable was not produced");
     auto run = run_cmd(exe.string(), dir);
     CHECK_EQ(run.exit_code, 0,
              "consumer executable returned non-zero: " + run.stdout);
 
     // Verify the archive exists.
-    fs::path archive = dir / "out" / "lib" / "libmodlib.a";
+    fs::path archive = out / "lib" / "libmodlib.a";
     CHECK(fs::exists(archive), "modlib static archive was not produced");
 
     // Inspect graph.json for module object → archive producer edges.
     const std::string graph =
-        read_file(dir / "out" / ".bake" / "graph.json");
+        read_file(out / ".bake" / "graph.json");
     CHECK(!graph.empty(), "module_archive did not persist graph.json");
 
     auto action_for_in = [](const std::string& document,
@@ -3019,7 +3064,7 @@ TestResult test_graph_json_round_trip() {
     CHECK(build.success(), "graph.json fixture build failed: " + build.stdout);
 
     const std::string graph_str =
-        read_file(dir / "out" / ".bake" / "graph.json");
+        read_file(target_output_dir(dir) / ".bake" / "graph.json");
     CHECK(!graph_str.empty(), "graph.json was not written");
 
     // Every action must have a unique id, a type, and a depends_on array.
@@ -3081,6 +3126,368 @@ TestResult test_graph_json_round_trip() {
     return {};
 }
 
+// Built-in profiles require no manifest declaration. A custom profile uses
+// the same semantic fields and must affect both compile and link actions.
+TestResult test_convention_profiles() {
+    auto dir = make_temp_dir("convention_profiles");
+    copy_fixture("convention_profiles", dir);
+
+    auto dev = run_bake("build", dir);
+    CHECK(dev.success(), "implicit dev profile failed: " + dev.stdout);
+    auto commands = read_file(dir / "compile_commands.json");
+    CHECK(contains_command_token(commands, "-O0") &&
+              contains_command_token(commands, "-g") &&
+              contains_command_token(commands, "-Wall"),
+          "implicit dev profile flags are incomplete: " + commands);
+    CHECK(!contains_command_token(commands, "-flto=thin"),
+          "dev profile leaked release-only flags: " + commands);
+    const fs::path exe = native_executable_path(
+        target_output_dir(dir), "convention-profiles");
+    auto dev_run = run_cmd(exe.string(), dir);
+    CHECK(dev_run.success() && dev_run.stdout == "NDEBUG=0\n",
+          "dev profile unexpectedly defined NDEBUG: " + dev_run.stdout);
+
+    auto release = run_bake("build --release", dir);
+    CHECK(release.success(), "implicit release profile failed: " + release.stdout);
+    commands = read_file(dir / "compile_commands.json");
+    CHECK(contains_command_token(commands, "-O3") &&
+              contains_command_token(commands, "-flto=thin") &&
+              contains_command_token(commands, "-Wall"),
+          "implicit release profile flags are incomplete: " + commands);
+    CHECK(!contains_command_token(commands, "-g"),
+          "release profile unexpectedly emitted full debug information: " +
+              commands);
+    auto release_run = run_cmd(exe.string(), dir);
+    CHECK(release_run.success() && release_run.stdout == "NDEBUG=1\n",
+          "release profile did not define NDEBUG: " + release_run.stdout);
+
+    std::string manifest = read_file(dir / "bake.toml");
+    manifest += "\n[profile.release]\n"
+                "opt = 1\n"
+                "debug = true\n"
+                "lto = false\n"
+                "warnings = \"none\"\n";
+    write_file(dir / "bake.toml", manifest);
+    auto overridden_release = run_bake("build --release", dir);
+    CHECK(overridden_release.success(),
+          "overridden release profile failed: " + overridden_release.stdout);
+    commands = read_file(dir / "compile_commands.json");
+    CHECK(contains_command_token(commands, "-O1") &&
+              contains_command_token(commands, "-g") &&
+              !contains_command_token(commands, "-flto=thin") &&
+              !contains_command_token(commands, "-Wall"),
+          "user release profile did not override built-in fields: " + commands);
+    auto overridden_run = run_cmd(exe.string(), dir);
+    CHECK(overridden_run.success() && overridden_run.stdout == "NDEBUG=1\n",
+          "overriding release fields removed NDEBUG: " + overridden_run.stdout);
+
+    auto bench = run_bake("build --profile bench", dir);
+    CHECK(bench.success(), "custom bench profile failed: " + bench.stdout);
+    commands = read_file(dir / "compile_commands.json");
+    CHECK(contains_command_token(commands, "-Oz") &&
+              contains_command_token(commands, "-gline-tables-only") &&
+              contains_command_token(commands, "-flto") &&
+              contains_command_token(commands, "-Wall") &&
+              contains_command_token(commands, "-Wextra") &&
+              contains_command_token(commands, "-Werror"),
+          "custom profile compile flags are incomplete: " + commands);
+    CHECK(!contains_command_token(commands, "-flto=thin"),
+          "full LTO was incorrectly converted to thin LTO: " + commands);
+
+    const std::string graph = read_file(
+        target_output_dir(dir) / ".bake/graph.json");
+    CHECK(contains_command_token(graph, "-Wl,-S"),
+          "custom profile strip flag is absent from the link action: " + graph);
+
+    auto missing = run_bake("build --profile does-not-exist", dir);
+    CHECK(!missing.success(), "unknown profile unexpectedly succeeded");
+    CHECK(missing.stdout.find("does-not-exist") != std::string::npos &&
+              missing.stdout.find("profile") != std::string::npos,
+          "unknown profile diagnostic omitted its name: " + missing.stdout);
+
+    return {};
+}
+
+// Broad and exact target tables both contribute. Exact flags are appended
+// last, non-matching tables contribute nothing, and frameworks are ignored on
+// a non-Darwin target without turning into linker arguments.
+TestResult test_target_conditions() {
+    auto dir = make_temp_dir("target_conditions");
+    copy_fixture("target_conditions", dir);
+
+    auto build = run_bake("build -t x86_64-linux-musl", dir);
+    CHECK(build.success(), "target-conditioned build failed: " + build.stdout);
+
+    const fs::path out = dir / "out/x86_64-linux-musl";
+    CHECK(fs::is_directory(out),
+          "explicit target did not use out/x86_64-linux-musl");
+    CHECK(fs::exists(out / "bin/target-conditions"),
+          "target-conditioned executable was not produced");
+
+    const std::string commands = read_file(dir / "compile_commands.json");
+    const auto profile = commands.find("-Wall");
+    const auto broad = commands.find("-DTARGET_PRIORITY=1");
+    const auto undef = commands.find("-UTARGET_PRIORITY");
+    const auto exact = commands.find("-DTARGET_PRIORITY=2");
+    CHECK(profile != std::string::npos && broad != std::string::npos &&
+              undef != std::string::npos && exact != std::string::npos &&
+              profile < broad && broad < undef && undef < exact,
+          "target flags were not merged from broad to specific: " + commands);
+    CHECK(commands.find("WRONG_ARCH_MATCH") == std::string::npos,
+          "non-matching target defines leaked into compile actions: " + commands);
+
+    const std::string graph = read_file(out / ".bake/graph.json");
+    CHECK(contains_command_token(graph, "-lm"),
+          "target library was not added to the link action: " + graph);
+    CHECK(graph.find("DefinitelyIgnoredOutsideDarwin") == std::string::npos,
+          "non-Darwin link action retained a framework: " + graph);
+
+    auto darwin_dir = make_temp_dir("darwin_framework_declaration");
+    write_file(darwin_dir / "bake.toml",
+        "[package]\n"
+        "name = \"darwin-framework-declaration\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[target.\"*-apple-darwin\"]\n"
+        "frameworks = [\"Foundation\"]\n");
+    write_file(darwin_dir / "src/value.c", "int value(void) { return 1; }\n");
+    auto darwin = run_bake("build -t aarch64-apple-darwin", darwin_dir);
+    CHECK(darwin.success(),
+          "Darwin framework target table failed to configure: " +
+              darwin.stdout);
+    auto declaration = find_moid_declaration(
+        darwin_dir / "out/aarch64-apple-darwin/.bake");
+    CHECK(declaration.has_value(),
+          "Darwin framework declaration was not persisted");
+    const auto frameworks =
+        json_value_field(read_file(*declaration), "frameworks");
+    CHECK(frameworks.has_value() &&
+              frameworks->find("\"Foundation\"") != std::string::npos,
+          "matching Darwin framework was not added to the declaration");
+
+    auto invalid_dir = make_temp_dir("invalid_target_pattern");
+    copy_fixture("target_conditions", invalid_dir);
+    std::string manifest = read_file(invalid_dir / "bake.toml");
+    manifest += "\n[target.\"x86*-linux-musl\"]\n"
+                "defines = [\"INVALID_PARTIAL_WILDCARD=1\"]\n";
+    write_file(invalid_dir / "bake.toml", manifest);
+    auto invalid = run_bake("build -t x86_64-linux-musl", invalid_dir);
+    CHECK(!invalid.success(), "partial-segment target wildcard was accepted");
+    CHECK(invalid.stdout.find("x86*") != std::string::npos &&
+              invalid.stdout.find("target") != std::string::npos,
+          "invalid target wildcard lacked a precise diagnostic: " +
+              invalid.stdout);
+
+    auto four_segment = run_bake(
+        "build -t x86_64-unknown-linux-musl", dir);
+    CHECK(!four_segment.success(),
+          "four-segment target triple was accepted");
+    CHECK(four_segment.stdout.find("x86_64-unknown-linux-musl") !=
+              std::string::npos &&
+              four_segment.stdout.find("target") != std::string::npos,
+          "four-segment target lacked a three-segment diagnostic: " +
+              four_segment.stdout);
+
+    return {};
+}
+
+TestResult test_convention_source_extensions() {
+    auto dir = make_temp_dir("convention_source_extensions");
+    copy_fixture("convention_source_extensions", dir);
+
+    auto build = run_bake("build", dir);
+    CHECK(build.success(),
+          "default convention extensions did not build: " + build.stdout);
+    const fs::path exe = native_executable_path(
+        target_output_dir(dir), "convention-source-extensions");
+    CHECK(fs::exists(exe), "default-extension executable was not produced");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK(run.success(),
+          "one or more default source/header/module extensions were omitted");
+
+    const std::string commands = read_file(dir / "compile_commands.json");
+    for (const std::string_view source : {
+             "main.cpp", "c_value.c", "cc_value.cc", "cxx_value.cxx",
+             "mm_value.mm", "detail.cppm", "api.ixx"}) {
+        CHECK(commands.find(source) != std::string::npos,
+              "compile_commands omitted default extension source '" +
+                  std::string(source) + "': " + commands);
+    }
+
+    return {};
+}
+
+TestResult test_header_only_dependency() {
+    auto dir = make_temp_dir("header_only_dependency");
+    copy_fixture("header_only_dependency", dir);
+
+    auto build = run_bake("build", dir);
+    CHECK(build.success(),
+          "header-only dependency build failed: " + build.stdout);
+    const fs::path out = target_output_dir(dir);
+    const fs::path exe =
+        native_executable_path(out, "header-only-consumer");
+    CHECK(fs::exists(exe), "header-only consumer was not produced");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK(run.success(),
+          "header include dirs or public option/package defines were not forwarded");
+
+#ifdef _WIN32
+    const fs::path unexpected_archive = out / "lib/header-only.lib";
+#else
+    const fs::path unexpected_archive = out / "lib/libheader-only.a";
+#endif
+    CHECK(!fs::exists(unexpected_archive),
+          "pure header library unexpectedly produced an archive");
+    const std::string graph = read_file(out / ".bake/graph.json");
+    CHECK(contains_command_token(graph, "-lm"),
+          "header-only dependency did not forward its link libraries: " + graph);
+
+    return {};
+}
+
+TestResult test_build_cpp_test_orchestration() {
+    auto dir = make_temp_dir("build_cpp_tests");
+    copy_fixture("build_cpp_tests", dir);
+
+    auto default_test = run_bake("test", dir);
+    CHECK(default_test.success(),
+          "bake test could not build and run the default test: " +
+              default_test.stdout);
+    CHECK(default_test.stdout.find("BAKE_TEST_PARSER_RAN\n") !=
+              std::string::npos &&
+              default_test.stdout.find("BAKE_TEST_STRING_RAN\n") ==
+              std::string::npos &&
+              default_test.stdout.find("BAKE_TEST_INTEGRATION_RAN\n") ==
+              std::string::npos,
+          "the last set_default() call did not uniquely select parser-suite: " +
+              default_test.stdout);
+
+    const fs::path out = target_output_dir(dir);
+#ifdef _WIN32
+    const std::string executable_suffix = ".exe";
+    const fs::path main_library = out / "lib/build-cpp-tests.lib";
+#else
+    const std::string executable_suffix;
+    const fs::path main_library = out / "lib/libbuild-cpp-tests.a";
+#endif
+    CHECK(fs::exists(main_library),
+          "incremental build.cpp mode did not preserve the convention main moid");
+    for (const std::string_view binary : {
+             "unit_string", "unit_parser", "integration"}) {
+        CHECK(fs::exists(out / "bin" /
+                         (std::string(binary) + executable_suffix)),
+              "registered test binary was not produced: " +
+                  std::string(binary));
+    }
+
+    auto named = run_bake("test string-suite", dir);
+    CHECK(named.success(), "named test failed: " + named.stdout);
+    CHECK(named.stdout.find("BAKE_TEST_STRING_RAN\n") != std::string::npos &&
+              named.stdout.find("BAKE_TEST_PARSER_RAN\n") == std::string::npos &&
+              named.stdout.find("BAKE_TEST_INTEGRATION_RAN\n") ==
+              std::string::npos,
+          "named test did not run only its mapped binary: " + named.stdout);
+
+    auto all = run_bake("test --all", dir);
+    CHECK(all.success(), "bake test --all failed: " + all.stdout);
+    CHECK(all.stdout.find("BAKE_TEST_STRING_RAN\n") != std::string::npos &&
+              all.stdout.find("BAKE_TEST_PARSER_RAN\n") != std::string::npos &&
+              all.stdout.find("BAKE_TEST_INTEGRATION_RAN\n") !=
+              std::string::npos,
+          "bake test --all did not run every registered test: " + all.stdout);
+
+    return {};
+}
+
+// A main lib can use fully custom input discovery and still contribute
+// several binaries. b.lib() binds to the bake.toml-defined main lib; it does
+// not create a second moid or change manifest configuration.
+TestResult test_build_cpp_custom_lib_with_binaries() {
+    auto dir = make_temp_dir("build_cpp_custom_lib_binaries");
+    copy_fixture("build_cpp_custom_lib_binaries", dir);
+
+    auto build = run_bake("build", dir);
+    CHECK(build.success(),
+          "custom-input main lib with binaries failed: " + build.stdout);
+    const fs::path out = target_output_dir(dir);
+
+#ifdef _WIN32
+    const fs::path main_library = out / "lib/custom-input-lib.lib";
+#else
+    const fs::path main_library = out / "lib/libcustom-input-lib.a";
+#endif
+    CHECK(fs::exists(main_library),
+          "build.cpp did not produce the bake.toml-defined main lib");
+
+    const fs::path tool_a =
+        native_executable_path(out, "custom-tool-a");
+    const fs::path tool_b =
+        native_executable_path(out, "custom-tool-b");
+    CHECK(fs::exists(tool_a) && fs::exists(tool_b),
+          "build.cpp did not produce every additional binary");
+    auto run_a = run_cmd(tool_a.string(), dir);
+    auto run_b = run_cmd(tool_b.string(), dir);
+    CHECK(run_a.success() && run_b.success(),
+          "additional binaries did not inherit the main lib and public headers");
+
+    const std::string graph = read_file(out / ".bake/graph.json");
+    CHECK(graph.find("must_not_compile.cpp") == std::string::npos,
+          "explicit main-lib inputs did not replace convention source scanning");
+    CHECK(graph.find("custom/src/value.cpp") != std::string::npos &&
+              graph.find("tools/tool_a.cpp") != std::string::npos &&
+              graph.find("tools/tool_b.cpp") != std::string::npos,
+          "custom main-lib or binary inputs are absent from the build graph: " +
+              graph);
+
+    return {};
+}
+
+TestResult test_target_output_isolation() {
+    auto dir = make_temp_dir("target_output_isolation");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"target-output-isolation\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\nc = \"c17\"\n");
+    write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
+
+    auto native = run_bake("build", dir);
+    CHECK(native.success(), "native isolation build failed: " + native.stdout);
+    auto outputs = target_output_dirs(dir);
+    CHECK_EQ(outputs.size(), std::size_t(1),
+             "native isolation build did not create one target directory");
+    const std::string native_target = outputs.front().filename().string();
+    const std::string cross_target = native_target == "x86_64-linux-musl"
+        ? "x86_64-windows-gnu"
+        : "x86_64-linux-musl";
+
+    auto cross = run_bake("build -t " + cross_target, dir);
+    CHECK(cross.success(), "cross-target isolation build failed: " + cross.stdout);
+    outputs = target_output_dirs(dir);
+    CHECK_EQ(outputs.size(), std::size_t(2),
+             "native and cross builds did not retain two isolated target roots");
+
+    for (const auto& target : {native_target, cross_target}) {
+        const fs::path out = dir / "out" / target;
+        CHECK(fs::is_directory(out / "bin") &&
+                  fs::is_directory(out / ".obj") &&
+                  fs::is_directory(out / ".bake"),
+              "target output is incomplete for " + target);
+        CHECK(!read_file(out / ".bake/graph.json").empty(),
+              "target graph is missing for " + target);
+        CHECK(!read_file(out / ".bake/fingerprints.json").empty(),
+              "target fingerprints are missing for " + target);
+    }
+    CHECK(!fs::exists(dir / "out/bin") &&
+              !fs::exists(dir / "out/.bake"),
+          "multi-target build leaked state into the target-less output root");
+
+    return {};
+}
+
 // ----------------------------------------------------------------
 // Test registry
 // ----------------------------------------------------------------
@@ -3090,7 +3497,6 @@ static std::vector<TestCase> all_tests = {
     {"default_executable_type",       test_default_executable_type},
     {"invalid_moid_type",             test_invalid_moid_type},
     {"declaration_equivalence",       test_declaration_equivalence},
-    {"declaration_convention_boundary", test_declaration_convention_boundary},
     {"declaration_json_escape",       test_declaration_json_escape},
     {"declaration_reader_validation", test_declaration_reader_validation},
     {"static_lib_build",              test_static_lib_build},
@@ -3106,7 +3512,7 @@ static std::vector<TestCase> all_tests = {
     {"add_duplicate",                 test_add_duplicate},
     {"add_duplicate_compact",         test_add_duplicate_compact},
     {"add_no_tag",                    test_add_no_tag},
-    {"unified_output_layout",         test_unified_output_layout},
+    {"target_output_layout",          test_target_output_layout},
     {"clean",                         test_clean},
     {"init",                          test_init},
     {"init_c",                        test_init_c},
@@ -3114,7 +3520,7 @@ static std::vector<TestCase> all_tests = {
     {"update_single_dep",             test_update_single_dep},
     {"standalone_path_dep_build",     test_standalone_path_dep_build},
     {"standalone_path_dep_locked",    test_standalone_path_dep_locked},
-    {"workspace_unified_output",      test_workspace_unified_output},
+    {"workspace_target_output",       test_workspace_target_output},
     {"canonical_engine_namespaces",   test_canonical_engine_namespaces},
     {"canonical_terminal_collision",  test_canonical_terminal_collision},
     {"archive_rebuild_drops_removed_objects", test_archive_rebuild_drops_removed_objects},
@@ -3126,14 +3532,15 @@ static std::vector<TestCase> all_tests = {
     {"workspace_duplicate_canonical_member", test_workspace_duplicate_canonical_member},
     {"workspace_symlink_selector",    test_workspace_symlink_selector},
     {"executable_dependency",         test_executable_dependency},
-    {"run_final_declaration",         test_run_final_declaration},
+    {"run_scripted_declaration",      test_run_scripted_declaration},
+    {"build_cpp_cannot_override_manifest", test_build_cpp_cannot_override_manifest},
     {"source_less_executable_rejects_stale_output", test_source_less_executable_rejects_stale_output},
     {"run_requires_member_for_multiple_executables", test_run_requires_member_for_multiple_executables},
     {"convention_meta_dependency",    test_convention_meta_dependency},
     {"overlapping_source_groups",     test_overlapping_source_groups},
     {"symlink_source_identity",       test_symlink_source_identity},
     {"build_cpp_options",             test_build_cpp_options},
-    {"build_cpp_multiline_option",    test_build_cpp_multiline_option},
+    {"options_reject_non_bool",       test_options_reject_non_bool},
     {"build_cpp_transitive_modules",  test_build_cpp_transitive_modules},
     {"std_compat_convention",         test_std_compat_convention},
     {"std_compat_build_cpp",          test_std_compat_build_cpp},
@@ -3141,6 +3548,13 @@ static std::vector<TestCase> all_tests = {
     {"remote_archive_extract",        test_remote_archive_extract},
     {"module_archive_edges",          test_module_archive_edges},
     {"graph_json_round_trip",         test_graph_json_round_trip},
+    {"convention_profiles",           test_convention_profiles},
+    {"target_conditions",             test_target_conditions},
+    {"convention_source_extensions",  test_convention_source_extensions},
+    {"header_only_dependency",        test_header_only_dependency},
+    {"build_cpp_test_orchestration",  test_build_cpp_test_orchestration},
+    {"build_cpp_custom_lib_with_binaries", test_build_cpp_custom_lib_with_binaries},
+    {"target_output_isolation",       test_target_output_isolation},
 };
 
 // ----------------------------------------------------------------

@@ -9,7 +9,6 @@ int main() {
             "src/middle.cppm",
             "src/top.cppm",
             "src/main.cpp",
-        })
-        .std("c++23");
+        });
     return b.build();
 }

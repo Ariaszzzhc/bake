@@ -2,10 +2,12 @@
 name = "base"
 version = "1.0.0"
 type = "lib"
-std = "c++23"
 
 [dependencies]
 upstream = { path = "upstream" }
 
 [options]
-tls = "mbedtls"
+wolfssl = false
+
+[language]
+cxx = "c++23"

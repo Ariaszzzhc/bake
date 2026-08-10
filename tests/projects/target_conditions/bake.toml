@@ -1,0 +1,22 @@
+[package]
+name = "target-conditions"
+version = "0.1.0"
+type = "executable"
+
+[target."*-linux-musl"]
+defines = ["TARGET_FAMILY=1"]
+flags = ["-DTARGET_PRIORITY=1"]
+include_dirs = ["target/family"]
+libraries = ["m"]
+frameworks = ["DefinitelyIgnoredOutsideDarwin"]
+
+[target."x86_64-linux-musl"]
+defines = ["TARGET_EXACT=1"]
+flags = ["-UTARGET_PRIORITY", "-DTARGET_PRIORITY=2"]
+include_dirs = ["target/exact"]
+
+[target."aarch64-*"]
+defines = ["WRONG_ARCH_MATCH=1"]
+
+[language]
+c = "c17"

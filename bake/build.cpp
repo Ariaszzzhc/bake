@@ -45,7 +45,7 @@ int main() {
     auto llvm_libs  = glob_static_libs(llvm_lib, "libLLVM");
 
     b.executable("bake")
-        .std("c++23")
+        .cxx_std("c++23")
         .sources({
             "src/bake.util.cppm",
             "src/bake.project.cppm",
@@ -66,27 +66,18 @@ int main() {
             llvm_include,
             "../third_party/tomlplusplus/public",
             "../third_party/nlohmann/public",
-        })
-        .define("BAKE_VERSION", "\"0.1.0\"");
+        });
 
-    // Link all LLVM/Clang/LLD static libs + zlib + zstd.
-    for (auto& lib : clang_libs) b.link_system(lib);
-    for (auto& lib : lld_libs)   b.link_system(lib);
-    for (auto& lib : llvm_libs)  b.link_system(lib);
-
-    // Windows system libraries required by LLVM/Clang:
-    // ole32 — COM functions (CoTaskMemFree, CoCreateInstance) used by LLVMSupport
-    // version — GetFileVersionInfoW used by Clang MSVC detection
-    if (b.target().contains("windows")) {
-        b.link_system("ole32");
-        b.link_system("version");
-    }
+    // Prebuilt LLVM/Clang/LLD static libraries.
+    for (auto& lib : clang_libs) b.prebuilt_lib(lib);
+    for (auto& lib : lld_libs)   b.prebuilt_lib(lib);
+    for (auto& lib : llvm_libs)  b.prebuilt_lib(lib);
 
     // Link zlib/zstd if present (absent in cross-compile builds where they're disabled).
     std::string zlib = ws + "/external/zlib-install/lib/libz.a";
     std::string zstd = ws + "/external/zstd-install/lib/libzstd.a";
-    if (fs::exists(zlib)) b.link_system(zlib);
-    if (fs::exists(zstd)) b.link_system(zstd);
+    if (fs::exists(zlib)) b.prebuilt_lib(zlib);
+    if (fs::exists(zstd)) b.prebuilt_lib(zstd);
 
     return b.build();
 }

@@ -2,9 +2,15 @@
 name = "option-app"
 version = "0.1.0"
 type = "executable"
-std = "c17"
 
 [options]
-backend = "portable"
 diagnostics = false
-level = 1
+native-backend = false
+
+[profile.dev]
+opt = 2
+debug = false
+warnings = "none"
+
+[language]
+c = "c17"

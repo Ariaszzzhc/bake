@@ -2,4 +2,6 @@
 name = "tomlplusplus"
 version = "3.4.0"
 type = "lib"
-std = "c++23"
+
+[language]
+cxx = "c++23"

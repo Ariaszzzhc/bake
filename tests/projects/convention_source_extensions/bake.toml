@@ -1,0 +1,10 @@
+[package]
+name = "convention-source-extensions"
+version = "0.1.0"
+type = "executable"
+
+[sources]
+source_ext = [".cpp", ".cc", ".cxx", ".c", ".mm"]
+
+[language]
+cxx = "c++23"

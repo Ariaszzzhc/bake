@@ -32,18 +32,28 @@ export struct SourceSet {
     }
 };
 
-export SourceSet discover_sources(const Path& src_dir, const Path& public_dir) {
+export SourceSet discover_sources(
+        const Path& src_dir, const Path& public_dir,
+        const SourceExtConfig& ext) {
     SourceSet sources;
+
+    auto match_ext = [](const Path& p, const std::vector<std::string>& exts) {
+        for (const auto& e : exts)
+            if (p.has_extension(e)) return true;
+        return false;
+    };
 
     if (src_dir.is_directory()) {
         for (auto& entry : std::filesystem::recursive_directory_iterator(src_dir.fs())) {
             if (!entry.is_regular_file()) continue;
             Path p(entry.path());
-            if (p.is_cpp()) {
-                sources.cpp_files.push_back(p);
-            } else if (p.is_c()) {
-                sources.c_files.push_back(p);
-            } else if (p.is_module_interface()) {
+            if (match_ext(p, ext.source_ext)) {
+                if (match_ext(p, ext.module_ext)) {
+                    sources.module_interfaces.push_back(p);
+                } else {
+                    sources.cpp_files.push_back(p);
+                }
+            } else if (match_ext(p, ext.module_ext)) {
                 sources.module_interfaces.push_back(p);
             }
         }
@@ -53,10 +63,9 @@ export SourceSet discover_sources(const Path& src_dir, const Path& public_dir) {
         for (auto& entry : std::filesystem::recursive_directory_iterator(public_dir.fs())) {
             if (!entry.is_regular_file()) continue;
             Path p(entry.path());
-            if (p.is_module_interface()) {
+            if (match_ext(p, ext.module_ext)) {
                 sources.module_interfaces.push_back(p);
-            } else if (p.has_extension(".hpp") || p.has_extension(".h") ||
-                       p.has_extension(".hxx") || p.has_extension(".hh")) {
+            } else if (match_ext(p, ext.header_ext)) {
                 sources.public_headers.push_back(p);
             }
         }
@@ -289,7 +298,8 @@ export MoidDeclaration convention_declare(
     declaration.version = manifest.moid->version;
     declaration.type = manifest.moid->type;
     declaration.root = layout.root.absolute().string();
-    declaration.std_version = manifest.moid->std_version;
+    declaration.cxx_std = manifest.moid->cxx_std;
+    declaration.c_std = manifest.moid->c_std;
     declaration.options = options;
     declaration.dependencies = dependencies;
 
@@ -318,7 +328,8 @@ export MoidDeclaration convention_declare(
         declaration.sources.push_back(std::move(group));
     };
 
-    auto sources = discover_sources(layout.source_dir, layout.public_dir);
+    auto source_ext = manifest.resolve_source_ext();
+    auto sources = discover_sources(layout.source_dir, layout.public_dir, source_ext);
     for (const auto& source : sources.cpp_files)
         add_source(source, false);
     for (const auto& source : sources.c_files)
@@ -330,8 +341,6 @@ export MoidDeclaration convention_declare(
         declaration.public_include_dirs.push_back("public");
 
     for (const auto& [name, dependency] : manifest.dependencies) {
-        // A raw path dependency has no declaration of its own. Keep its source
-        // and include inputs in the consumer declaration as convention mode did.
         if (!dependency.is_path_dep) continue;
         Path dependency_dir = layout.root / dependency.path;
         if ((dependency_dir / "bake.toml").is_regular_file()) continue;
@@ -347,7 +356,13 @@ export MoidDeclaration convention_declare(
              std::filesystem::recursive_directory_iterator(dependency_source.fs())) {
             if (!entry.is_regular_file()) continue;
             Path source(entry.path());
-            if (source.is_cpp() || source.is_c() || source.is_module_interface())
+            // Match against the configured extensions
+            auto match_ext = [&source](const std::vector<std::string>& exts) {
+                for (const auto& e : exts)
+                    if (source.has_extension(e)) return true;
+                return false;
+            };
+            if (match_ext(source_ext.source_ext) || match_ext(source_ext.module_ext))
                 add_source(source, false);
         }
     }
@@ -452,8 +467,7 @@ std::optional<std::string> validate_terminal_relative_path(
         return std::nullopt;
     const auto parent = relative.parent_path().generic_string();
     const auto filename = relative.filename().generic_string();
-    if ((parent != "bin" && parent != "lib" &&
-         !parent.starts_with("bin-") && !parent.starts_with("lib-")) ||
+    if ((parent != "bin" && parent != "lib") ||
         filename.empty() ||
         filename == "." || filename == "..") {
         return std::nullopt;
@@ -572,13 +586,8 @@ export std::expected<BuildGraph, std::string> build_graph(
     (out_dir / ".obj").mkdir_recursive();
     (out_dir / ".bmi").mkdir_recursive();
 
-    // Output subdirectory: "bin" for native, "bin-<triple>" for cross-compile.
-    std::string bin_subdir = tc.target.is_native()
-        ? "bin" : "bin-" + tc.target.triple();
-    std::string lib_subdir = tc.target.is_native()
-        ? "lib" : "lib-" + tc.target.triple();
-    (out_dir / bin_subdir).mkdir_recursive();
-    (out_dir / lib_subdir).mkdir_recursive();
+    (out_dir / "bin").mkdir_recursive();
+    (out_dir / "lib").mkdir_recursive();
     graph.state_dir.mkdir_recursive();
 
     struct TerminalClaim {
@@ -603,10 +612,6 @@ export std::expected<BuildGraph, std::string> build_graph(
         std::vector<Path> module_interfaces;
         CompileUsage own_compile;
         std::set<std::string> public_module_sources;
-        std::map<std::string, std::vector<std::string>> source_flags;
-        std::map<std::string, std::vector<std::pair<std::string, std::string>>>
-            source_defines;
-        std::map<std::string, std::vector<Path>> source_include_dirs;
         bool uses_cxx = false;
     };
 
@@ -646,10 +651,7 @@ export std::expected<BuildGraph, std::string> build_graph(
             auto [existing, inserted] = source_groups.emplace(source_key, &group);
             if (!inserted) {
                 const auto& previous = *existing->second;
-                if (previous.is_public != group.is_public ||
-                    previous.options.flags != group.options.flags ||
-                    previous.options.defines != group.options.defines ||
-                    previous.options.include_dirs != group.options.include_dirs) {
+                if (previous.is_public != group.is_public) {
                     return std::unexpected(
                         "conflicting source groups for '" +
                         normalized_source_id(rm.source_dir, source) +
@@ -663,22 +665,11 @@ export std::expected<BuildGraph, std::string> build_graph(
                 rm.uses_cxx = true;
                 if (group.is_public)
                     rm.public_module_sources.insert(source_key);
-            } else if (source.is_cpp()) {
-                rm.cpp_files.push_back(source);
-                rm.uses_cxx = true;
             } else if (source.is_c()) {
                 rm.c_files.push_back(source);
-            }
-
-            rm.source_flags[source_key] = group.options.flags;
-            for (const auto& define : group.options.defines) {
-                rm.source_defines[source_key].emplace_back(define, "");
-                if (group.is_public)
-                    append_unique_string(rm.own_compile.defines, define);
-            }
-            for (const auto& include_dir : group.options.include_dirs) {
-                rm.source_include_dirs[source_key].push_back(
-                    resolve_path(include_dir, rm.source_dir));
+            } else {
+                rm.cpp_files.push_back(source);
+                rm.uses_cxx = true;
             }
         }
 
@@ -687,7 +678,14 @@ export std::expected<BuildGraph, std::string> build_graph(
                 rm.own_compile.include_dirs,
                 resolve_path(include_dir, rm.source_dir));
         }
-        rm.uses_cxx = rm.uses_cxx || !is_c_standard(decl.std_version);
+
+        // Propagate compile_defines to consumers via CompileUsage.
+        for (const auto& [name, value] : decl.compile_defines) {
+            std::string define = value.empty() ? name : name + "=" + value;
+            append_unique_string(rm.own_compile.defines, define);
+        }
+
+        rm.uses_cxx = rm.uses_cxx || !is_c_standard(decl.cxx_std);
 
         const bool has_sources = !rm.cpp_files.empty() ||
             !rm.c_files.empty() || !rm.module_interfaces.empty();
@@ -723,8 +721,8 @@ export std::expected<BuildGraph, std::string> build_graph(
 
             std::string out_name = library_name(decl.name, rm.type, tc.target);
             rm.output = (rm.type == MoidType::Executable)
-                ? out_dir / bin_subdir / out_name
-                : out_dir / lib_subdir / out_name;
+                ? out_dir / "bin" / out_name
+                : out_dir / "lib" / out_name;
 
             auto relative_output = terminal_relative_path(out_dir, rm.output);
             if (!relative_output) {
@@ -807,10 +805,9 @@ export std::expected<BuildGraph, std::string> build_graph(
                                     const Path& source) {
         std::vector<Path> result =
             moid_exports.at(moid.canonical_id).compile.include_dirs;
-        auto it = moid.source_include_dirs.find(source.string());
-        if (it != moid.source_include_dirs.end()) {
-            for (const auto& include_dir : it->second)
-                append_unique_path(result, include_dir);
+        // Add moid-level extra include dirs from target conditions
+        for (const auto& dir : moid.decl->extra_include_dirs) {
+            append_unique_path(result, resolve_path(dir, moid.source_dir));
         }
         return result;
     };
@@ -818,25 +815,22 @@ export std::expected<BuildGraph, std::string> build_graph(
     auto compile_defines = [&](const ResolvedMoid& moid,
                                const Path& source) {
         std::vector<std::pair<std::string, std::string>> result;
-        auto append_define = [&](const std::string& definition) {
-            const auto equals = definition.find('=');
-            std::pair<std::string, std::string> parsed = equals == std::string::npos
-                ? std::pair{definition, std::string{}}
-                : std::pair{definition.substr(0, equals),
-                            definition.substr(equals + 1)};
-            if (std::find(result.begin(), result.end(), parsed) == result.end())
-                result.push_back(std::move(parsed));
+        auto append_define = [&](const std::string& name, const std::string& value) {
+            if (std::find(result.begin(), result.end(), std::pair{name, value}) == result.end())
+                result.emplace_back(name, value);
         };
+        // Transitive public defines from dependencies
         for (const auto& definition :
              moid_exports.at(moid.canonical_id).compile.defines) {
-            append_define(definition);
+            auto equals = definition.find('=');
+            if (equals != std::string::npos)
+                append_define(definition.substr(0, equals), definition.substr(equals + 1));
+            else
+                append_define(definition, "");
         }
-        auto own = moid.source_defines.find(source.string());
-        if (own != moid.source_defines.end()) {
-            for (const auto& [name, value] : own->second) {
-                append_define(value.empty() ? name : name + "=" + value);
-            }
-        }
+        // Moid-level defines (option macros, package macros, target defines, NDEBUG)
+        for (const auto& [name, value] : moid.decl->compile_defines)
+            append_define(name, value);
         return result;
     };
 
@@ -1059,16 +1053,14 @@ export std::expected<BuildGraph, std::string> build_graph(
         CompileConfig cc;
         cc.source = src;
         cc.output = obj;
-        cc.std_ver = rm.decl->std_version;
+        cc.std_ver = rm.decl->cxx_std;
         cc.include_dirs = compile_include_dirs(rm, src);
         cc.defines = compile_defines(rm, src);
         cc.is_module_interface = true;
         cc.bmi_output = pcm;
         cc.use_pic = (rm.type != MoidType::Executable);
 
-        auto flags_it = rm.source_flags.find(src.string());
-        if (flags_it != rm.source_flags.end())
-            cc.extra_flags = flags_it->second;
+        cc.extra_flags = rm.decl->compile_flags;
 
         for (const auto& dependency : module_provider_closure(
                  module_dependencies[module_key])) {
@@ -1158,14 +1150,12 @@ export std::expected<BuildGraph, std::string> build_graph(
             CompileConfig cc;
             cc.source = src;
             cc.output = obj;
-            cc.std_ver = rm.decl->std_version;
+            cc.std_ver = src.is_c() ? rm.decl->c_std : rm.decl->cxx_std;
             cc.include_dirs = compile_include_dirs(rm, src);
             cc.defines = compile_defines(rm, src);
             cc.use_pic = (rm.type != MoidType::Executable);
 
-            auto flags_it = rm.source_flags.find(src.string());
-            if (flags_it != rm.source_flags.end())
-                cc.extra_flags = flags_it->second;
+            cc.extra_flags = rm.decl->compile_flags;
 
             std::vector<ModuleKey> consumer_roots;
             auto consumer_it = consumers.find(src.string());
@@ -1326,6 +1316,8 @@ export std::expected<BuildGraph, std::string> build_graph(
             append_unique_string(requirements.system_libraries, library);
         for (const auto& framework : rm.decl->frameworks)
             append_unique_string(requirements.frameworks, framework);
+        for (const auto& lib : rm.decl->prebuilt_libs)
+            append_unique_string(requirements.system_libraries, lib);
 
         std::vector<ArtifactRef> command_objects = moid_objects[moid_id];
         append_unique_artifacts(command_objects, dependency_link.objects);
@@ -1398,6 +1390,7 @@ export std::expected<BuildGraph, std::string> build_graph(
             link.use_cxx_linker = rm.uses_cxx;
             link.system_libraries = requirements.system_libraries;
             link.frameworks = requirements.frameworks;
+            link.extra_flags = rm.decl->link_flags;
             action.command = make_link_command(tc, link);
 
             exports.terminal = terminal;
@@ -1657,7 +1650,6 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
     }
 
     int pending = static_cast<int>(std::count(dirty.begin(), dirty.end(), true));
-    int skipped = static_cast<int>(graph.actions.size()) - pending;
 
     if (pending == 0) {
         print_finished();

@@ -1,0 +1,10 @@
+[package]
+name = "header-only-consumer"
+version = "0.1.0"
+type = "executable"
+
+[dependencies]
+header-only = { path = "header-only" }
+
+[language]
+cxx = "c++23"

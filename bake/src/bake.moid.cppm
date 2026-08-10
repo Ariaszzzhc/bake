@@ -7,22 +7,15 @@ import nlohmann.json;
 
 namespace bake {
 
-export struct SourceOptions {
-    std::vector<std::string> flags;
-    std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
-};
-
 export struct SourceGroup {
     std::string pattern;
     bool is_public = false;
-    SourceOptions options;
 };
 
 export struct MoidDependency {
     std::string alias;
     std::string id;
-    std::map<std::string, BuildOption> options;
+    std::vector<std::string> options;
 };
 
 export struct MoidDeclaration {
@@ -31,13 +24,21 @@ export struct MoidDeclaration {
     std::string version;
     MoidType type = MoidType::Executable;
     std::string root;
-    std::string std_version;
+    std::string cxx_std = "c++17";
+    std::string c_std = "c17";
     std::map<std::string, BuildOption> options;
     std::vector<SourceGroup> sources;
     std::vector<std::string> public_include_dirs;
     std::vector<std::string> libraries;
     std::vector<std::string> frameworks;
     std::vector<MoidDependency> dependencies;
+    // Resolved at configure time (profile/target analysis)
+    std::vector<std::string> compile_flags;
+    std::vector<std::pair<std::string, std::string>> compile_defines;
+    std::vector<std::string> extra_include_dirs;
+    std::vector<std::string> link_flags;
+    // Prebuilt libraries (.a/.so paths for linking)
+    std::vector<std::string> prebuilt_libs;
 };
 
 namespace {
@@ -103,27 +104,6 @@ std::expected<std::vector<std::string>, std::string> required_string_array(
     return string_array(**value, field_path(parent, name));
 }
 
-std::expected<BuildOption, std::string> build_option_from_json(
-        const Json& value, std::string_view path) {
-    if (value.is_boolean())
-        return BuildOption::from_bool(value.get<bool>());
-    if (value.is_number_integer() || value.is_number_unsigned()) {
-        if (value.is_number_unsigned() &&
-            value.get<std::uint64_t>() >
-                static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
-            return std::unexpected(
-                "moid declaration field '" + std::string(path) +
-                "' is outside the signed 64-bit integer range");
-        }
-        return BuildOption::from_int(value.get<std::int64_t>());
-    }
-    if (value.is_string())
-        return BuildOption::from_string(value.get<std::string>());
-    return std::unexpected(
-        "moid declaration field '" + std::string(path) +
-        "' must be a boolean, integer, or string");
-}
-
 std::expected<std::map<std::string, BuildOption>, std::string> options_from_json(
         const Json& value, std::string_view path) {
     if (!value.is_object()) {
@@ -133,10 +113,12 @@ std::expected<std::map<std::string, BuildOption>, std::string> options_from_json
 
     std::map<std::string, BuildOption> result;
     for (auto it = value.begin(); it != value.end(); ++it) {
-        auto option = build_option_from_json(
-            it.value(), field_path(path, it.key()));
-        if (!option) return std::unexpected(option.error());
-        result.emplace(it.key(), std::move(*option));
+        if (!it.value().is_boolean()) {
+            return std::unexpected(
+                "moid declaration field '" +
+                field_path(path, it.key()) + "' must be a boolean");
+        }
+        result.emplace(it.key(), BuildOption{it.value().get<bool>()});
     }
     return result;
 }
@@ -151,17 +133,41 @@ std::expected<std::map<std::string, BuildOption>, std::string> required_options(
 Json options_to_json(const std::map<std::string, BuildOption>& options) {
     Json result = Json::object();
     for (const auto& [name, option] : options) {
-        switch (option.type) {
-            case BuildOption::Type::Bool:
-                result[name] = option.bool_value;
-                break;
-            case BuildOption::Type::Int:
-                result[name] = option.int_value;
-                break;
-            case BuildOption::Type::String:
-                result[name] = option.str_value;
-                break;
+        result[name] = option.value;
+    }
+    return result;
+}
+
+Json compile_defines_to_json(
+        const std::vector<std::pair<std::string, std::string>>& defines) {
+    Json result = Json::array();
+    for (const auto& [name, value] : defines) {
+        result.push_back({{"macro", name}, {"value", value}});
+    }
+    return result;
+}
+
+std::expected<std::vector<std::pair<std::string, std::string>>, std::string>
+compile_defines_from_json(const Json& value, std::string_view path) {
+    if (!value.is_array()) {
+        return std::unexpected(
+            "moid declaration field '" + std::string(path) + "' must be an array");
+    }
+
+    std::vector<std::pair<std::string, std::string>> result;
+    result.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const std::string elem_path =
+            std::string(path) + "[" + std::to_string(i) + "]";
+        if (!value[i].is_object()) {
+            return std::unexpected(
+                "moid declaration field '" + elem_path + "' must be an object");
         }
+        auto name = required_string(value[i], "macro", elem_path);
+        if (!name) return std::unexpected(name.error());
+        auto def_value = required_string(value[i], "value", elem_path);
+        if (!def_value) return std::unexpected(def_value.error());
+        result.emplace_back(std::move(*name), std::move(*def_value));
     }
     return result;
 }
@@ -173,7 +179,8 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
     document["version"] = declaration.version;
     document["type"] = moid_type_str(declaration.type);
     document["root"] = declaration.root;
-    document["std"] = declaration.std_version;
+    document["cxx_std"] = declaration.cxx_std;
+    document["c_std"] = declaration.c_std;
     document["options"] = options_to_json(declaration.options);
 
     document["sources"] = Json::array();
@@ -181,9 +188,6 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
         Json entry;
         entry["pattern"] = source.pattern;
         entry["visibility"] = source.is_public ? "public" : "private";
-        entry["flags"] = source.options.flags;
-        entry["defines"] = source.options.defines;
-        entry["include_dirs"] = source.options.include_dirs;
         document["sources"].push_back(std::move(entry));
     }
 
@@ -198,9 +202,16 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
         document["dependencies"].push_back({
             {"alias", dependency.alias},
             {"id", dependency.id},
-            {"options", options_to_json(dependency.options)},
+            {"options", dependency.options},
         });
     }
+
+    document["flags"] = declaration.compile_flags;
+    document["defines"] = compile_defines_to_json(declaration.compile_defines);
+    document["include_dirs"] = declaration.extra_include_dirs;
+    document["link_flags"] = declaration.link_flags;
+    document["prebuilt_libs"] = declaration.prebuilt_libs;
+
     return document;
 }
 
@@ -238,9 +249,13 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
     if (!root) return std::unexpected(root.error());
     declaration.root = std::move(*root);
 
-    auto standard = required_string(document, "std");
-    if (!standard) return std::unexpected(standard.error());
-    declaration.std_version = std::move(*standard);
+    auto cxx_standard = required_string(document, "cxx_std");
+    if (!cxx_standard) return std::unexpected(cxx_standard.error());
+    declaration.cxx_std = std::move(*cxx_standard);
+
+    auto c_standard = required_string(document, "c_std");
+    if (!c_standard) return std::unexpected(c_standard.error());
+    declaration.c_std = std::move(*c_standard);
 
     auto options = required_options(document, "options");
     if (!options) return std::unexpected(options.error());
@@ -273,18 +288,6 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
             return std::unexpected(
                 "unknown source visibility '" + *visibility + "'");
         }
-
-        auto flags = required_string_array(source, "flags", path);
-        if (!flags) return std::unexpected(flags.error());
-        group.options.flags = std::move(*flags);
-
-        auto defines = required_string_array(source, "defines", path);
-        if (!defines) return std::unexpected(defines.error());
-        group.options.defines = std::move(*defines);
-
-        auto include_dirs = required_string_array(source, "include_dirs", path);
-        if (!include_dirs) return std::unexpected(include_dirs.error());
-        group.options.include_dirs = std::move(*include_dirs);
 
         declaration.sources.push_back(std::move(group));
     }
@@ -337,13 +340,40 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
         if (!dependency_id) return std::unexpected(dependency_id.error());
         value.id = std::move(*dependency_id);
 
-        auto dependency_options = required_options(dependency, "options", path);
+        auto dependency_options =
+            required_string_array(dependency, "options", path);
         if (!dependency_options)
             return std::unexpected(dependency_options.error());
         value.options = std::move(*dependency_options);
 
         declaration.dependencies.push_back(std::move(value));
     }
+
+    auto compile_flags = required_string_array(document, "flags");
+    if (!compile_flags) return std::unexpected(compile_flags.error());
+    declaration.compile_flags = std::move(*compile_flags);
+
+    auto compile_defines_field = required_field(document, "defines");
+    if (!compile_defines_field)
+        return std::unexpected(compile_defines_field.error());
+    auto compile_defines =
+        compile_defines_from_json(**compile_defines_field, "defines");
+    if (!compile_defines) return std::unexpected(compile_defines.error());
+    declaration.compile_defines = std::move(*compile_defines);
+
+    auto extra_include_dirs =
+        required_string_array(document, "include_dirs");
+    if (!extra_include_dirs)
+        return std::unexpected(extra_include_dirs.error());
+    declaration.extra_include_dirs = std::move(*extra_include_dirs);
+
+    auto link_flags = required_string_array(document, "link_flags");
+    if (!link_flags) return std::unexpected(link_flags.error());
+    declaration.link_flags = std::move(*link_flags);
+
+    auto prebuilt_libs = required_string_array(document, "prebuilt_libs");
+    if (!prebuilt_libs) return std::unexpected(prebuilt_libs.error());
+    declaration.prebuilt_libs = std::move(*prebuilt_libs);
 
     return declaration;
 }

@@ -217,10 +217,54 @@ std::map<std::string, std::string> parse_options_env() {
 
 export namespace bake {
 
-struct SourceOptions {
-    std::vector<std::string> flags;
-    std::vector<std::string> defines;
-    std::vector<std::string> include_dirs;
+struct SourceGroup {
+    std::string pattern;
+    bool is_public = false;
+};
+
+class BinaryBuilder {
+public:
+    BinaryBuilder() = default;
+    explicit BinaryBuilder(std::string n, std::string dir)
+        : name(std::move(n)), source_dir_(std::move(dir)) {}
+
+    BinaryBuilder& sources(std::string_view pattern) {
+        for (auto& file : expand_glob(std::string(pattern), source_dir_))
+            source_groups.push_back({std::move(file), false});
+        return *this;
+    }
+    BinaryBuilder& sources(std::initializer_list<std::string_view> patterns) {
+        for (auto pattern : patterns) sources(pattern);
+        return *this;
+    }
+
+    BinaryBuilder& include_dirs(std::string_view dir) {
+        include_dirs_.emplace_back(dir);
+        return *this;
+    }
+    BinaryBuilder& include_dirs(std::initializer_list<std::string_view> dirs) {
+        for (auto dir : dirs) include_dirs_.emplace_back(dir);
+        return *this;
+    }
+
+    std::string name;
+    std::vector<SourceGroup> source_groups;
+    std::vector<std::string> include_dirs_;
+
+private:
+    std::string source_dir_;
+};
+
+class TestRegistration {
+public:
+    TestRegistration& set_default() {
+        is_default = true;
+        return *this;
+    }
+
+    std::string name;
+    std::string binary;
+    bool is_default = false;
 };
 
 class Builder {
@@ -232,6 +276,8 @@ public:
             name_ = value;
         if (const char* value = std::getenv("BAKE_MOID_VERSION"))
             version_ = value;
+        if (const char* value = std::getenv("BAKE_MOID_TYPE"))
+            type_ = value;
         if (const char* value = std::getenv("BAKE_SOURCE_DIR"))
             source_dir_ = value;
         if (const char* value = std::getenv("BAKE_BUILD_DIR"))
@@ -268,27 +314,23 @@ public:
         name_ = std::move(name); type_ = "dylib"; return *this;
     }
 
-    Builder& std(std::string_view version) {
-        std_version_ = version;
+    Builder& cxx_std(std::string_view version) {
+        cxx_std_ = version;
+        return *this;
+    }
+    Builder& c_std(std::string_view version) {
+        c_std_ = version;
         return *this;
     }
 
     Builder& sources(std::string_view pattern) {
-        return sources(pattern, {});
-    }
-    Builder& sources(std::initializer_list<std::string_view> patterns) {
-        for (auto pattern : patterns) sources(pattern);
-        return *this;
-    }
-    Builder& sources(std::string_view pattern, const SourceOptions& options) {
         for (auto& file : expand_glob(std::string(pattern), source_dir_)) {
-            source_groups_.push_back({std::move(file), false, options});
+            source_groups_.push_back({std::move(file), false});
         }
         return *this;
     }
-    Builder& sources(std::initializer_list<std::string_view> patterns,
-                     const SourceOptions& options) {
-        for (auto pattern : patterns) sources(pattern, options);
+    Builder& sources(std::initializer_list<std::string_view> patterns) {
+        for (auto pattern : patterns) sources(pattern);
         return *this;
     }
 
@@ -301,36 +343,35 @@ public:
         return *this;
     }
 
-    Builder& define(std::string_view name, std::string_view value = "") {
-        std::string definition(name);
-        if (!value.empty()) definition += "=" + std::string(value);
-        defines_.push_back(std::move(definition));
+    Builder& public_headers(std::string_view path) {
+        include_dirs_.emplace_back(path);
+        return *this;
+    }
+    Builder& public_headers(std::initializer_list<std::string_view> paths) {
+        for (auto path : paths) include_dirs_.emplace_back(path);
         return *this;
     }
 
-    Builder& link_system(std::string_view library) {
-        libraries_.emplace_back(library);
+    Builder& prebuilt_lib(std::string_view path) {
+        prebuilt_libs_.emplace_back(path);
         return *this;
     }
 
-    Builder& link_framework(std::string_view framework) {
-        frameworks_.emplace_back(framework);
-        return *this;
+    BinaryBuilder& binary(std::string_view name) {
+        binaries_.emplace_back(std::string(name), source_dir_);
+        return binaries_.back();
+    }
+
+    TestRegistration& add_test(std::string_view test_name,
+                               std::string_view binary_name) {
+        tests_.push_back({std::string(test_name), std::string(binary_name), false});
+        return tests_.back();
     }
 
     bool option_bool(std::string_view name) const {
         auto it = options_.find(std::string(name));
         return it != options_.end() &&
                (it->second == "true" || it->second == "1");
-    }
-    std::int64_t option_int(std::string_view name) const {
-        auto it = options_.find(std::string(name));
-        if (it == options_.end()) return 0;
-        try { return std::stoll(it->second); } catch (...) { return 0; }
-    }
-    std::string_view option_str(std::string_view name) const {
-        auto it = options_.find(std::string(name));
-        return it != options_.end() ? std::string_view(it->second) : "";
     }
 
     std::string_view source_dir() const { return source_dir_; }
@@ -351,12 +392,6 @@ public:
     }
 
 private:
-    struct SourceGroup {
-        std::string pattern;
-        bool is_public = false;
-        SourceOptions options;
-    };
-
     std::string serialize() const {
         std::string json;
         json += "{\n";
@@ -365,31 +400,63 @@ private:
         json += "  \"version\": " + json_string(version_) + ",\n";
         json += "  \"type\": " + json_string(type_) + ",\n";
         json += "  \"root\": " + json_string(source_dir_) + ",\n";
-        json += "  \"std\": " + json_string(std_version_) + ",\n";
+        json += "  \"cxx_std\": " + json_string(cxx_std_) + ",\n";
+        json += "  \"c_std\": " + json_string(c_std_) + ",\n";
         json += "  \"options\": " + declaration_options_ + ",\n";
 
         json += "  \"sources\": [";
         for (std::size_t i = 0; i < source_groups_.size(); ++i) {
             if (i != 0) json += ",";
-            auto source_defines = source_groups_[i].options.defines;
-            source_defines.insert(source_defines.end(),
-                                  defines_.begin(), defines_.end());
             json += "\n    {\"pattern\": " +
                     json_string(source_groups_[i].pattern);
             json += ", \"visibility\": " +
                     json_string(source_groups_[i].is_public ? "public" : "private");
-            json += ", \"flags\": " +
-                    json_array(source_groups_[i].options.flags);
-            json += ", \"defines\": " + json_array(source_defines);
-            json += ", \"include_dirs\": " +
-                    json_array(source_groups_[i].options.include_dirs) + "}";
+            json += "}";
         }
         json += source_groups_.empty() ? "],\n" : "\n  ],\n";
 
         json += "  \"public_include_dirs\": " + json_array(include_dirs_) + ",\n";
-        json += "  \"link\": {\"libraries\": " + json_array(libraries_) +
-                ", \"frameworks\": " + json_array(frameworks_) + "},\n";
-        json += "  \"dependencies\": " + declaration_dependencies_ + "\n";
+        json += "  \"link\": {\"libraries\": [], \"frameworks\": []},\n";
+        json += "  \"dependencies\": " + declaration_dependencies_ + ",\n";
+        json += "  \"flags\": [],\n";
+        json += "  \"defines\": [],\n";
+        json += "  \"include_dirs\": [],\n";
+        json += "  \"link_flags\": [],\n";
+        json += "  \"prebuilt_libs\": " + json_array(prebuilt_libs_) + ",\n";
+
+        json += "  \"binaries\": [";
+        for (std::size_t i = 0; i < binaries_.size(); ++i) {
+            if (i != 0) json += ",";
+            json += "\n    {";
+            json += "\"name\": " + json_string(binaries_[i].name);
+            json += ", \"sources\": [";
+            const auto& srcs = binaries_[i].source_groups;
+            for (std::size_t j = 0; j < srcs.size(); ++j) {
+                if (j != 0) json += ",";
+                json += "{\"pattern\": " + json_string(srcs[j].pattern);
+                json += ", \"visibility\": " +
+                        json_string(srcs[j].is_public ? "public" : "private");
+                json += "}";
+            }
+            json += "]";
+            json += ", \"include_dirs\": " +
+                    json_array(binaries_[i].include_dirs_);
+            json += "}";
+        }
+        json += binaries_.empty() ? "],\n" : "\n  ],\n";
+
+        json += "  \"tests\": [";
+        for (std::size_t i = 0; i < tests_.size(); ++i) {
+            if (i != 0) json += ",";
+            json += "\n    {";
+            json += "\"name\": " + json_string(tests_[i].name);
+            json += ", \"binary\": " + json_string(tests_[i].binary);
+            json += ", \"is_default\": " +
+                    std::string(tests_[i].is_default ? "true" : "false");
+            json += "}";
+        }
+        json += tests_.empty() ? "]\n" : "\n  ]\n";
+
         json += "}\n";
         return json;
     }
@@ -398,7 +465,8 @@ private:
     std::string name_;
     std::string version_;
     std::string type_ = "executable";
-    std::string std_version_ = "c++23";
+    std::string cxx_std_ = "c++23";
+    std::string c_std_ = "c17";
     std::string source_dir_;
     std::string build_dir_;
     std::string target_;
@@ -407,9 +475,9 @@ private:
     std::string declaration_dependencies_ = "[]";
     std::vector<SourceGroup> source_groups_;
     std::vector<std::string> include_dirs_;
-    std::vector<std::string> defines_;
-    std::vector<std::string> libraries_;
-    std::vector<std::string> frameworks_;
+    std::vector<std::string> prebuilt_libs_;
+    std::vector<BinaryBuilder> binaries_;
+    std::vector<TestRegistration> tests_;
     std::map<std::string, std::string> options_;
     std::map<std::string, std::string> dep_dirs_;
 };

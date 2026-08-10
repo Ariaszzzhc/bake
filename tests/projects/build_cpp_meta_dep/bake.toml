@@ -2,10 +2,12 @@
 name = "meta-consumer"
 version = "0.1.0"
 type = "executable"
-std = "c++23"
 
 [dependencies]
-answer = { path = "answer", options = { bias = 1 } }
+answer = { path = "answer", options = ["biased"] }
 
 [options]
-bias = 100
+wolfssl = false
+
+[language]
+cxx = "c++23"

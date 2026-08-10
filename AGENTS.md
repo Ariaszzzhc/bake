@@ -87,7 +87,7 @@ Multi-package like Cargo. Each member has its own `bake.toml`. Root declares `[w
 
 ### `bake.build` module
 
-`lib/bake/bake.build.cppm` is the `build.cpp` API — source-distributed (like a header), compiled fresh per project when `build.cpp` is present. Context arrives via environment variables (`BAKE_MOID_ID`, `BAKE_SOURCE_DIR`, `BAKE_TARGET`, `BAKE_DEPS`, …). The `Builder` exposes `target()` for target-conditional logic (e.g. linking platform-specific system libraries). The script writes a `MoidDeclaration` JSON to `BAKE_DECLARATION_PATH`.
+`lib/bake/bake.build.cppm` is the `build.cpp` API — source-distributed (like a header), compiled fresh per project when `build.cpp` is present. Context arrives via environment variables (`BAKE_MOID_ID`, `BAKE_SOURCE_DIR`, `BAKE_TARGET`, `BAKE_DEPS`, …). The `Builder` describes **inputs** (which source files, public headers, prebuilt libs, extra binaries, test registrations). It does NOT set flags, defines, or system libraries — those are in `bake.toml` (`[profile.*]`, `[target.*]`, `[link]`, `[options]`). The script writes a declaration JSON to `BAKE_DECLARATION_PATH`.
 
 ## Directory Layout
 
@@ -151,9 +151,48 @@ version = "0.1.0"
 type = "executable"          # executable (default) | lib | dylib
 std = "c++23"                # c11 | c17 | c23 | c++17 | c++20 | c++23
 
+[options]                    # bool-only feature flags → BAKE_<MOID>_<OPTION> macros
+use_tls = false
+use_json = true
+
 [dependencies]
 somelib = { path = "../somelib" }
 remotepkg = { url = "https://github.com/org/repo", tag = "v1.0" }
+curl = { path = "../curl", options = ["use_tls"] }   # activate features
+
+[link]                       # platform-agnostic system libraries
+libraries = ["z"]
+
+[target."*-apple-darwin"]    # triple-glob matching: * matches a full segment
+frameworks = ["Foundation"]
+
+[target."*-linux-musl"]
+libraries = ["pthread", "dl"]
+
+[profile.release]            # override built-in release defaults
+opt = 3
+lto = true
+strip = true
+
+[sources]                    # file extension config (all have defaults)
+# module_ext = [".cppm", ".ixx"]
+# source_ext = [".cpp", ".cc", ".cxx", ".c"]
+# header_ext = [".h", ".hpp", ".hxx", ".hh"]
+```
+
+Profiles (`--release` / `--profile <name>`, default `dev`) control compiler flags via semantic fields (`opt`, `debug`, `lto`, `strip`, `sanitize`, `warnings`). Options are bool-only — OR-merged across the dependency graph. Auto-macros: `BAKE_<MOID>_<OPTION>=0/1`, `BAKE_<MOID>_VERSION="..."`.
+
+## Output Directory
+
+```
+out/
+├── <target-triple>/          # e.g. aarch64-apple-darwin
+│   ├── bin/                  executables
+│   ├── lib/                  .a / .dylib / .so / .dll
+│   ├── .obj/                 object files
+│   ├── .bmi/                 module PCMs
+│   └── .bake/                declarations, fingerprints, graph.json
+└── .bake/                    host-level (build.cpp compiled scripts)
 ```
 
 ## Coding Style

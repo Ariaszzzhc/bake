@@ -25,12 +25,8 @@ namespace bake {
 
 // ===== Cross-compilation target =====
 //
-// TargetSpec stores a canonical triple string in arch-os-abi format
-// (no vendor field), matching the multiarch directory convention used
-// by libc header paths and cache keys. When passed to Clang via
-// -target, LLVM's normalize() inserts the implicit "unknown" vendor
-// automatically — the canonical form is always recoverable.
-//
+// TargetSpec stores the full triple string (arch-vendor-os-libc).
+// When passed to Clang via -target, LLVM normalizes internally.
 // The triple string is the single source of truth. All property
 // queries (is_darwin, is_linux_musl, arch, …) derive from it.
 
@@ -74,69 +70,65 @@ export TargetSpec detect_host_target() {
     TargetSpec t;
     t.native_ = true;
 #if defined(__APPLE__) && defined(__aarch64__)
-    t.triple_ = "aarch64-macos";
+    t.triple_ = "aarch64-apple-darwin";
 #elif defined(__APPLE__) && defined(__x86_64__)
-    t.triple_ = "x86_64-macos";
+    t.triple_ = "x86_64-apple-darwin";
 #elif defined(__linux__) && defined(__aarch64__)
-    t.triple_ = "aarch64-linux";
+    t.triple_ = "aarch64-linux-musl";
 #elif defined(__linux__) && defined(__x86_64__)
-    t.triple_ = "x86_64-linux";
+    t.triple_ = "x86_64-linux-musl";
+#elif defined(_WIN32) && defined(_M_X64)
+    t.triple_ = "x86_64-windows-gnu";
+#elif defined(_WIN32) && defined(_M_ARM64)
+    t.triple_ = "aarch64-windows-gnu";
 #else
-    t.triple_ = "unknown";
+    t.triple_ = "unknown-unknown-none";
 #endif
     return t;
 }
 
-// Parse a user-supplied target spec into a canonical arch-os-abi triple.
-// Handles both 3-component (Zig-style "aarch64-linux-musl") and
-// 4-component (LLVM-style "aarch64-unknown-linux-musl") inputs by
-// discarding the vendor field. Architecture aliases are normalized
-// (arm64→aarch64, amd64→x86_64) to match LLVM/Clang canonical names.
+// Parse a user-supplied target spec into a canonical triple.
+// Preserves all segments (including vendor). Normalizes arch aliases
+// (arm64→aarch64, amd64→x86_64) and handles MinGW legacy triples.
 export TargetSpec parse_target(std::string_view spec) {
     TargetSpec t;
     if (spec.empty() || spec == "native" || spec == "host") return t;
     t.native_ = false;
 
-    // Split on '-', discarding known vendor components.
-    static constexpr std::string_view vendors[] = {
-        "unknown", "apple", "pc", "squeakboard", "wrs", "img", "myriad"
-    };
-
-    std::vector<std::string> kept;
+    std::vector<std::string> segments;
     size_t start = 0;
     for (size_t i = 0; i <= spec.size(); ++i) {
         if (i == spec.size() || spec[i] == '-') {
-            if (i > start) {
-                std::string_view comp = spec.substr(start, i - start);
-                bool is_vendor = false;
-                for (auto v : vendors)
-                    if (comp == v) { is_vendor = true; break; }
-                if (!is_vendor) kept.emplace_back(comp);
-            }
+            if (i > start)
+                segments.emplace_back(spec.substr(start, i - start));
             start = i + 1;
         }
     }
 
-    if (kept.empty()) return t;
+    if (segments.empty()) return t;
 
     // Normalize architecture aliases to LLVM canonical names.
-    if (kept[0] == "arm64")  kept[0] = "aarch64";
-    if (kept[0] == "amd64")  kept[0] = "x86_64";
+    if (segments[0] == "arm64")  segments[0] = "aarch64";
+    if (segments[0] == "amd64")  segments[0] = "x86_64";
 
     // Normalize MinGW triples: x86_64-w64-mingw32 → x86_64-windows-gnu.
-    // LLVM canonical form is <arch>-windows-gnu; the legacy w64-mingw32
-    // suffix is the historical MinGW-w64 convention.
-    for (size_t i = 1; i < kept.size(); ++i) {
-        if (kept[i].starts_with("mingw32")) {
-            kept.erase(kept.begin() + 1, kept.end());
-            kept.push_back("windows-gnu");
+    for (size_t i = 1; i < segments.size(); ++i) {
+        if (segments[i].starts_with("mingw32")) {
+            segments.erase(segments.begin() + 1, segments.begin() + i + 1);
+            segments.push_back("windows-gnu");
             break;
         }
     }
 
-    t.triple_ = kept[0];
-    for (size_t i = 1; i < kept.size(); ++i)
-        t.triple_ += "-" + kept[i];
+    // Strip "unknown" vendor: LLVM normalizes x86_64-linux-musl →
+    // x86_64-unknown-linux-musl internally, but bake uses 3-segment
+    // triples (arch-os-libc) consistently.
+    if (segments.size() == 4 && segments[1] == "unknown")
+        segments.erase(segments.begin() + 1);
+
+    t.triple_ = segments[0];
+    for (size_t i = 1; i < segments.size(); ++i)
+        t.triple_ += "-" + segments[i];
 
     return t;
 }
@@ -192,6 +184,7 @@ export struct LinkCommand {
     MoidType type = MoidType::Executable;
     std::vector<std::string> system_libraries;
     std::vector<std::string> frameworks;
+    std::vector<std::string> extra_flags;
     bool use_cxx_linker = true;
 };
 
@@ -298,6 +291,9 @@ export std::vector<std::string> make_link_command(const Toolchain& tc,
         cmd.push_back(framework);
     }
 
+    for (const auto& flag : lc.extra_flags)
+        cmd.push_back(flag);
+
     cmd.push_back("-o");
     cmd.push_back(lc.output.string());
 
@@ -316,6 +312,169 @@ export std::vector<std::string> make_archive_command(
     for (const auto& object : archive.objects)
         cmd.push_back(object.string());
     return cmd;
+}
+
+// ===== Triple pattern matching =====
+//
+// Match a target triple against a pattern. Both are split on '-'.
+// '*' matches an entire segment. Segment counts must be equal.
+
+export bool triple_matches(std::string_view triple, std::string_view pattern) {
+    auto split = [](std::string_view s) {
+        std::vector<std::string> segs;
+        size_t start = 0;
+        for (size_t i = 0; i <= s.size(); ++i) {
+            if (i == s.size() || s[i] == '-') {
+                if (i > start) segs.emplace_back(s.substr(start, i - start));
+                start = i + 1;
+            }
+        }
+        return segs;
+    };
+
+    auto triple_segs = split(triple);
+    auto pattern_segs = split(pattern);
+
+    if (triple_segs.size() != pattern_segs.size()) return false;
+    for (size_t i = 0; i < triple_segs.size(); ++i) {
+        if (pattern_segs[i] == "*") continue;
+        if (pattern_segs[i] != triple_segs[i]) return false;
+    }
+    return true;
+}
+
+// ===== Profile → compiler flags =====
+
+export struct ResolvedProfile {
+    std::vector<std::string> compile_flags;
+    std::vector<std::string> link_flags;
+    std::vector<std::pair<std::string, std::string>> defines;
+};
+
+export ResolvedProfile resolve_profile_flags(const ProfileConfig& profile,
+                                              bool is_release) {
+    ResolvedProfile rp;
+
+    // Optimization level
+    if (profile.opt_size) {
+        if (*profile.opt_size == "s") rp.compile_flags.push_back("-Os");
+        else if (*profile.opt_size == "z") rp.compile_flags.push_back("-Oz");
+    } else if (profile.opt_level) {
+        rp.compile_flags.push_back("-O" + std::to_string(*profile.opt_level));
+    }
+
+    // Debug info
+    if (profile.debug_kind) {
+        rp.compile_flags.push_back("-g" + *profile.debug_kind);
+    } else if (profile.debug && *profile.debug) {
+        rp.compile_flags.push_back("-g");
+    }
+
+    // LTO
+    if (profile.lto_kind) {
+        rp.compile_flags.push_back("-flto=" + *profile.lto_kind);
+    } else if (profile.lto && *profile.lto) {
+        rp.compile_flags.push_back("-flto");
+    }
+
+    // Strip (link-time)
+    if (profile.strip && *profile.strip) {
+        rp.link_flags.push_back("-Wl,-S");
+    }
+
+    // Sanitizers
+    if (!profile.sanitize.empty()) {
+        std::string joined;
+        for (size_t i = 0; i < profile.sanitize.size(); ++i) {
+            if (i > 0) joined += ",";
+            joined += profile.sanitize[i];
+        }
+        rp.compile_flags.push_back("-fsanitize=" + joined);
+        rp.link_flags.push_back("-fsanitize=" + joined);
+    }
+
+    // Warning flags
+    if (profile.warnings) {
+        if (*profile.warnings == "all") {
+            rp.compile_flags.push_back("-Wall");
+        } else if (*profile.warnings == "extra") {
+            rp.compile_flags.push_back("-Wall");
+            rp.compile_flags.push_back("-Wextra");
+        } else if (*profile.warnings == "error") {
+            rp.compile_flags.push_back("-Wall");
+            rp.compile_flags.push_back("-Wextra");
+            rp.compile_flags.push_back("-Werror");
+        }
+        // "none" → no flags
+    }
+
+    // Release defines NDEBUG
+    if (is_release) {
+        rp.defines.emplace_back("NDEBUG", "1");
+    }
+
+    return rp;
+}
+
+// ===== Auto-macro generation =====
+//
+// BAKE_{MOID}_{OPTION} = 0/1  for each option.
+// BAKE_{MOID}_NAME / VERSION / VERSION_MAJOR/MINOR/PATCH for package identity.
+
+export std::string normalize_macro_name(std::string_view name) {
+    std::string result;
+    result.reserve(name.size());
+    for (char c : name) {
+        if (c >= 'a' && c <= 'z') result += static_cast<char>(c - 'a' + 'A');
+        else if (c == '-') result += '_';
+        else result += c;
+    }
+    return result;
+}
+
+export std::vector<std::pair<std::string, std::string>>
+generate_option_macros(const std::string& moid_name,
+                       const std::map<std::string, BuildOption>& options) {
+    std::string prefix = "BAKE_" + normalize_macro_name(moid_name);
+    std::vector<std::pair<std::string, std::string>> macros;
+    for (const auto& [name, opt] : options) {
+        std::string macro_name = prefix + "_" + normalize_macro_name(name);
+        macros.emplace_back(macro_name, opt.value ? "1" : "0");
+    }
+    return macros;
+}
+
+export std::vector<std::pair<std::string, std::string>>
+generate_package_macros(const std::string& moid_name,
+                        const std::string& version) {
+    std::string prefix = "BAKE_" + normalize_macro_name(moid_name);
+    std::vector<std::pair<std::string, std::string>> macros;
+
+    macros.emplace_back(prefix + "_NAME", "\"" + moid_name + "\"");
+    macros.emplace_back(prefix + "_VERSION", "\"" + version + "\"");
+
+    // Parse major.minor.patch
+    int major = 0, minor = 0, patch = 0;
+    {
+        size_t pos = 0;
+        auto parse_component = [&]() -> int {
+            int val = 0;
+            while (pos < version.size() && version[pos] >= '0' && version[pos] <= '9') {
+                val = val * 10 + (version[pos] - '0');
+                ++pos;
+            }
+            if (pos < version.size() && version[pos] == '.') ++pos;
+            return val;
+        };
+        major = parse_component();
+        minor = parse_component();
+        patch = parse_component();
+    }
+    macros.emplace_back(prefix + "_VERSION_MAJOR", std::to_string(major));
+    macros.emplace_back(prefix + "_VERSION_MINOR", std::to_string(minor));
+    macros.emplace_back(prefix + "_VERSION_PATCH", std::to_string(patch));
+
+    return macros;
 }
 
 // ===== Standard module (std / std.compat) PCM management =====

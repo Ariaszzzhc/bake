@@ -37,50 +37,16 @@ parse_moid_type(std::string_view text) {
         "unknown moid type '" + std::string(text) + "'");
 }
 
-// ===== BuildOption =====
+// ===== BuildOption (bool-only) =====
 
 export struct BuildOption {
-    enum class Type { Bool, Int, String };
-    Type type = Type::String;
-    bool bool_value = false;
-    std::int64_t int_value = 0;
-    std::string str_value;
-
-    static BuildOption from_bool(bool v) {
-        BuildOption o; o.type = Type::Bool; o.bool_value = v; return o;
-    }
-    static BuildOption from_int(std::int64_t v) {
-        BuildOption o; o.type = Type::Int; o.int_value = v; return o;
-    }
-    static BuildOption from_string(std::string v) {
-        BuildOption o; o.type = Type::String; o.str_value = std::move(v); return o;
-    }
+    bool value = false;
 
     bool operator==(const BuildOption&) const = default;
 };
 
-export std::string_view build_option_type_name(BuildOption::Type type) {
-    switch (type) {
-        case BuildOption::Type::Bool: return "boolean";
-        case BuildOption::Type::Int: return "integer";
-        case BuildOption::Type::String: return "string";
-    }
-    return "unknown";
-}
-
 export std::string format_build_option(const BuildOption& option) {
-    switch (option.type) {
-        case BuildOption::Type::Bool:
-            return option.bool_value ? "true" : "false";
-        case BuildOption::Type::Int:
-            return std::to_string(option.int_value);
-        case BuildOption::Type::String: {
-            std::ostringstream output;
-            output << std::quoted(option.str_value);
-            return output.str();
-        }
-    }
-    return "<unknown>";
+    return option.value ? "true" : "false";
 }
 
 // ===== Dependency =====
@@ -91,8 +57,7 @@ export struct Dependency {
     std::string tag;           // git tag/branch (empty for path deps)
     std::string path;          // relative path (for path deps)
     bool is_path_dep = false;
-    // Configuration owned and type-checked by the dependency package.
-    std::map<std::string, BuildOption> options;
+    std::vector<std::string> options;  // feature names to enable
 };
 
 export std::string normalize_dependency_url(std::string_view raw_url) {
@@ -119,7 +84,47 @@ export struct Moid {
     std::string name;
     std::string version = "0.1.0";
     MoidType type = MoidType::Executable;
-    std::string std_version = "c++17";
+    std::string cxx_std = "c++17";
+    std::string c_std = "c17";
+};
+
+// ===== Profile / Target / Link / Sources config =====
+
+export struct ProfileConfig {
+    std::optional<int> opt_level;           // 0,1,2,3
+    std::optional<std::string> opt_size;    // "s","z"
+    std::optional<bool> debug;
+    std::optional<std::string> debug_kind;  // "line-tables-only"
+    std::optional<bool> lto;
+    std::optional<std::string> lto_kind;    // "thin"
+    std::optional<bool> strip;
+    std::vector<std::string> sanitize;      // ["address"],...
+    std::optional<std::string> warnings;    // "none","all","extra","error"
+
+    bool any_set() const {
+        return opt_level || opt_size || debug || debug_kind ||
+               lto || lto_kind || strip || !sanitize.empty() || warnings;
+    }
+};
+
+export struct TargetCondition {
+    std::string triple_pattern;
+    std::vector<std::string> libraries;
+    std::vector<std::string> frameworks;
+    std::vector<std::string> defines;
+    std::vector<std::string> flags;
+    std::vector<std::string> include_dirs;
+};
+
+export struct LinkConfig {
+    std::vector<std::string> libraries;
+    std::vector<std::string> frameworks;
+};
+
+export struct SourceExtConfig {
+    std::vector<std::string> module_ext = {".cppm", ".ixx"};
+    std::vector<std::string> source_ext = {".cpp", ".cc", ".cxx", ".c"};
+    std::vector<std::string> header_ext = {".h", ".hpp", ".hxx", ".hh"};
 };
 
 // ===== Workspace =====
@@ -136,9 +141,47 @@ export struct Manifest {
     std::optional<Moid> moid;
     std::map<std::string, Dependency> dependencies;
     std::map<std::string, BuildOption> options;
+    std::map<std::string, ProfileConfig> profiles;
+    std::vector<TargetCondition> targets;
+    std::optional<LinkConfig> link;
+    std::optional<SourceExtConfig> sources_config;
 
     bool is_workspace() const { return workspace.has_value(); }
     bool has_moid() const { return moid.has_value(); }
+
+    ProfileConfig resolve_profile(const std::string& name) const {
+        ProfileConfig base;
+        if (name == "dev") {
+            base.opt_level = 0;
+            base.debug = true;
+            base.warnings = "all";
+        } else if (name == "release") {
+            base.opt_level = 3;
+            base.debug = false;
+            base.lto = true;
+            base.lto_kind = "thin";
+            base.warnings = "all";
+        }
+        auto it = profiles.find(name);
+        if (it != profiles.end()) {
+            const auto& usr = it->second;
+            if (usr.opt_level) { base.opt_size.reset(); base.opt_level = usr.opt_level; }
+            if (usr.opt_size) { base.opt_level.reset(); base.opt_size = usr.opt_size; }
+            if (usr.debug) { base.debug_kind.reset(); base.debug = usr.debug; }
+            if (usr.debug_kind) { base.debug.reset(); base.debug_kind = usr.debug_kind; }
+            if (usr.lto) { base.lto_kind.reset(); base.lto = usr.lto; }
+            if (usr.lto_kind) { base.lto.reset(); base.lto_kind = usr.lto_kind; }
+            if (usr.strip) base.strip = usr.strip;
+            if (!usr.sanitize.empty()) base.sanitize = usr.sanitize;
+            if (usr.warnings) base.warnings = usr.warnings;
+        }
+        return base;
+    }
+
+    SourceExtConfig resolve_source_ext() const {
+        if (sources_config) return *sources_config;
+        return SourceExtConfig{};
+    }
 
     // Try to load bake.toml from the given directory.
     // Returns nullopt if no bake.toml exists.
@@ -160,18 +203,22 @@ export struct Manifest {
 
         auto parse_option_value = [](const toml::node& value)
                 -> std::optional<BuildOption> {
-            // toml++ value<T>() performs numeric conversions, so inspect the
-            // node type before extracting the value.
             if (value.is_boolean()) {
-                return BuildOption::from_bool(*value.value<bool>());
-            }
-            if (value.is_integer()) {
-                return BuildOption::from_int(*value.value<std::int64_t>());
-            }
-            if (value.is_string()) {
-                return BuildOption::from_string(*value.value<std::string>());
+                return BuildOption{*value.value<bool>()};
             }
             return std::nullopt;
+        };
+
+        auto parse_string_array = [](const toml::node& value)
+                -> std::vector<std::string> {
+            std::vector<std::string> result;
+            if (auto* arr = value.as_array()) {
+                for (auto& elem : *arr) {
+                    if (auto s = elem.value<std::string>())
+                        result.push_back(*s);
+                }
+            }
+            return result;
         };
 
         // [workspace]
@@ -210,9 +257,18 @@ export struct Manifest {
                 }
                 value.type = *parsed;
             }
-            if (auto v = (*pkg_tbl)["std"].value<std::string>())
-                value.std_version = *v;
+            // [language] is the sole source of language standards.
+            // No [package] std shorthand.
             m.moid = std::move(value);
+        }
+
+        // [language] — cxx/c standard control (defaults: c++17 / c17)
+        if (auto* lang_tbl = tbl["language"].as_table()) {
+            if (!m.moid) m.moid = Moid{};
+            if (auto v = (*lang_tbl)["cxx"].value<std::string>())
+                m.moid->cxx_std = *v;
+            if (auto v = (*lang_tbl)["c"].value<std::string>())
+                m.moid->c_std = *v;
         }
 
         // [dependencies]
@@ -227,19 +283,10 @@ export struct Manifest {
                         d.path = *v;
                         d.is_path_dep = true;
                     }
-                    if (auto* opts = (*t)["options"].as_table()) {
-                        for (auto& [opt_key, opt_value] : *opts) {
-                            auto parsed = parse_option_value(opt_value);
-                            if (!parsed) {
-                                std::println(
-                                    std::cerr,
-                                    "bake: dependency '{}': option '{}' must be "
-                                    "a bool, integer, or string",
-                                    d.name, opt_key.str());
-                                return std::nullopt;
-                            }
-                            d.options[std::string(opt_key.str())] =
-                                std::move(*parsed);
+                    if (auto* opts = (*t)["options"].as_array()) {
+                        for (auto& elem : *opts) {
+                            if (auto s = elem.value<std::string>())
+                                d.options.push_back(*s);
                         }
                     }
                 }
@@ -247,13 +294,125 @@ export struct Manifest {
             }
         }
 
-        // [options]
+        // [options] — bool only
         if (auto* opts = tbl["options"].as_table()) {
             for (auto& [key, val] : *opts) {
                 std::string opt_name = std::string(key.str());
-                if (auto parsed = parse_option_value(val))
+                if (auto parsed = parse_option_value(val)) {
                     m.options[opt_name] = std::move(*parsed);
+                } else {
+                    std::println(std::cerr,
+                                 "bake: option '{}' must be a boolean in {}",
+                                 opt_name, toml_path.string());
+                    return std::nullopt;
+                }
             }
+        }
+
+        // [profile.<name>]
+        if (auto* profiles_tbl = tbl["profile"].as_table()) {
+            for (auto& [prof_key, prof_val] : *profiles_tbl) {
+                auto* pt = prof_val.as_table();
+                if (!pt) continue;
+                ProfileConfig pc;
+                if (auto* opt_node = pt->get("opt")) {
+                    if (opt_node->is_integer())
+                        pc.opt_level = static_cast<int>(
+                            *opt_node->value<std::int64_t>());
+                    else if (auto s = opt_node->value<std::string>())
+                        pc.opt_size = *s;
+                }
+                if (auto* dbg_node = pt->get("debug")) {
+                    if (auto b = dbg_node->value<bool>())
+                        pc.debug = *b;
+                    else if (auto s = dbg_node->value<std::string>())
+                        pc.debug_kind = *s;
+                }
+                if (auto* lto_node = pt->get("lto")) {
+                    if (auto b = lto_node->value<bool>())
+                        pc.lto = *b;
+                    else if (auto s = lto_node->value<std::string>())
+                        pc.lto_kind = *s;
+                }
+                if (auto b = (*pt)["strip"].value<bool>()) pc.strip = *b;
+                if (auto* san = pt->get("sanitize"))
+                    pc.sanitize = parse_string_array(*san);
+                if (auto s = (*pt)["warnings"].value<std::string>())
+                    pc.warnings = *s;
+                m.profiles[std::string(prof_key.str())] = std::move(pc);
+            }
+        }
+
+        // [target."<pattern>"]
+        if (auto* targets_tbl = tbl["target"].as_table()) {
+            for (auto& [tgt_key, tgt_val] : *targets_tbl) {
+                auto* tt = tgt_val.as_table();
+                if (!tt) continue;
+                TargetCondition tc;
+                tc.triple_pattern = std::string(tgt_key.str());
+
+                // Validate: * must be a whole segment, not part of one
+                auto validate_pattern = [](std::string_view pattern) -> bool {
+                    std::size_t start = 0;
+                    for (std::size_t i = 0; i <= pattern.size(); ++i) {
+                        if (i == pattern.size() || pattern[i] == '-') {
+                            auto seg = pattern.substr(start, i - start);
+                            if (seg.find('*') != std::string_view::npos &&
+                                seg != "*")
+                                return false;
+                            start = i + 1;
+                        }
+                    }
+                    return true;
+                };
+                if (!validate_pattern(tc.triple_pattern)) {
+                    std::println(std::cerr,
+                        "bake: invalid target pattern '{}': "
+                        "'*' must match a whole segment",
+                        tc.triple_pattern);
+                    return std::nullopt;
+                }
+                if (auto* libs = (*tt)["libraries"].as_array())
+                    for (auto& e : *libs)
+                        if (auto s = e.value<std::string>()) tc.libraries.push_back(*s);
+                if (auto* fws = (*tt)["frameworks"].as_array())
+                    for (auto& e : *fws)
+                        if (auto s = e.value<std::string>()) tc.frameworks.push_back(*s);
+                if (auto* defs = (*tt)["defines"].as_array())
+                    for (auto& e : *defs)
+                        if (auto s = e.value<std::string>()) tc.defines.push_back(*s);
+                if (auto* flags = (*tt)["flags"].as_array())
+                    for (auto& e : *flags)
+                        if (auto s = e.value<std::string>()) tc.flags.push_back(*s);
+                if (auto* incs = (*tt)["include_dirs"].as_array())
+                    for (auto& e : *incs)
+                        if (auto s = e.value<std::string>()) tc.include_dirs.push_back(*s);
+                m.targets.push_back(std::move(tc));
+            }
+        }
+
+        // [link]
+        if (auto* link_tbl = tbl["link"].as_table()) {
+            LinkConfig lc;
+            if (auto* libs = (*link_tbl)["libraries"].as_array())
+                for (auto& e : *libs)
+                    if (auto s = e.value<std::string>()) lc.libraries.push_back(*s);
+            if (auto* fws = (*link_tbl)["frameworks"].as_array())
+                for (auto& e : *fws)
+                    if (auto s = e.value<std::string>()) lc.frameworks.push_back(*s);
+            m.link = std::move(lc);
+        }
+
+        // [sources]
+        if (auto* src_tbl = tbl["sources"].as_table()) {
+            SourceExtConfig sec;
+            if (auto* me = (*src_tbl)["module_ext"].as_array())
+                sec.module_ext = parse_string_array(*me);
+            if (auto* se = (*src_tbl)["source_ext"].as_array())
+                sec.source_ext = parse_string_array(*se);
+            if (auto* he = (*src_tbl)["header_ext"].as_array())
+                sec.header_ext = parse_string_array(*he);
+            m.sources_config = std::move(sec);
         }
 
         return m;
