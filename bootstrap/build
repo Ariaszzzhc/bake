@@ -57,7 +57,6 @@ if [ ! -f "$PREFIX/lib/libLLVMCore.a" ]; then
 
     # 2a: Native tablegen (runs on host)
     if [ ! -f "$NATIVE/bin/llvm-tblgen" ]; then
-        rm -rf "$NATIVE"
         cmake -G Ninja -B "$NATIVE" \
             -DCMAKE_C_COMPILER="$(pwd)/$WRAP/native-cc" \
             -DCMAKE_CXX_COMPILER="$(pwd)/$WRAP/native-c++" \
@@ -73,10 +72,32 @@ if [ ! -f "$PREFIX/lib/libLLVMCore.a" ]; then
     fi
 
     # 2b: Cross-compile LLVM for target
+    # Map target triple to CMake system name + processor.
+    case "$TARGET" in
+        *-linux-*)   SYSNAME=Linux ;;
+        *-windows-*) SYSNAME=Windows ;;
+        *-darwin*)   SYSNAME=Darwin ;;
+        *)           SYSNAME=Linux ;;
+    esac
+
     rm -rf "$CROSS"
+
+    # Disable all fuzzer tool directories (14 total).
+    FUZZER_FLAGS=""
+    for d in llvm-as-fuzzer llvm-dis-fuzzer llvm-dlang-demangle-fuzzer \
+             llvm-isel-fuzzer llvm-itanium-demangle-fuzzer \
+             llvm-mc-assemble-fuzzer llvm-mc-disassemble-fuzzer \
+             llvm-microsoft-demangle-fuzzer llvm-opt-fuzzer \
+             llvm-rust-demangle-fuzzer llvm-special-case-list-fuzzer \
+             llvm-yaml-numeric-parser-fuzzer llvm-yaml-parser-fuzzer \
+             vfabi-demangle-fuzzer; do
+        var="LLVM_TOOL_$(echo "$d" | tr 'a-z-' 'A-Z_')_BUILD"
+        FUZZER_FLAGS="$FUZZER_FLAGS -D${var}=OFF"
+    done
+
     cmake -G Ninja -B "$CROSS" \
         -DCMAKE_CROSSCOMPILING=True \
-        -DCMAKE_SYSTEM_NAME=Linux \
+        -DCMAKE_SYSTEM_NAME="$SYSNAME" \
         -DCMAKE_SYSTEM_PROCESSOR="${TARGET%%-*}" \
         -DCMAKE_C_COMPILER="$(pwd)/$WRAP/cc" \
         -DCMAKE_CXX_COMPILER="$(pwd)/$WRAP/c++" \
@@ -96,7 +117,7 @@ if [ ! -f "$PREFIX/lib/libLLVMCore.a" ]; then
         -DLLVM_INCLUDE_BENCHMARKS=OFF \
         -DLLVM_INCLUDE_DOCS=OFF \
         -DLLVM_BUILD_TOOLS=OFF \
-        -DLLVM_BUILD_STATIC=ON \
+        -DLLVM_BUILD_UTILS=OFF \
         -DLLVM_BUILD_LLVM_DYLIB=OFF \
         -DLLVM_BUILD_SHARED_LIBS=OFF \
         -DLLVM_ENABLE_PIC=OFF \
@@ -109,8 +130,14 @@ if [ ! -f "$PREFIX/lib/libLLVMCore.a" ]; then
         -DLLVM_TABLEGEN="$(pwd)/$NATIVE/bin/llvm-tblgen" \
         -DCLANG_TABLEGEN="$(pwd)/$NATIVE/bin/clang-tblgen" \
         -DCLANG_BUILD_TOOLS=OFF \
+        -DCLANG_ENABLE_ARCMT=OFF \
+        -DCLANG_ENABLE_STATIC_ANALYZER=OFF \
+        -DCLANG_INCLUDE_TESTS=OFF \
+        -DCLANG_BUILD_EXAMPLES=OFF \
+        -DLIBCLANG_BUILD_STATIC=ON \
         -DLLD_BUILD_TOOLS=OFF \
         -DCMAKE_INSTALL_PREFIX="$PREFIX" \
+        $FUZZER_FLAGS \
         "$LLVM_SRC"
     cmake --build "$CROSS"
     cmake --install "$CROSS"

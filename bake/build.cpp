@@ -74,6 +74,14 @@ int main() {
     for (auto& lib : lld_libs)   b.link_system(lib);
     for (auto& lib : llvm_libs)  b.link_system(lib);
 
+    // Windows system libraries required by LLVM/Clang:
+    // ole32 — COM functions (CoTaskMemFree, CoCreateInstance) used by LLVMSupport
+    // version — GetFileVersionInfoW used by Clang MSVC detection
+    if (b.target().contains("windows")) {
+        b.link_system("ole32");
+        b.link_system("version");
+    }
+
     // Link zlib/zstd if present (absent in cross-compile builds where they're disabled).
     std::string zlib = ws + "/external/zlib-install/lib/libz.a";
     std::string zstd = ws + "/external/zstd-install/lib/libzstd.a";

@@ -234,7 +234,7 @@ limitations in handling dllimport attribute.  */
 #  define __MSVCRT_VERSION__ 0xE00
 #  define _UCRT
 # else
-#  define __MSVCRT_VERSION__ 0x800
+#  define __MSVCRT_VERSION__ 0xE00
 # endif
 #endif
 

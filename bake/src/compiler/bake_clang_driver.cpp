@@ -391,6 +391,21 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     //   - mingw: skip GCC libs (-lgcc, -lgcc_eh, -lmoldname, -lmingwex,
     //     -lmingw32) since we inject libmingw32.a directly. Also skip
     //     -lmsvcrt since we inject api-ms-win-crt-* import libs.
+    //
+    // For mingw: generate import libraries on-demand for -l<name> flags.
+    // Only libraries that are referenced are generated (like Zig does).
+    if (is_mingw) {
+      for (const char *Arg : Cmd->getArguments()) {
+        if (!Arg) continue;
+        StringRef A(Arg);
+        if (A.starts_with("-l")) {
+          std::string name(A.substr(2));
+          if (!name.empty())
+            bake::ensure_mingw_import_lib(tc, name);
+        }
+      }
+    }
+
     for (const char *Arg : Cmd->getArguments()) {
       if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
         continue;

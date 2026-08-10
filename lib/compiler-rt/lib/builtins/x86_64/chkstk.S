@@ -37,4 +37,22 @@ DEFINE_COMPILERRT_FUNCTION(___chkstk_ms)
         ret
 END_COMPILERRT_FUNCTION(___chkstk_ms)
 
+// Aliases — all variants share the same implementation.
+// The compiler generates calls to __chkstk / ___chkstk / _chkstk;
+// _alloca / __alloca are aliases provided for GCC/MSVC compatibility.
+// Normally these live in libgcc.a; we provide them here since bake
+// does not link against libgcc.
+.globl __chkstk
+.set __chkstk, ___chkstk_ms
+.globl ___chkstk
+.set ___chkstk, ___chkstk_ms
+.globl __chkstk_ms
+.set __chkstk_ms, ___chkstk_ms
+.globl _chkstk
+.set _chkstk, ___chkstk_ms
+.globl _alloca
+.set _alloca, ___chkstk_ms
+.globl __alloca
+.set __alloca, ___chkstk_ms
+
 #endif // __x86_64__

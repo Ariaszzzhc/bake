@@ -242,6 +242,8 @@ public:
             declaration_options_ = value;
         if (const char* value = std::getenv("BAKE_DECLARATION_DEPENDENCIES"))
             declaration_dependencies_ = value;
+        if (const char* value = std::getenv("BAKE_TARGET"))
+            target_ = value;
         options_ = parse_options_env();
 
         // Dependency source directories arrive as alias=/absolute/path.
@@ -333,6 +335,7 @@ public:
 
     std::string_view source_dir() const { return source_dir_; }
     std::string_view build_dir() const { return build_dir_; }
+    std::string_view target() const { return target_; }
 
     std::string_view dep_src_dir(std::string_view name) const {
         auto it = dep_dirs_.find(std::string(name));
@@ -398,6 +401,7 @@ private:
     std::string std_version_ = "c++23";
     std::string source_dir_;
     std::string build_dir_;
+    std::string target_;
     std::string declaration_path_;
     std::string declaration_options_ = "{}";
     std::string declaration_dependencies_ = "[]";

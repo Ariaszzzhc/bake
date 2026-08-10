@@ -1,6 +1,10 @@
 module;
 
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <unistd.h>
+#endif
 
 export module bake.compiler;
 
@@ -440,7 +444,13 @@ static bool atomic_compile_pcm(
     Path parent = dest.parent();
     parent.mkdir_recursive();
 
-    std::string suffix = "." + std::to_string(getpid()) + ".tmp";
+    std::string suffix = "." + std::to_string(
+#ifdef _WIN32
+        _getpid()
+#else
+        getpid()
+#endif
+    ) + ".tmp";
     Path tmp = Path(dest.string() + suffix);
 
     std::vector<std::string> cmd = compile_cmd;
@@ -1381,7 +1391,7 @@ static const char* mingw32_misc_src[] = {
     "misc/wmemset.c",
     // ucrtbase
     "misc/__initenv.c", "misc/__winitenv.c", "misc/__p___initenv.c",
-    "misc/__p___winitenv.c", "misc/_onexit.c", "misc/ucrt-access.c",
+    "misc/__p___winitenv.c", "misc/_assert.c", "misc/_onexit.c", "misc/ucrt-access.c",
     "misc/ucrt__getmainargs.c", "misc/ucrt__wgetmainargs.c",
     "misc/ucrt_amsg_exit.c", "misc/ucrt_at_quick_exit.c",
     "misc/ucrt_tzset.c",
@@ -1782,6 +1792,169 @@ export MingwObjects ensure_mingw_objects(const Toolchain& tc) {
     return result;
 }
 
+// ── On-demand import library generation ──
+//
+// Called from the driver for each -l<name> on a windows-gnu link line.
+// If <name>.lib already exists in the cache, returns immediately.
+// Otherwise finds <name>.def in the MinGW source, filters F_* arch directives,
+// and generates the import library via LLD COFF driver.
+//
+// uuid is special: no .def file. It's a static archive of GUID definitions
+// compiled from libsrc/*-uuid.c.
+
+export Path ensure_mingw_import_lib(const Toolchain& tc,
+                                     const std::string& lib_name) {
+    if (!tc.target.is_windows_gnu()) return Path();
+
+    Path lib_dir = find_lib_dir();
+    if (lib_dir.string().empty()) return Path();
+
+    Path mingw_src = lib_dir / "libc" / "mingw";
+    Path cache_dir = get_cache_dir().parent() / "mingw-objects" /
+                     tc.target.triple();
+    Path import_dir = cache_dir / "implib";
+
+    Path final_lib = import_dir / (lib_name + ".lib");
+    if (final_lib.is_regular_file()) return final_lib;
+    if (!import_dir.is_directory()) return Path();
+
+    std::string arch = tc.target.arch();
+    std::string machine = (arch == "x86_64") ? "X64" : "ARM64";
+    std::string def_arch_dir = (arch == "x86_64") ? "lib64" : "libarm64";
+
+    // uuid: static library from C sources (GUID definitions, not DLL import).
+    if (lib_name == "uuid") {
+        Path libsrc = mingw_src / "libsrc";
+        if (!libsrc.is_directory()) return Path();
+
+        std::vector<std::string> uuid_src;
+        for (auto& e : std::filesystem::directory_iterator(libsrc.string())) {
+            auto name = e.path().filename().string();
+            if (name.ends_with("-uuid.c"))
+                uuid_src.push_back(e.path().string());
+        }
+        if (uuid_src.empty()) return Path();
+
+        std::vector<std::string> flags;
+        flags.push_back(tc.exe_path);
+        flags.push_back("cc");
+        flags.push_back("-target");
+        flags.push_back(tc.target.triple());
+        flags.push_back("-c");
+        flags.push_back("-std=gnu11");
+        flags.push_back("-D__USE_MINGW_ANSI_STDIO=0");
+        flags.push_back("-D__MSVCRT_VERSION__=0x700");
+        flags.push_back("-D_CTYPE_DISABLE_MACROS");
+        flags.push_back("-D_CRTBLD");
+        flags.push_back("-D_SYSCRT=1");
+        flags.push_back("-D_WIN32_WINNT=0x0f00");
+        flags.push_back("-DCRTDLL=1");
+        flags.push_back("-isystem");
+        flags.push_back((lib_dir / "libc" / "include" / "any-windows-any").string());
+        flags.push_back("-I" + (mingw_src / "include").string());
+        flags.push_back("-Os");
+        flags.push_back("-w");
+
+        std::vector<Path> obj_paths;
+        for (auto& src : uuid_src) {
+            std::string fname = std::filesystem::path(src).filename().string();
+            std::string obj_name = "uuid__" + fname;
+            obj_name.replace(obj_name.size() - 2, 2, ".o");
+            Path obj = cache_dir / obj_name;
+            if (!obj.is_regular_file()) {
+                std::vector<std::string> f = flags;
+                f.push_back(src);
+                f.push_back("-o");
+                f.push_back(obj.string());
+                auto r = run_process(f, Path(), true);
+                if (!r.success()) {
+                    std::print(std::cerr, "{}", r.stderr_output);
+                    continue;
+                }
+            }
+            obj_paths.push_back(obj);
+        }
+        if (obj_paths.empty()) return Path();
+        write_archive(final_lib, obj_paths, false, true);
+        return final_lib;
+    }
+
+    // Standard import library: find .def, filter F_* directives, generate.
+    Path def_file = mingw_src / def_arch_dir / (lib_name + ".def");
+    if (!def_file.is_regular_file())
+        def_file = mingw_src / "lib-common" / (lib_name + ".def");
+    if (!def_file.is_regular_file()) return Path();
+
+    // Filter F_* arch directives that LLD can't parse.
+    Path use_def = def_file;
+    {
+        std::ifstream in(def_file.string());
+        std::string content((std::istreambuf_iterator<char>(in)),
+                             std::istreambuf_iterator<char>());
+        if (content.find("F_") != std::string::npos) {
+            std::string keep_prefix;
+            if (machine == "X64")        keep_prefix = "F_X64(";
+            else if (machine == "ARM64") keep_prefix = "F_ARM64(";
+            else                         keep_prefix = "F_I386(";
+
+            std::string filtered;
+            filtered.reserve(content.size());
+            size_t pos = 0;
+            while (pos < content.size()) {
+                size_t eol = content.find('\n', pos);
+                if (eol == std::string::npos) eol = content.size();
+                std::string_view line(content.data() + pos, eol - pos);
+
+                if (line.starts_with("F_")) {
+                    bool keep = false;
+                    if (line.starts_with(keep_prefix)) keep = true;
+                    else if (line.starts_with("F_NON_I386(") &&
+                             machine != "X86") keep = true;
+                    if (keep) {
+                        size_t s = line.find('(');
+                        size_t e = line.find(')', s);
+                        if (s != std::string_view::npos &&
+                            e != std::string_view::npos)
+                            filtered += std::string(line.substr(s + 1, e - s - 1));
+                        filtered += '\n';
+                    }
+                } else {
+                    filtered += std::string(line);
+                    filtered += '\n';
+                }
+                pos = eol + 1;
+            }
+
+            use_def = import_dir / (lib_name + ".filtered.def");
+            write_file(use_def, filtered);
+        }
+    }
+
+    std::vector<const char*> lld_args;
+    lld_args.push_back("lld-link");
+    std::string def_arg = "/def:" + use_def.string();
+    std::string out_arg = "/out:" + final_lib.string();
+    std::string mach_arg = "/machine:" + machine;
+    lld_args.push_back(def_arg.c_str());
+    lld_args.push_back(out_arg.c_str());
+    lld_args.push_back(mach_arg.c_str());
+
+    if (bake_lld_link(LldFlavor::COFF,
+                      static_cast<int>(lld_args.size()),
+                      lld_args.data()) != 0)
+        return Path();
+
+    // LLD creates "lib<name>.lib" — rename to "<name>.lib".
+    Path lld_output = import_dir / ("lib" + lib_name + ".lib");
+    if (lld_output.is_regular_file() && !final_lib.is_regular_file()) {
+        std::error_code ec;
+        std::filesystem::rename(lld_output.string(),
+                                final_lib.string(), ec);
+    }
+
+    return final_lib.is_regular_file() ? final_lib : Path();
+}
+
 // ── Unified runtime preparation ──
 //
 // Called once per link job from bake_clang_driver.cpp. Dispatches to the
@@ -1867,6 +2040,7 @@ export RuntimeArtifacts prepare_runtime(
         // Link search paths: cache dir (for crt2.o, libmingw32.a) + import libs.
         if (!mingw.crt2_o.string().empty()) {
             rt.link_dirs.push_back(mingw.crt2_o.parent().string());
+            rt.link_dirs.push_back(mingw.import_lib_dir.string());
             rt.mingw_import_dir = mingw.import_lib_dir.string();
         }
         // Always-link system libraries.

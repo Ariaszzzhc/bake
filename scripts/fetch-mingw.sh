@@ -66,7 +66,7 @@ for mac_in in \
     "$SRC/mingw-w64-headers/crt/_mingw_mac.h.in"; do
   if [ -f "$mac_in" ]; then
     sed -e 's/@DEFAULT_WIN32_WINNT@/0x0a00/g' \
-        -e 's/@DEFAULT_MSVCRT_VERSION@/0x800/g' \
+        -e 's/@DEFAULT_MSVCRT_VERSION@/0xE00/g' \
         "$mac_in" > "$HEADERS_DST/_mingw_mac.h"
     break
   fi
@@ -78,19 +78,11 @@ for mingw_in in \
     "$SRC/mingw-w64-headers/crt/_mingw.h.in"; do
   if [ -f "$mingw_in" ] && [ ! -f "$HEADERS_DST/_mingw.h" ]; then
     sed -e 's/@DEFAULT_WIN32_WINNT@/0x0a00/g' \
-        -e 's/@DEFAULT_MSVCRT_VERSION@/0x800/g' \
+        -e 's/@DEFAULT_MSVCRT_VERSION@/0xE00/g' \
         "$mingw_in" > "$HEADERS_DST/_mingw.h"
     break
   fi
 done
-
-# Patch _mingw.h: default to UCRT (__MSVCRT_VERSION__=0xE00 + _UCRT) instead
-# of MSVCRT 0x700. CRT sources override with -D__MSVCRT_VERSION__=0x700.
-sed -i.bak '/^#  define __MSVCRT_VERSION__ 0x700$/s/0x700/0xE00/' \
-    "$HEADERS_DST/_mingw.h"
-sed -i.bak2 '/^#  define __MSVCRT_VERSION__ 0xE00$/a\
-#  define _UCRT' "$HEADERS_DST/_mingw.h"
-rm -f "$HEADERS_DST/_mingw.h.bak" "$HEADERS_DST/_mingw.h.bak2"
 
 echo "  → $(find "$HEADERS_DST" -type f \( -name '*.h' -o -name '*.inl' \) | wc -l | tr -d ' ') headers"
 

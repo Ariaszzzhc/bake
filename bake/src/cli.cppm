@@ -8,6 +8,7 @@ module;
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <process.h>
 #else
 #include <unistd.h>
 #endif
@@ -647,7 +648,13 @@ MoidDeclaration compile_and_run_build_cpp(
 
     if (!pcm.is_regular_file() || !wrapper_o.is_regular_file()) {
         // Atomic compile: write to temp names, then rename into place.
-        std::string pid = std::to_string(getpid());
+        std::string pid = std::to_string(
+#ifdef _WIN32
+            _getpid()
+#else
+            getpid()
+#endif
+        );
         Path tmp_pcm = Path(pcm.string() + "." + pid + ".tmp");
         Path tmp_o   = Path(wrapper_o.string() + "." + pid + ".tmp");
 
@@ -768,6 +775,8 @@ MoidDeclaration compile_and_run_build_cpp(
             "BAKE_DECLARATION_DEPENDENCIES", declaration_dependencies);
         ScopedEnv dependencies_env("BAKE_DEPS", deps_str);
         ScopedEnv executable_env("BAKE_EXE", self);
+        ScopedEnv target_env("BAKE_TARGET",
+            tc.target.is_native() ? "" : tc.target.triple());
 
         // Do not capture stdout/stderr: declaration transport uses the file,
         // so build scripts retain their normal user-facing streams.
