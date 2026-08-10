@@ -1,0 +1,20 @@
+# Mark vendored source as linguist-vendored so GitHub doesn't count it
+# in language statistics. These are third-party sources (MinGW-w64, musl,
+# libc++, compiler-rt, etc.) that bake vendors for its integrated toolchain.
+
+# C runtime sources (musl, MinGW-w64, darwin stubs, kernel headers)
+lib/libc/** linguist-vendored
+
+# C++ runtime (vendored from LLVM)
+lib/libcxx/** linguist-vendored
+lib/libcxxabi/** linguist-vendored
+lib/libunwind/** linguist-vendored
+
+# compiler-rt builtins (vendored from LLVM)
+lib/compiler-rt/** linguist-vendored
+
+# Clang resource headers (vendored from LLVM)
+lib/include/** linguist-vendored
+
+# Third-party header-only libraries
+third_party/** linguist-vendored

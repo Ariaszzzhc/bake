@@ -721,7 +721,7 @@ export std::expected<BuildGraph, std::string> build_graph(
                     "reserved device name");
             }
 
-            std::string out_name = library_name(decl.name, rm.type);
+            std::string out_name = library_name(decl.name, rm.type, tc.target);
             rm.output = (rm.type == MoidType::Executable)
                 ? out_dir / bin_subdir / out_name
                 : out_dir / lib_subdir / out_name;

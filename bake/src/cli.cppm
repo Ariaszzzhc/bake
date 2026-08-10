@@ -1288,8 +1288,16 @@ export int cmd_run(const ParsedArgs& args) {
     }
 
     const auto& executable = executables.front();
-    exe_path = out_dir / "bin" /
-        library_name(executable.name, executable.type);
+
+    // Parse cross-compile target (must match what cmd_build used).
+    TargetSpec target;
+    if (auto t = args.get_option("target"))
+        target = parse_target(*t);
+    std::string bin_subdir = target.is_native()
+        ? "bin" : "bin-" + target.triple();
+
+    exe_path = out_dir / bin_subdir /
+        library_name(executable.name, executable.type, target);
 
     if (!exe_path.exists()) {
         std::println(std::cerr, "bake: built executable not found at {}", exe_path.string());

@@ -15,6 +15,7 @@ export enum class LldFlavor : int {
     COFF  = 1,
     MACHO = 2,
     WASM  = 3,
+    MinGW = 4,  // GNU-style args → translated to COFF internally
 };
 
 // In-process LLD link. argv[0] should be the linker name.

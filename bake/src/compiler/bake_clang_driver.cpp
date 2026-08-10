@@ -290,8 +290,15 @@ static void bakeGetLLDInfo(const llvm::Triple &Triple,
     Flavor = LldFlavor::MACHO;
     break;
   case llvm::Triple::COFF:
-    LinkerName = "lld-link";
-    Flavor = LldFlavor::COFF;
+    // MinGW (windows-gnu) uses the MinGW driver, which accepts GNU-style
+    // args and translates them to COFF internally. MSVC targets use lld-link.
+    if (Triple.getEnvironment() == llvm::Triple::GNU) {
+      LinkerName = "ld.lld";
+      Flavor = LldFlavor::MinGW;
+    } else {
+      LinkerName = "lld-link";
+      Flavor = LldFlavor::COFF;
+    }
     break;
   case llvm::Triple::Wasm:
     LinkerName = "wasm-ld";
@@ -328,6 +335,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     tc.target = bake::parse_target(Triple.getTriple());
 
     bool is_darwin = Flavor == LldFlavor::MACHO;
+    bool is_mingw = Flavor == LldFlavor::MinGW;
 
     // Parse link mode from user args.
     std::vector<std::string> user_args;
@@ -343,9 +351,9 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     std::vector<const char *> LldArgs;
     LldArgs.push_back(LinkerName);
 
-    // ── Prefix: crt entry + darwin link dirs ──
+    // ── Prefix: crt entry + link dirs ──
 
-    // CRT entry (musl: crt1.o / rcrt1.o / Scrt1.o; darwin: none)
+    // CRT entry (musl: crt1.o; mingw: crt2.o; darwin: none)
     if (!rt.crt_entry.string().empty())
       Prefix.push_back(rt.crt_entry.string());
 
@@ -367,15 +375,39 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       Prefix.push_back("-lSystem");
     }
 
+    if (is_mingw) {
+      // Import library search paths for the MinGW driver.
+      for (auto& dir : rt.link_dirs)
+        Prefix.push_back("-L" + dir);
+    }
+
     for (auto &S : Prefix)
       LldArgs.push_back(S.c_str());
 
     // ── User args ──
-    // For darwin C++ links: filter out Clang's auto-added -lc++ to avoid
-    // conflict with our static archives.
+    // Filter target-specific libraries that bake replaces with its own
+    // runtime injection:
+    //   - darwin C++: skip -lc++ (use our static libc++.a instead)
+    //   - mingw: skip GCC libs (-lgcc, -lgcc_eh, -lmoldname, -lmingwex,
+    //     -lmingw32) since we inject libmingw32.a directly. Also skip
+    //     -lmsvcrt since we inject api-ms-win-crt-* import libs.
     for (const char *Arg : Cmd->getArguments()) {
       if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
         continue;
+      if (is_mingw && Arg) {
+        StringRef A(Arg);
+        // GCC-specific libs not needed with Clang/LLD.
+        if (A == "-lgcc" || A == "-lgcc_eh" || A == "-lgcc_s" ||
+            A == "-lmoldname" || A == "-lmingwex" || A == "-lmingw32" ||
+            A == "-lmsvcrt" || A == "-lstdc++" ||
+            A == "-ladvapi32" || A == "-lkernel32" || A == "-luser32" ||
+            A == "-lshell32" || A == "-lntdll")
+          continue;
+        // GCC CRT startup files — not needed with Clang/LLD (uses crt2.o).
+        if (A == "crtbegin.o" || A == "crtend.o" ||
+            A == "crtbeginS.o" || A == "crtendS.o")
+          continue;
+      }
       LldArgs.push_back(Arg);
     }
 
@@ -390,6 +422,12 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       Suffix.push_back(rt.libc.string());
     if (!rt.compiler_rt.string().empty())
       Suffix.push_back(rt.compiler_rt.string());
+
+    // MinGW: always-link system libraries as full paths (like Zig does).
+    if (is_mingw && !rt.mingw_import_dir.empty()) {
+      for (auto& lib : rt.always_link_libs)
+        Suffix.push_back(rt.mingw_import_dir + "/" + lib + ".lib");
+    }
 
     for (auto &S : Suffix)
       LldArgs.push_back(S.c_str());
@@ -497,6 +535,9 @@ static void inject_vendored_headers(
   bool is_musl = target_triple.contains("linux") &&
                  target_triple.contains("musl");
 
+  bool is_mingw = target_triple.contains("windows") &&
+                  target_triple.contains("gnu");
+
   bake::TargetSpec host = bake::detect_host_target();
   bool is_darwin = !target_triple.empty()
       ? (target_triple.contains("darwin") ||
@@ -528,6 +569,32 @@ static void inject_vendored_headers(
       add(lib + "/libc/include/generic-musl");
       add(lib + "/libc/include/" + arch_os_dir + "-linux-any");
       add(lib + "/libc/include/any-linux-any");
+    }
+  }
+
+  if (is_mingw) {
+    Args.push_back(Saver.save("-nostdinc").data());
+    if (IsCxx)
+      Args.push_back(Saver.save("-nostdinc++").data());
+
+    auto add = [&](const std::string &path) {
+      Args.push_back(Saver.save("-isystem").data());
+      Args.push_back(Saver.save(path.c_str()).data());
+    };
+
+    // C++ headers (vendored libc++ with MinGW config).
+    if (IsCxx && !lib.empty()) {
+      add(lib + "/libcxx/mingw-config");
+      add(lib + "/libcxx/include");
+      add(lib + "/libcxxabi/include");
+    }
+    // C runtime + Win32 API headers (MinGW-w64 public headers).
+    // _mingw.h defaults to UCRT (__MSVCRT_VERSION__=0xE00 + _UCRT) when
+    // __MSVCRT_VERSION__ is not explicitly defined. CRT sources override
+    // with -D__MSVCRT_VERSION__=0x700 to stay in MSVCRT compat mode.
+    if (!lib.empty()) {
+      add(lib + "/include");
+      add(lib + "/libc/include/any-windows-any");
     }
   }
 

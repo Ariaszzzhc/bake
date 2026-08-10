@@ -1,0 +1,324 @@
+LIBRARY api-ms-win-crt-math-l1-1-0
+EXPORTS
+_Cbuild
+_Cmulcc
+_Cmulcr
+_FCbuild
+_FCmulcc
+_FCmulcr
+_LCbuild
+_LCmulcc
+_LCmulcr
+__setusermatherr
+; DATA set manually
+_cabs DATA
+_chgsign
+chgsign == _chgsign
+_chgsignl == _chgsign
+_chgsignf
+_copysign
+_copysignf
+_d_int
+_dclass
+_dexp
+_dlog
+_dnorm
+_dpcomp
+_dpoly
+_dscale
+_dsign
+_dsin
+_dtest
+_dunscale
+_except1
+_fd_int
+_fdclass
+_fdexp
+_fdlog
+_fdnorm
+_fdopen
+fdopen == _fdopen
+_fdpcomp
+_fdpoly
+_fdscale
+_fdsign
+_fdsin
+_fdtest
+_fdunscale
+_finite
+finite == _finite
+_finitef
+_fpclass
+fpclass == _fpclass
+_fpclassf
+_get_FMA3_enable
+_hypot
+_hypotf
+_isnan
+_isnanf
+_j0
+j0 == _j0
+_j1
+j1 == _j1
+_jn
+jn == _jn
+_ld_int
+_ldclass
+_ldexp
+_ldlog
+_ldpcomp
+_ldpoly
+_ldscale
+_ldsign
+_ldsin
+_ldtest
+_ldunscale
+_logb
+_logbf
+_nextafter
+_nextafterf
+_scalb
+_scalbf
+_set_FMA3_enable
+_y0
+y0 == _y0
+_y1
+y1 == _y1
+_yn
+yn == _yn
+acos
+acosf
+acosl == acos
+acosh
+acoshf
+acoshl ; Can't use long double functions from the CRT on x86
+asin
+asinf
+asinl == asin
+asinh
+asinhf
+asinhl ; Can't use long double functions from the CRT on x86
+atan
+atan2
+atan2f
+atan2l == atan2
+atanf
+atanl == atan
+atanh
+atanhf
+atanhl ; Can't use long double functions from the CRT on x86
+cabs
+cabsf
+cabsl ; Can't use long double functions from the CRT on x86
+cacos
+cacosf
+cacosh
+cacoshf
+cacoshl ; Can't use long double functions from the CRT on x86
+cacosl ; Can't use long double functions from the CRT on x86
+carg
+cargf
+cargl ; Can't use long double functions from the CRT on x86
+casin
+casinf
+casinh
+casinhf
+casinhl ; Can't use long double functions from the CRT on x86
+casinl ; Can't use long double functions from the CRT on x86
+catan
+catanf
+catanh
+catanhf
+catanhl ; Can't use long double functions from the CRT on x86
+catanl ; Can't use long double functions from the CRT on x86
+cbrt
+cbrtf
+cbrtl ; Can't use long double functions from the CRT on x86
+ccos
+ccosf
+ccosh
+ccoshf
+ccoshl ; Can't use long double functions from the CRT on x86
+ccosl ; Can't use long double functions from the CRT on x86
+ceil
+ceilf
+ceill == ceil
+cexp
+cexpf
+cexpl ; Can't use long double functions from the CRT on x86
+cimag
+cimagf
+cimagl ; Can't use long double functions from the CRT on x86
+clog
+clog10
+clog10f
+clog10l ; Can't use long double functions from the CRT on x86
+clogf
+clogl ; Can't use long double functions from the CRT on x86
+conj
+conjf
+conjl ; Can't use long double functions from the CRT on x86
+copysign
+copysignf
+copysignl ; Can't use long double functions from the CRT on x86
+cos
+cosf
+cosl == cos
+cosh
+coshf
+cpow
+cpowf
+cpowl ; Can't use long double functions from the CRT on x86
+cproj
+cprojf
+cprojl ; Can't use long double functions from the CRT on x86
+creal
+crealf
+creall ; Can't use long double functions from the CRT on x86
+csin
+csinf
+csinh
+csinhf
+csinhl ; Can't use long double functions from the CRT on x86
+csinl ; Can't use long double functions from the CRT on x86
+csqrt
+csqrtf
+csqrtl ; Can't use long double functions from the CRT on x86
+ctan
+ctanf
+ctanh
+ctanhf
+ctanhl ; Can't use long double functions from the CRT on x86
+ctanl ; Can't use long double functions from the CRT on x86
+erf
+erfc
+erfcf
+erfcl ; Can't use long double functions from the CRT on x86
+erff
+erfl ; Can't use long double functions from the CRT on x86
+exp
+exp2
+exp2f
+exp2l ; Can't use long double functions from the CRT on x86
+expf
+expl == exp
+expm1
+expm1f
+expm1l ; Can't use long double functions from the CRT on x86
+fabs
+fdim
+fdimf
+fdiml ; Can't use long double functions from the CRT on x86
+floor
+floorf
+floorl == floor
+fma
+fmaf
+fmal ; Can't use long double functions from the CRT on x86
+fmax
+fmaxf
+fmaxl ; Can't use long double functions from the CRT on x86
+fmin
+fminf
+fminl ; Can't use long double functions from the CRT on x86
+fmod
+fmodf
+fmodl == fmod
+frexp
+hypot
+ilogb
+ilogbf
+ilogbl ; Can't use long double functions from the CRT on x86
+ldexp
+; The UCRT lgamma functions don't set/provide the signgam variable like
+; the mingw ones do. Therefore prefer the libmingwex version instead.
+lgamma DATA
+lgammaf DATA
+lgammal DATA ; Can't use long double functions from the CRT on x86
+llrint
+llrintf
+llrintl ; Can't use long double functions from the CRT on x86
+llround
+llroundf
+llroundl ; Can't use long double functions from the CRT on x86
+log
+log10
+log10f
+log10l == log10
+log1p
+log1pf
+log1pl ; Can't use long double functions from the CRT on x86
+log2
+log2f
+log2l ; Can't use long double functions from the CRT on x86
+logb
+logbf
+logbl ; Can't use long double functions from the CRT on x86
+logf
+logl == log
+lrint
+lrintf
+lrintl ; Can't use long double functions from the CRT on x86
+lround
+lroundf
+lroundl ; Can't use long double functions from the CRT on x86
+modf
+modff
+nan
+nanf
+nanl ; Can't use long double functions from the CRT on x86
+nearbyint
+nearbyintf
+nearbyintl ; Can't use long double functions from the CRT on x86
+nextafter
+nextafterf
+nextafterl ; Can't use long double functions from the CRT on x86
+; All of the nexttoward functions take the second parameter as long double,
+; making them unusable for x86.
+nexttoward ; Can't use long double functions from the CRT on x86
+nexttowardf ; Can't use long double functions from the CRT on x86
+nexttowardl ; Can't use long double functions from the CRT on x86
+norm
+normf
+norml
+pow
+powf ; Missing in Wine's ucrtbase.dll for i386 in Wine 9.15 and older
+powl == pow
+remainder
+remainderf
+remainderl ; Can't use long double functions from the CRT on x86
+remquo
+remquof
+remquol ; Can't use long double functions from the CRT on x86
+rint
+rintf
+rintl ; Can't use long double functions from the CRT on x86
+round
+roundf
+roundl ; Can't use long double functions from the CRT on x86
+scalbln
+scalblnf
+scalblnl ; Can't use long double functions from the CRT on x86
+scalbn
+scalbnf
+scalbnl ; Can't use long double functions from the CRT on x86
+sin
+sinf
+sinl == sin
+; if we implement sinh, we can set it DATA only.
+sinh
+sinhf
+sqrt
+sqrtf
+tan
+tanf
+tanl == tan
+; if we implement tanh, we can set it to DATA only.
+tanh
+tanhf
+tgamma
+tgammaf
+tgammal ; Can't use long double functions from the CRT on x86
+trunc
+truncf
+truncl ; Can't use long double functions from the CRT on x86

@@ -17,6 +17,7 @@ module;
 LLD_HAS_DRIVER(coff)
 LLD_HAS_DRIVER(elf)
 LLD_HAS_DRIVER(macho)
+LLD_HAS_DRIVER(mingw)
 LLD_HAS_DRIVER(wasm)
 
 module bake.llvm;
@@ -43,6 +44,10 @@ int bake_lld_link(LldFlavor flavor, int argc, const char **argv) {
     case LldFlavor::WASM:
         ok = lld::wasm::link(args, llvm::outs(), llvm::errs(),
                              /*exitEarly=*/false, /*disableOutput=*/false);
+        break;
+    case LldFlavor::MinGW:
+        ok = lld::mingw::link(args, llvm::outs(), llvm::errs(),
+                              /*exitEarly=*/false, /*disableOutput=*/false);
         break;
     }
 

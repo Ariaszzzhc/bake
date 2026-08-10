@@ -1,0 +1,1807 @@
+LIBRARY "msvcrt.dll"
+EXPORTS
+; List of X64 C++ mangled symbols which matches the first X64 version of msvcrt.dll (Windows Server 2003 SP1 / Windows XP x64)
+; public: __cdecl __non_rtti_object::__non_rtti_object(class __non_rtti_object const & __ptr64) __ptr64
+; GCC = __ZN17__non_rtti_objectC2ERKS_
+??0__non_rtti_object@@QEAA@AEBV0@@Z
+; public: __cdecl __non_rtti_object::__non_rtti_object(char const * __ptr64) __ptr64
+; GCC = __ZN17__non_rtti_objectC1ERKS_
+??0__non_rtti_object@@QEAA@PEBD@Z
+; private: __cdecl bad_cast::bad_cast(char const * __ptr64 const * __ptr64) __ptr64
+??0bad_cast@@AEAA@PEBQEBD@Z
+; public: __cdecl bad_cast::bad_cast(char const * __ptr64 const & __ptr64) __ptr64
+??0bad_cast@@QEAA@AEBQEBD@Z
+; public: __cdecl bad_cast::bad_cast(class bad_cast const & __ptr64) __ptr64
+??0bad_cast@@QEAA@AEBV0@@Z
+; public: __cdecl bad_cast::bad_cast(char const * __ptr64) __ptr64
+??0bad_cast@@QEAA@PEBD@Z
+; public: __cdecl bad_typeid::bad_typeid(class bad_typeid const & __ptr64) __ptr64
+??0bad_typeid@@QEAA@AEBV0@@Z
+; public: __cdecl bad_typeid::bad_typeid(char const * __ptr64) __ptr64
+??0bad_typeid@@QEAA@PEBD@Z
+; public: __cdecl exception::exception(char const * __ptr64 const & __ptr64) __ptr64
+??0exception@@QEAA@AEBQEBD@Z
+; public: __cdecl exception::exception(char const * __ptr64 const & __ptr64,int) __ptr64
+??0exception@@QEAA@AEBQEBDH@Z
+; public: __cdecl exception::exception(class exception const & __ptr64) __ptr64
+??0exception@@QEAA@AEBV0@@Z
+; public: __cdecl exception::exception(void) __ptr64
+??0exception@@QEAA@XZ
+; public: virtual __cdecl __non_rtti_object::~__non_rtti_object(void) __ptr64
+??1__non_rtti_object@@UEAA@XZ
+; public: virtual __cdecl bad_cast::~bad_cast(void) __ptr64
+??1bad_cast@@UEAA@XZ
+; public: virtual __cdecl bad_typeid::~bad_typeid(void) __ptr64
+??1bad_typeid@@UEAA@XZ
+; public: virtual __cdecl exception::~exception(void) __ptr64
+??1exception@@UEAA@XZ
+; public: virtual __cdecl type_info::~type_info(void) __ptr64
+??1type_info@@UEAA@XZ
+; void * __ptr64 __cdecl operator new(unsigned __int64)
+; GCC = __Znwy
+??2@YAPEAX_K@Z
+; void __cdecl operator delete(void * __ptr64)
+; GCC = __ZdlPv
+??3@YAXPEAX@Z
+; public: class __non_rtti_object & __ptr64 __cdecl __non_rtti_object::operator=(class __non_rtti_object const & __ptr64) __ptr64
+??4__non_rtti_object@@QEAAAEAV0@AEBV0@@Z
+; public: class bad_cast & __ptr64 __cdecl bad_cast::operator=(class bad_cast const & __ptr64) __ptr64
+??4bad_cast@@QEAAAEAV0@AEBV0@@Z
+; public: class bad_typeid & __ptr64 __cdecl bad_typeid::operator=(class bad_typeid const & __ptr64) __ptr64
+??4bad_typeid@@QEAAAEAV0@AEBV0@@Z
+; public: class exception & __ptr64 __cdecl exception::operator=(class exception const & __ptr64) __ptr64
+??4exception@@QEAAAEAV0@AEBV0@@Z
+; public: int __cdecl type_info::operator==(class type_info const & __ptr64)const __ptr64
+??8type_info@@QEBAHAEBV0@@Z
+; public: int __cdecl type_info::operator!=(class type_info const & __ptr64)const __ptr64
+??9type_info@@QEBAHAEBV0@@Z
+; const __non_rtti_object::`vftable'
+??_7__non_rtti_object@@6B@ DATA
+; const bad_cast::`vftable'
+??_7bad_cast@@6B@ DATA
+; const bad_typeid::`vftable'
+??_7bad_typeid@@6B@ DATA
+; const exception::`vftable'
+??_7exception@@6B@ DATA
+; public: void __cdecl bad_cast::`default constructor closure'(void) __ptr64
+??_Fbad_cast@@QEAAXXZ
+; public: void __cdecl bad_typeid::`default constructor closure'(void) __ptr64
+??_Fbad_typeid@@QEAAXXZ
+; void * __ptr64 __cdecl operator new[](unsigned __int64)
+; GNU = __Znay
+??_U@YAPEAX_K@Z
+; void __cdecl operator delete[](void * __ptr64)
+; GNU = __ZdaPv
+??_V@YAXPEAX@Z
+; int (__cdecl*__cdecl _query_new_handler(void))(unsigned __int64)
+; GNU = __Z18_query_new_handlerv
+?_query_new_handler@@YAP6AH_K@ZXZ
+; int __cdecl _query_new_mode(void)
+; GNU = __Z15_query_new_modev
+?_query_new_mode@@YAHXZ
+; int (__cdecl*__cdecl _set_new_handler(int (__cdecl*)(unsigned __int64)))(unsigned __int64)
+; GNU = __Z16_set_new_handlerPFiyE
+?_set_new_handler@@YAP6AH_K@ZP6AH0@Z@Z
+; int __cdecl _set_new_mode(int)
+; GNU = __Z13_set_new_modei
+?_set_new_mode@@YAHH@Z
+; void (__cdecl*__cdecl _set_se_translator(void (__cdecl*)(unsigned int,struct _EXCEPTION_POINTERS * __ptr64)))(unsigned int,struct _EXCEPTION_POINTERS * __ptr64)
+; GNU = __Z18_set_se_translatorPFvjP19_EXCEPTION_POINTERSE
+?_set_se_translator@@YAP6AXIPEAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z
+; public: int __cdecl type_info::before(class type_info const & __ptr64)const __ptr64
+?before@type_info@@QEBAHAEBV1@@Z
+; public: char const * __ptr64 __cdecl type_info::name(void)const __ptr64
+?name@type_info@@QEBAPEBDXZ
+; public: char const * __ptr64 __cdecl type_info::raw_name(void)const __ptr64
+?raw_name@type_info@@QEBAPEBDXZ
+; void (__cdecl*__cdecl set_new_handler(void (__cdecl*)(void)))(void)
+; GNU = __Z15set_new_handlerPFvvE
+?set_new_handler@@YAP6AXXZP6AXXZ@Z
+; void (__cdecl*__cdecl set_terminate(void (__cdecl*)(void)))(void)
+; GNU = __Z13set_terminatePFvvE
+?set_terminate@@YAP6AXXZP6AXXZ@Z
+; void (__cdecl*__cdecl set_unexpected(void (__cdecl*)(void)))(void)
+; GNU = __Z14set_unexpectedPFvvE
+?set_unexpected@@YAP6AXXZP6AXXZ@Z
+; void __cdecl terminate(void)
+; GNU = __Z9terminatev
+?terminate@@YAXXZ
+; void __cdecl unexpected(void)
+; GNU = __Z10unexpectedv
+?unexpected@@YAXXZ
+; public: virtual char const * __ptr64 __cdecl exception::what(void)const __ptr64
+?what@exception@@UEBAPEBDXZ
+; List of ARM64 C++ mangled symbols which matches the first ARM64 version of msvcrt.dll (Windows 10 Fall Creators Update)
+; public: __cdecl __non_rtti_object::__non_rtti_object(class __non_rtti_object const &__ptr64 )__ptr64
+??0__non_rtti_object@@QEAA@AEBV0@@Z
+; public: __cdecl __non_rtti_object::__non_rtti_object(char const *__ptr64)__ptr64
+??0__non_rtti_object@@QEAA@PEBD@Z
+; private: __thiscall bad_cast::bad_cast(char const *const *)
+??0bad_cast@@AAE@PBQBD@Z
+; private: __cdecl bad_cast::bad_cast(char const *__ptr64 const *__ptr64)__ptr64
+??0bad_cast@@AEAA@PEBQEBD@Z
+; public: __thiscall bad_cast::bad_cast(char const *const &)
+??0bad_cast@@QAE@ABQBD@Z
+; public: __cdecl bad_cast::bad_cast(char const *__ptr64 const &__ptr64 )__ptr64
+??0bad_cast@@QEAA@AEBQEBD@Z
+; public: __cdecl bad_cast::bad_cast(class bad_cast const &__ptr64 )__ptr64
+??0bad_cast@@QEAA@AEBV0@@Z
+; public: __cdecl bad_cast::bad_cast(char const *__ptr64)__ptr64
+??0bad_cast@@QEAA@PEBD@Z
+; public: __cdecl bad_typeid::bad_typeid(class bad_typeid const &__ptr64 )__ptr64
+??0bad_typeid@@QEAA@AEBV0@@Z
+; public: __cdecl bad_typeid::bad_typeid(char const *__ptr64)__ptr64
+??0bad_typeid@@QEAA@PEBD@Z
+; public: __cdecl exception::exception(char const *__ptr64 const &__ptr64 )__ptr64
+??0exception@@QEAA@AEBQEBD@Z
+; public: __cdecl exception::exception(char const *__ptr64 const &__ptr64 ,int)__ptr64
+??0exception@@QEAA@AEBQEBDH@Z
+; public: __cdecl exception::exception(class exception const &__ptr64 )__ptr64
+??0exception@@QEAA@AEBV0@@Z
+; public: __cdecl exception::exception(void)__ptr64
+??0exception@@QEAA@XZ
+; public: virtual __cdecl __non_rtti_object::~__non_rtti_object(void)__ptr64
+??1__non_rtti_object@@UEAA@XZ
+; public: virtual __cdecl bad_cast::~bad_cast(void)__ptr64
+??1bad_cast@@UEAA@XZ
+; public: virtual __cdecl bad_typeid::~bad_typeid(void)__ptr64
+??1bad_typeid@@UEAA@XZ
+; public: virtual __cdecl exception::~exception(void)__ptr64
+??1exception@@UEAA@XZ
+; public: virtual __cdecl type_info::~type_info(void)__ptr64
+??1type_info@@UEAA@XZ
+; void *__ptr64 __cdecl operator new(unsigned __int64)
+??2@YAPEAX_K@Z
+; void *__ptr64 __cdecl operator new(unsigned __int64,int,char const *__ptr64,int)
+??2@YAPEAX_KHPEBDH@Z
+; void __cdecl operator delete(void *__ptr64)
+??3@YAXPEAX@Z
+; public: class __non_rtti_object &__ptr64 __cdecl __non_rtti_object::operator =(class __non_rtti_object const &__ptr64 )__ptr64
+??4__non_rtti_object@@QEAAAEAV0@AEBV0@@Z
+; public: class bad_cast &__ptr64 __cdecl bad_cast::operator =(class bad_cast const &__ptr64 )__ptr64
+??4bad_cast@@QEAAAEAV0@AEBV0@@Z
+; public: class bad_typeid &__ptr64 __cdecl bad_typeid::operator =(class bad_typeid const &__ptr64 )__ptr64
+??4bad_typeid@@QEAAAEAV0@AEBV0@@Z
+; public: class exception &__ptr64 __cdecl exception::operator =(class exception const &__ptr64 )__ptr64
+??4exception@@QEAAAEAV0@AEBV0@@Z
+; public: int __cdecl type_info::operator ==(class type_info const &__ptr64 )const __ptr64
+??8type_info@@QEBAHAEBV0@@Z
+; public: int __cdecl type_info::operator !=(class type_info const &__ptr64 )const __ptr64
+??9type_info@@QEBAHAEBV0@@Z
+; const __non_rtti_object::$vftable
+??_7__non_rtti_object@@6B@ DATA
+; const bad_cast::$vftable
+??_7bad_cast@@6B@ DATA
+; const bad_typeid::$vftable
+??_7bad_typeid@@6B@ DATA
+; const exception::$vftable
+??_7exception@@6B@ DATA
+; public: void __cdecl bad_cast::__dflt_ctor_closure(void)__ptr64
+??_Fbad_cast@@QEAAXXZ
+; public: void __cdecl bad_typeid::__dflt_ctor_closure(void)__ptr64
+??_Fbad_typeid@@QEAAXXZ
+; void *__ptr64 __cdecl operator new[](unsigned __int64)
+??_U@YAPEAX_K@Z
+; void *__ptr64 __cdecl operator new[](unsigned __int64,int,char const *__ptr64,int)
+??_U@YAPEAX_KHPEBDH@Z
+; void __cdecl operator delete[](void *__ptr64)
+??_V@YAXPEAX@Z
+; int(__cdecl *)(unsigned __int64)__cdecl _query_new_handler(void)
+?_query_new_handler@@YAP6AH_K@ZXZ
+; int(__cdecl *)(unsigned __int64)__cdecl _set_new_handler(int(__cdecl *)(unsigned __int64))
+?_set_new_handler@@YAP6AH_K@ZP6AH0@Z@Z
+; int __cdecl _set_new_mode(int)
+?_set_new_mode@@YAHH@Z
+; void(__cdecl *)(unsigned int,struct _EXCEPTION_POINTERS *__ptr64)__cdecl _set_se_translator(void(__cdecl *)(unsigned int,struct _EXCEPTION_POINTERS *__ptr64))
+?_set_se_translator@@YAP6AXIPEAU_EXCEPTION_POINTERS@@@ZP6AXI0@Z@Z
+; public: int __cdecl type_info::before(class type_info const &__ptr64 )const __ptr64
+?before@type_info@@QEBAHAEBV1@@Z
+; public: char const *__ptr64 __cdecl type_info::name(void)const __ptr64
+?name@type_info@@QEBAPEBDXZ
+; public: char const *__ptr64 __cdecl type_info::raw_name(void)const __ptr64
+?raw_name@type_info@@QEBAPEBDXZ
+; void(__cdecl *)(void)__cdecl set_terminate(void(__cdecl *)(void))
+?set_terminate@@YAP6AXXZP6AXXZ@Z
+; void(__cdecl *)(void)__cdecl set_unexpected(void(__cdecl *)(void))
+?set_unexpected@@YAP6AXXZP6AXXZ@Z
+; void __cdecl terminate(void)
+?terminate@@YAXXZ
+; void __cdecl unexpected(void)
+?unexpected@@YAXXZ
+; public: virtual char const *__ptr64 __cdecl exception::what(void)const __ptr64
+?what@exception@@UEBAPEBDXZ
+; This is list of symbols available in the original Microsoft Visual C++ 4.2 version of msvcrt.dll
+; Same set of symbols are available in Windows NT 4.0 OS system version of msvcrt.dll
+                    ; $I10_OUTPUT is available also in Windows XP x64, but was removed in Windows Vista x64
+_CxxThrowException
+_Getdays
+_Getmonths
+_Gettnames
+_HUGE DATA
+_Strftime
+_XcptFilter
+__CxxFrameHandler
+__RTCastToVoid
+__RTDynamicCast
+__RTtypeid
+__STRINGTOLD
+__argc DATA
+__argv DATA
+__badioinfo DATA
+__crtCompareStringA
+__crtGetLocaleInfoW
+__crtLCMapStringA
+__dllonexit
+__doserrno
+__fpecode
+                                              ; pre-XP i386 msvcrt.dll's __getmainargs is incompatible with mingw-w64's __getmainargs, real __getmainargs provided by emu
+__getmainargs
+__initenv DATA ; arm32 and arm64 __initenv provided by emu
+__isascii
+__iscsym
+__iscsymf
+__lc_codepage DATA
+__lc_handle DATA
+__lconv_init
+__mb_cur_max DATA
+                   ; x64, arm32 and arm64 __p___argc provided by emu
+                   ; x64, arm32 and arm64 __p___argv provided by emu
+                      ; x64, arm32 and arm64 __p___initenv provided by emu
+                         ; x64, arm32 and arm64 __p___mb_cur_max provided by emu
+                    ; x64, arm32 and arm64 __p___wargv provided by emu
+                       ; x64, arm32 and arm64 __p___winitenv provided by emu
+                    ; x64, arm32 and arm64 __p__acmdln provided by emu
+                     ; x64, arm32 and arm64 __p__commode provided by emu
+                                                   ; arm32 and arm64 __p__daylight provided by alias and x64 __p__daylight provided by emu
+                                                 ; arm32 and arm64 __p__dstbias provided by alias and x64 __p__dstbias provided by emu
+                     ; x64 __p__environ provided by emu
+                   ; x64, arm32 and arm64 __p__fmode provided by emu
+__p__iob == __iob_func ; x64, arm32 and arm64 __p__iob provided by alias
+                     ; x64, arm32 and arm64 __p__mbctype provided by emu
+                   ; x64, arm32 and arm64 __p__osver provided by emu
+                    ; x64, arm32 and arm64 __p__pctype provided by emu
+                    ; x64, arm32 and arm64 __p__pgmptr provided by emu
+                     ; x64, arm32 and arm64 __p__pwctype provided by emu
+                      ; x64, arm32 and arm64 __p__timezone provided by emu
+                    ; x64, arm32 and arm64 __p__tzname provided by emu
+                    ; x64, arm32 and arm64 __p__wcmdln provided by emu
+                      ; x64 __p__wenviron provided by emu
+                      ; x64, arm32 and arm64 __p__winmajor provided by emu
+                      ; x64, arm32 and arm64 __p__winminor provided by emu
+                    ; x64, arm32 and arm64 __p__winver provided by emu
+                     ; x64, arm32 and arm64 __p__wpgmptr provided by emu
+__pioinfo DATA
+__pxcptinfoptrs
+__set_app_type
+__setlc_active DATA
+__setusermatherr
+__threadhandle
+__threadid
+__toascii
+__unDName
+__unguarded_readlc_active DATA
+__wargv DATA
+                                                ; pre-XP i386 msvcrt.dll's __wgetmainargs is incompatible with mingw-w64's __wgetmainargs, real __wgetmainargs provided by emu
+__wgetmainargs
+__winitenv DATA ; arm32 and arm64 __winitenv provided by emu
+_access
+_acmdln DATA
+                       ; msvc symbol is without decoration but callee pop stack (like stdcall @4)
+                      ; msvc symbol is without decoration but callee pop stack (like stdcall @4)
+                       ; msvc symbol is without decoration but callee pop stack (like stdcall @4)
+                      ; msvc symbol is without decoration but callee pop stack (like stdcall @8)
+                        ; msvc symbol is without decoration but callee pop stack (like stdcall @4)
+                       ; msvc symbol is without decoration but callee pop stack (like stdcall @4)
+                        ; msvc symbol is without decoration but callee pop stack (like stdcall @4)
+                       ; msvc symbol is without decoration but callee pop stack (like stdcall @8)
+_aexit_rtn DATA
+_amsg_exit
+__msvcrt_assert DATA == _assert ; mingw-w64 provides _assert() function as wrapper around renamed __msvcrt_assert symbol
+_atodbl
+_atoi64
+_atoldbl
+_beep
+_beginthread
+_beginthreadex
+_c_exit
+_cabs DATA
+_callnewh
+_cexit
+_cgets
+_chdir
+_chdrive
+_chgsign
+_chmod
+_chsize
+_clearfp
+_close
+_commit
+_commode DATA
+_control87
+_controlfp
+_copysign
+_cprintf
+_cputs
+_creat
+_cscanf
+_ctype DATA
+_cwait
+_daylight DATA
+_dstbias DATA
+_dup
+_dup2
+_ecvt
+_endthread
+_endthreadex
+_environ DATA
+_eof
+_errno
+_execl
+_execle
+_execlp
+_execlpe
+_execv
+_execve
+_execvp
+_execvpe
+_exit
+_expand
+_fcloseall
+_fcvt
+_fdopen
+_fgetchar
+_fgetwchar
+_filbuf
+_fileinfo DATA
+_filelength
+_filelengthi64
+_fileno
+_findclose
+_findfirst
+_findfirsti64
+_findnext
+_findnexti64
+_finite
+_flsbuf
+_flushall
+_fmode DATA
+_fpclass
+_fpreset
+_fputchar
+_fputwchar
+_fsopen
+_fstat
+_fstati64
+_ftime
+_fullpath
+_futime
+_gcvt
+_get_osfhandle
+_get_sbh_threshold
+_getch
+_getche
+_getcwd
+_getdcwd
+_getdiskfree
+                        ; _getdllprocaddr is available also in Windows XP x64, but was removed in Windows Vista x64
+_getdrive
+_getdrives
+_getmaxstdio
+_getmbcp
+_getpid
+_getsystime
+_getw
+_getws
+                 ; _heapadd is available also in Windows XP x64, but was removed in Windows Vista x64
+_heapchk
+_heapmin
+_heapset
+                  ; _heapused is available also in Windows XP x64, but was removed in Windows Vista x64
+_heapwalk
+_hypot
+_i64toa
+_i64tow
+_initterm
+_iob DATA
+_isatty
+_isctype
+_ismbbalnum
+_ismbbalpha
+_ismbbgraph
+_ismbbkalnum
+_ismbbkana
+_ismbbkprint
+_ismbbkpunct
+_ismbblead
+_ismbbprint
+_ismbbpunct
+_ismbbtrail
+_ismbcalnum
+_ismbcalpha
+_ismbcdigit
+_ismbcgraph
+_ismbchira
+_ismbckata
+_ismbcl0
+_ismbcl1
+_ismbcl2
+_ismbclegal
+_ismbclower
+_ismbcprint
+_ismbcpunct
+_ismbcspace
+_ismbcsymbol
+_ismbcupper
+_ismbslead
+_ismbstrail
+_isnan
+_itoa
+_itow
+_j0
+_j1
+_jn
+_kbhit
+_lfind
+                 ; _loaddll is available also in Windows XP x64, but was removed in Windows Vista x64
+_lock
+_locking
+_logb
+_lrotl
+_lrotr
+_lsearch
+_lseek
+_lseeki64
+_ltoa
+_ltow
+_makepath
+_mbbtombc
+_mbbtype
+_mbccpy
+_mbcjistojms
+_mbcjmstojis
+_mbclen
+_mbctohira
+_mbctokata
+_mbctolower
+_mbctombb
+_mbctoupper
+_mbctype DATA
+_mbsbtype
+_mbscat
+_mbschr
+_mbscmp
+_mbscoll
+_mbscpy
+_mbscspn
+_mbsdec
+_mbsdup
+_mbsicmp
+_mbsicoll
+_mbsinc
+_mbslen
+_mbslwr
+_mbsnbcat
+_mbsnbcmp
+_mbsnbcnt
+_mbsnbcoll
+_mbsnbcpy
+_mbsnbicmp
+_mbsnbicoll
+_mbsnbset
+_mbsncat
+_mbsnccnt
+_mbsncmp
+_mbsncoll
+_mbsncpy
+_mbsnextc
+_mbsnicmp
+_mbsnicoll
+_mbsninc
+_mbsnset
+_mbspbrk
+_mbsrchr
+_mbsrev
+_mbsset
+_mbsspn
+_mbsspnp
+_mbsstr
+_mbstok
+_mbstrlen
+_mbsupr
+_memccpy
+_memicmp
+_mkdir
+_mktemp
+_msize
+_nextafter
+; _onexit replaced by emu, CRT _onexit does not work for DLL builds
+_open
+_open_osfhandle
+_osver DATA
+_pclose
+_pctype DATA
+_pgmptr DATA
+_pipe
+_popen
+_purecall
+_putch
+_putenv
+_putw
+_putws
+_pwctype DATA
+_read
+_rmdir
+_rmtmp
+_rotl
+_rotr
+_scalb
+_searchenv
+_set_error_mode
+_set_sbh_threshold
+_seterrormode
+_setjmp
+_setmaxstdio
+_setmbcp
+_setmode
+_setsystime
+_sleep
+_snprintf
+_snwprintf
+_sopen
+_spawnl
+_spawnle
+_spawnlp
+_spawnlpe
+_spawnv
+_spawnve
+_spawnvp
+_spawnvpe
+_splitpath
+_stat
+_stati64
+_statusfp
+_strcmpi
+_strdate
+_strdup
+_strerror
+_stricmp
+_stricoll
+_strlwr
+_strncoll
+_strnicmp
+_strnicoll
+_strnset
+_strrev
+_strset
+_strtime
+_strupr
+_swab
+_sys_errlist DATA
+_sys_nerr DATA
+_tell
+_telli64
+_tempnam
+_timezone DATA
+_tolower
+_toupper
+_tzname DATA
+_tzset
+_ui64toa
+_ui64tow
+_ultoa
+_ultow
+_umask
+_ungetch
+_unlink
+                   ; _unloaddll is available also in Windows XP x64, but was removed in Windows Vista x64
+_unlock
+_utime
+_vsnprintf
+_vsnwprintf
+_waccess
+_wasctime
+_wchdir
+_wchmod
+_wcmdln DATA
+_wcreat
+_wcsdup
+_wcsicmp
+_wcsicoll
+_wcslwr
+_wcsncoll
+_wcsnicmp
+_wcsnicoll
+_wcsnset
+_wcsrev
+_wcsset
+_wcsupr
+_wctime
+_wenviron DATA
+_wexecl
+_wexecle
+_wexeclp
+_wexeclpe
+_wexecv
+_wexecve
+_wexecvp
+_wexecvpe
+_wfdopen
+_wfindfirst
+_wfindfirsti64
+_wfindnext
+_wfindnexti64
+_wfopen
+_wfreopen
+_wfsopen
+_wfullpath
+_wgetcwd
+_wgetdcwd
+_wgetenv
+_winmajor DATA
+_winminor DATA
+_winver DATA
+_wmakepath
+_wmkdir
+_wmktemp
+_wopen
+_wperror
+_wpgmptr DATA
+_wpopen
+_wputenv
+_wremove
+_wrename
+_write
+_wrmdir
+_wsearchenv
+_wsetlocale
+_wsopen
+_wspawnl
+_wspawnle
+_wspawnlp
+_wspawnlpe
+_wspawnv
+_wspawnve
+_wspawnvp
+_wspawnvpe
+_wsplitpath
+_wstat
+_wstati64
+_wstrdate
+_wstrtime
+_wsystem
+_wtempnam
+_wtmpnam
+_wtoi
+_wtoi64
+_wtol
+_wunlink
+_wutime
+_y0
+_y1
+_yn
+abort
+abs
+acos
+asctime
+asin
+atan
+atan2 DATA
+_crt_atexit == atexit ; rename atexit to _crt_atexit for compatibility with UCRT, real atexit function provided by mingw-w64
+atof
+atoi
+atol
+bsearch
+calloc
+ceil DATA
+clearerr
+clock
+cos DATA
+cosh
+ctime
+difftime
+div
+exit
+exp DATA
+fabs DATA
+fclose
+feof
+ferror
+fflush
+fgetc
+fgetpos
+fgets
+fgetwc
+fgetws
+floor DATA
+fmod DATA
+fopen
+fprintf
+fputc
+fputs
+fputwc
+fputws
+fread
+free
+freopen
+frexp DATA
+fscanf
+fseek
+fsetpos
+ftell
+fwprintf
+fwrite
+fwscanf
+getc
+getchar
+getenv
+gets
+getwc
+getwchar
+gmtime
+is_wctype
+isalnum
+isalpha
+iscntrl
+isdigit
+isgraph
+isleadbyte
+islower
+; isprint ; replaced by emu, CRT version mishandles TAB character
+ispunct
+isspace
+isupper
+iswalnum
+iswalpha
+iswascii
+iswcntrl
+__msvcrt_iswctype DATA == iswctype; mingw-w64 provides real iswctype as a wrapper around renamed __msvcrt_iswctype
+iswdigit
+iswgraph
+iswlower
+; iswprint ; replaced by emu, CRT version mishandles TAB character
+iswpunct
+iswspace
+iswupper
+iswxdigit
+isxdigit
+labs
+ldexp DATA
+ldiv
+localeconv
+localtime
+log DATA
+log10
+longjmp
+malloc
+mblen
+mbstowcs
+mbtowc
+memchr
+memcmp
+memcpy
+memmove
+memset
+mktime
+modf DATA
+perror
+pow DATA
+printf
+putc
+putchar
+puts
+putwc
+putwchar
+qsort
+raise
+rand
+realloc
+remove
+rename
+rewind
+scanf
+setbuf
+setlocale
+setvbuf
+signal
+sin DATA
+sinh ; if we implement sinh, we can set it DATA only.
+sprintf
+sqrt DATA
+srand
+sscanf
+strcat
+strchr
+strcmp
+strcoll
+strcpy
+strcspn
+strerror
+strftime
+strlen
+strncat
+strncmp
+strncpy
+strpbrk
+strrchr
+strspn
+strstr
+strtod
+strtok
+strtol
+strtoul
+strxfrm
+_swprintf == swprintf ; rename i386 and x64 swprintf to _swprintf (ARM already provided _swprintf) for compatibility with msvcr80+, real C95+ compatible swprintf provided by mingw-w64
+swscanf
+system
+tan
+tanh ; if we implement tanh, we can set it to DATA only.
+time
+; tmpfile replaced by emu, CRT version may not use writable temporary directory
+tmpnam
+tolower
+toupper
+towlower
+towupper
+ungetc
+ungetwc
+vfprintf
+vfwprintf
+vprintf
+vsprintf
+_vswprintf == vswprintf ; rename i386 and x64 vswprintf to _vswprintf (ARM already provided _vswprintf) for compatibility with msvcr80+, real C95+ compatible vswprintf provided by mingw-w64
+vwprintf
+wcscat
+wcschr
+wcscmp
+wcscoll
+wcscpy
+wcscspn
+wcsftime
+wcslen
+wcsncat
+wcsncmp
+wcsncpy
+wcspbrk
+wcsrchr
+wcsspn
+wcsstr
+wcstod
+_wcstok == wcstok ; provide nonstandard function "wcstok" in the DLL, under the name "_wcstok" to match UCRT, the C95+ compatible "wcstok" is provided by mingw-w64 or by wcstok_s alias
+wcstol
+wcstombs
+wcstoul
+wcsxfrm
+wctomb
+wprintf
+wscanf
+; These symbols were added in Microsoft Visual C++ 5.0 SP1 and Windows 98 First Edition OS system versions of msvcrt.dll
+; They are not available in Microsoft Visual C++ 4.2, nor in 5.0 and neither in Windows NT 4.0 OS system version
+                       ; x64, arm32 and arm64 __p__mbcasemap provided by emu
+_mbcasemap DATA
+; These symbols were added in Microsoft Visual C++ 6.0 and Windows 98 Second Edition OS system versions of msvcrt.dll
+__lc_collate_cp DATA
+__unDNameEx
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; This is end of the list of symbols available in the original Microsoft Visual C++ versions of msvcrt.dll ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; These symbols were added in Windows ME and Windows 2000 OS system versions of msvcrt.dll
+_ctime64 ; i386 _ctime64 replaced by emu
+_findfirst64 ; i386 _findfirst64 replaced by emu
+_findnext64 ; i386 _findnext64 replaced by emu
+_fstat64 ; i386 _fstat64 replaced by emu
+_ftime64 ; i386 _ftime64 replaced by emu
+_futime64 ; i386 _futime64 replaced by emu
+_gmtime64 ; i386 _gmtime64 replaced by emu
+_localtime64 ; i386 _localtime64 replaced by emu
+_mktime64 ; i386 _mktime64 replaced by emu
+_osplatform DATA
+_stat64 ; i386 _stat64 replaced by emu
+_time64 ; i386 _time64 replaced by emu
+_utime64 ; i386 _utime64 replaced by emu
+_wctime64 ; i386 _wctime64 replaced by emu
+_wfindfirst64 ; i386 _wfindfirst64 replaced by emu
+_wfindnext64 ; i386 _wfindnext64 replaced by emu
+_wstat64 ; i386 _wstat64 replaced by emu
+_wutime64 ; i386 _wutime64 replaced by emu
+; These symbols were added in Windows 2000 SP4 OS system version of msvcrt.dll
+_get_heap_handle ; _get_heap_handle is not available in Windows XP and Windows XP SP1 OS system versions of msvcrt.dll, but is in XP SP2 and SP3
+; These symbols were added in Windows XP OS system version of msvcrt.dll
+__uncaught_exception
+__DestructExceptionObject
+___lc_codepage_func ; i386 ___lc_codepage_func replaced by emu
+___lc_handle_func ; i386 ___lc_handle_func replaced by emu
+___mb_cur_max_func ; i386 ___mb_cur_max_func replaced by emu
+___setlc_active_func
+___unguarded_readlc_active_add_func
+__crtCompareStringW
+__crtGetStringTypeW
+__crtLCMapStringW
+__iob_func ; i386 __iob_func replaced by alias
+__pctype_func ; i386 __pctype_func replaced by emu
+__wcserror
+_aligned_free ; i386 _aligned_free replaced by emu
+_aligned_malloc ; i386 _aligned_malloc replaced by emu
+_aligned_offset_malloc ; i386 _aligned_offset_malloc replaced by emu
+_aligned_offset_realloc ; i386 _aligned_offset_realloc replaced by emu
+_aligned_realloc ; i386 _aligned_realloc replaced by emu
+_cgetws
+_cputws
+_cwprintf
+_cwscanf
+_getwch
+_getwche
+_putwch
+_resetstkoflw
+_scprintf ; i386 _scprintf replaced by emu
+_scwprintf ; i386 _scwprintf replaced by emu
+_snscanf
+_snwscanf
+_strtoi64 ; i386 _strtoi64 replaced by emu
+_strtoui64 ; i386 _strtoui64 replaced by emu
+_ungetwch
+_vscprintf ; i386 _vscprintf replaced by emu
+_vscwprintf ; i386 _vscwprintf replaced by emu
+_wcserror
+_wcstoi64 ; i386 _wcstoi64 replaced by emu
+_wcstoui64 ; i386 _wcstoui64 replaced by emu
+_wtof
+; These symbols were added in Windows Server 2003 OS system version of msvcrt.dll
+; They are not available in 32-bit Windows XP but are available in 32-bit Windows Vista
+__CxxFrameHandler2
+___lc_collate_cp_func
+__pwctype_func ; i386 __pwctype_func replaced by emu
+_abs64 ; i386 _abs64 replaced by emu
+_mkgmtime ; i386 _mkgmtime replaced by emu
+_mkgmtime64 ; i386 _mkgmtime64 replaced by emu
+_rotl64 ; i386 _rotl64 replaced by emu
+_rotr64 ; i386 _rotr64 replaced by emu
+_wctype DATA
+; These symbols were added in Windows Server 2003 SP1 and Windows XP x64 OS system version of msvcrt.dll
+; This is the first X64 version of msvcrt.dll, all symbols in this section and also above this section are present in all X64 versions of msvcrt.dll
+__C_specific_handler
+__CppXcptFilter
+_chgsignf
+_copysignf
+_finitef
+_fpclassf
+_hypotf
+_isnanf
+_local_unwind
+_logbf
+_nextafterf
+_scalbf
+_setjmpex
+acosf DATA ; i386 acosf provided by emu
+asinf DATA ; i386 asinf provided by emu
+atan2f DATA ; i386 atan2f provided by emu
+atanf DATA ; i386 atanf provided by emu
+ceilf DATA ; i386 ceilf provided by emu
+cosf DATA ; i386 cosf provided by emu
+coshf DATA ; i386 coshf provided by emu
+expf DATA ; i386 expf provided by emu
+floorf DATA ; i386 floorf provided by emu
+fmodf DATA ; i386 fmodf provided by emu
+log10f DATA ; i386 log10f provided by emu
+logf DATA ; i386 logf provided by emu
+modff DATA ; i386 modff provided by emu
+powf DATA ; i386 powf provided by emu
+setjmp
+sinf DATA ; i386 sinf provided by emu
+sinhf DATA ; i386 sinhf provided by emu
+sqrtf DATA ; i386 sqrtf provided by emu
+tanf DATA ; i386 tanf provided by emu
+; These symbols were added in Windows Vista OS system version of msvcrt.dll
+; private: __thiscall bad_cast::bad_cast(char const *const *)
+??0bad_cast@@AAE@PBQBD@Z
+; public: __thiscall bad_cast::bad_cast(char const *const &)
+??0bad_cast@@QAE@ABQBD@Z
+; void *__ptr64 __cdecl operator new(unsigned __int64,int,char const *__ptr64,int)
+??2@YAPEAX_KHPEBDH@Z
+; void *__ptr64 __cdecl operator new[](unsigned __int64,int,char const *__ptr64,int)
+??_U@YAPEAX_KHPEBDH@Z
+_CrtCheckMemory
+_CrtDbgBreak
+_CrtDbgReport
+_CrtDbgReportV
+_CrtDbgReportW
+_CrtDbgReportWV
+_CrtDoForAllClientObjects
+_CrtDumpMemoryLeaks
+_CrtIsMemoryBlock
+_CrtIsValidHeapPointer
+_CrtIsValidPointer
+_CrtMemCheckpoint
+_CrtMemDifference
+_CrtMemDumpAllObjectsSince
+_CrtMemDumpStatistics
+_CrtReportBlockType
+_CrtSetAllocHook
+_CrtSetBreakAlloc
+_CrtSetDbgBlockType
+_CrtSetDbgFlag
+_CrtSetDumpClient
+_CrtSetReportFile
+_CrtSetReportHook
+_CrtSetReportHook2
+_CrtSetReportMode
+__CxxFrameHandler3
+                      ; i386 __daylight replaced by alias and x64 __daylight replaced by emu
+                     ; i386 __dstbias replaced by alias and x64 __dstbias replaced by emu
+__strncnt
+__wcserror_s
+__wcsncnt
+                     ; i386 and x64 _access_s replaced by emu
+_aligned_free_dbg
+_aligned_malloc_dbg
+_aligned_offset_malloc_dbg
+_aligned_offset_realloc_dbg
+_aligned_realloc_dbg
+_atodbl_l
+_atof_l
+_atoflt_l
+_atoi64_l
+_atoi_l
+_atol_l
+_atoldbl_l
+_calloc_dbg
+                    ; i386 and x64 _cgets_s replaced by emu
+                     ; i386 and x64 _cgetws_s replaced by emu
+                     ; i386 and x64 _chsize_s replaced by emu
+_chvalidator
+_chvalidator_l
+                        ; i386 and x64 _controlfp_s replaced by emu
+_cprintf_l
+_cprintf_p
+_cprintf_p_l
+                      ; i386 and x64 _cprintf_s replaced by emu
+                        ; i386 and x64 _cprintf_s_l replaced by emu
+_crtAssertBusy
+_crtBreakAlloc
+_crtDbgFlag
+_cscanf_l
+_cscanf_s
+_cscanf_s_l
+_ctime32 ; i386 _ctime32 replaced by alias
+                      ; i386 and x64 _ctime32_s replaced by emu
+                      ; i386 and x64 _ctime64_s replaced by emu
+_cwprintf_l
+_cwprintf_p
+_cwprintf_p_l
+                       ; i386 and x64 _cwprintf_s replaced by emu
+                         ; i386 and x64 _cwprintf_s_l replaced by emu
+_cwscanf_l
+_cwscanf_s
+_cwscanf_s_l
+_difftime32 ; i386 _difftime32 replaced by alias
+_difftime64 == difftime ; i386 _difftime64 replaced by emu and x64 _difftime64 replaced by alias
+_ecvt_s
+_expand_dbg
+_fcvt_s
+_fprintf_l
+_fprintf_p
+_fprintf_p_l
+_fprintf_s_l
+_free_dbg
+_freea
+_freea_s
+_fscanf_l
+_fscanf_s_l
+                     ; i386 and x64 _fseeki64 replaced by emu
+_ftime32 ; i386 _ftime32 replaced by alias
+_ftime32_s
+_ftime64_s
+_fullpath_dbg
+_futime32 ; i386 _futime32 replaced by alias
+_fwprintf_l
+_fwprintf_p
+_fwprintf_p_l
+_fwprintf_s_l
+_fwscanf_l
+_fwscanf_s_l
+_gcvt_s
+                         ; i386 and x64 _get_doserrno replaced by emu
+_get_environ
+                      ; i386 and x64 _get_errno replaced by emu
+_get_fileinfo
+                      ; i386 and x64 _get_fmode replaced by emu
+_get_osplatform
+_get_osver
+                              ; i386 and x64 _get_output_format replaced by emu
+; _get_pgmptr ; i386 and x64 _get_pgmptr replaced by emu, arm32 and arm64 provided by emu
+_get_wenviron
+_get_winmajor
+_get_winminor
+_get_winver
+; _get_wpgmptr ; i386 and x64 _get_wpgmptr replaced by emu, arm32 and arm64 provided by emu
+_gmtime32 ; i386 _gmtime32 replaced by alias
+                       ; i386 and x64 _gmtime32_s replaced by emu
+                       ; i386 and x64 _gmtime64_s replaced by emu
+_i64toa_s
+_i64tow_s
+                       ; i386 and x64 _initterm_e replaced by emu
+; _invalid_parameter replaced by emu, msvcrt.dll's _invalid_parameter is not compatible with msvcr80+/UCRT
+_isalnum_l
+_isalpha_l
+_iscntrl_l
+_isctype_l
+_isdigit_l
+_isgraph_l
+_isleadbyte_l
+_islower_l
+_ismbbalnum_l
+_ismbbalpha_l
+_ismbbgraph_l
+_ismbbkalnum_l
+_ismbbkana_l
+_ismbbkprint_l
+_ismbbkpunct_l
+_ismbblead_l
+_ismbbprint_l
+_ismbbpunct_l
+_ismbbtrail_l
+_ismbcalnum_l
+_ismbcalpha_l
+_ismbcdigit_l
+_ismbcgraph_l
+_ismbchira_l
+_ismbckata_l
+_ismbcl0_l
+_ismbcl1_l
+_ismbcl2_l
+_ismbclegal_l
+_ismbclower_l
+_ismbcprint_l
+_ismbcpunct_l
+_ismbcspace_l
+_ismbcsymbol_l
+_ismbcupper_l
+_ismbslead_l
+_ismbstrail_l
+_isprint_l
+_isspace_l
+_isupper_l
+_iswalnum_l
+_iswalpha_l
+_iswcntrl_l
+_iswctype_l
+_iswdigit_l
+_iswgraph_l
+_iswlower_l
+_iswprint_l
+_iswpunct_l
+_iswspace_l
+_iswupper_l
+_iswxdigit_l
+_isxdigit_l
+_itoa_s
+_itow_s
+_lfind_s
+_localtime32 ; i386 _localtime32 replaced by alias
+                          ; i386 and x64 _localtime32_s replaced by emu
+                          ; i386 and x64 _localtime64_s replaced by emu
+_lsearch_s
+_ltoa_s
+_ltow_s
+_makepath_s
+_malloc_dbg
+_mbbtombc_l
+_mbccpy_l
+_mbccpy_s
+_mbccpy_s_l
+_mbcjistojms_l
+_mbcjmstojis_l
+_mbclen_l
+_mbctohira_l
+_mbctokata_l
+_mbctolower_l
+_mbctombb_l
+_mbctoupper_l
+_mblen_l
+_mbsbtype_l
+_mbscat_s
+_mbscat_s_l
+_mbschr_l
+_mbscmp_l
+_mbscoll_l
+_mbscpy_s
+_mbscpy_s_l
+_mbscspn_l
+_mbsdec_l
+_mbsicmp_l
+_mbsicoll_l
+_mbsinc_l
+_mbslen_l
+_mbslwr_l
+_mbslwr_s
+_mbslwr_s_l
+_mbsnbcat_l
+_mbsnbcat_s
+_mbsnbcat_s_l
+_mbsnbcmp_l
+_mbsnbcnt_l
+_mbsnbcoll_l
+_mbsnbcpy_l
+_mbsnbcpy_s
+_mbsnbcpy_s_l
+_mbsnbicmp_l
+_mbsnbicoll_l
+_mbsnbset_l
+_mbsnbset_s
+_mbsnbset_s_l
+_mbsncat_l
+_mbsncat_s
+_mbsncat_s_l
+_mbsnccnt_l
+_mbsncmp_l
+_mbsncoll_l
+_mbsncpy_l
+_mbsncpy_s
+_mbsncpy_s_l
+_mbsnextc_l
+_mbsnicmp_l
+_mbsnicoll_l
+_mbsninc_l
+_mbsnlen_l
+_mbsnset_l
+_mbsnset_s
+_mbsnset_s_l
+_mbspbrk_l
+_mbsrchr_l
+_mbsrev_l
+_mbsset_l
+_mbsset_s
+_mbsset_s_l
+_mbsspn_l
+_mbsspnp_l
+_mbsstr_l
+_mbstok_l
+_mbstok_s
+_mbstok_s_l
+_mbstowcs_l
+_mbstowcs_s_l
+_mbstrlen_l
+_mbstrnlen_l
+_mbsupr_l
+_mbsupr_s
+_mbsupr_s_l
+_mbtowc_l
+_mbsnlen
+_mbstrnlen
+_memicmp_l
+                       ; i386 and x64 _mkgmtime32 replaced by emu
+                     ; i386 and x64 _mktemp_s replaced by emu
+_mktime32 ; i386 _mktime32 replaced by alias
+_msize_dbg
+_printf_l
+_printf_p
+_printf_p_l
+_printf_s_l
+_putenv_s
+_realloc_dbg
+_scanf_l
+_scanf_s_l
+_scprintf_l
+_scprintf_p_l
+_scwprintf_l
+_scwprintf_p_l
+_searchenv_s
+_set_controlfp
+                         ; i386 and x64 _set_doserrno replaced by emu
+                      ; i386 and x64 _set_errno replaced by emu
+_set_fileinfo
+                      ; i386 and x64 _set_fmode replaced by emu
+                              ; i386 and x64 _set_output_format replaced by emu
+_snprintf_c
+_snprintf_c_l
+_snprintf_l
+_snprintf_s
+_snprintf_s_l
+_snscanf_l
+_snscanf_s
+_snscanf_s_l
+_snwprintf_l
+_snwprintf_s
+_snwprintf_s_l
+_snwscanf_l
+_snwscanf_s
+_snwscanf_s_l
+                    ; i386 and x64 _sopen_s replaced by emu
+_splitpath_s
+_sprintf_l
+_sprintf_p_l
+_sprintf_s_l
+_sscanf_l
+_sscanf_s_l
+_strcoll_l
+                      ; i386 and x64 _strdate_s replaced by emu
+_strdup_dbg
+_strerror_s
+_stricmp_l
+_stricoll_l
+_strlwr_l
+_strlwr_s
+_strlwr_s_l
+_strncoll_l
+_strnicmp_l
+_strnicoll_l
+_strnset_s
+_strset_s
+                      ; i386 and x64 _strtime_s replaced by emu
+_strtod_l
+_strtoi64_l
+_strtol_l
+_strtoui64_l
+_strtoul_l
+_strupr_l
+_strupr_s
+_strupr_s_l
+_strxfrm_l
+                     ; i386 and x64 _swprintf replaced by renamed swprintf symbol
+_swprintf_c
+_swprintf_c_l
+_swprintf_p_l
+_swprintf_s_l
+_swscanf_l
+_swscanf_s_l
+_tempnam_dbg
+_time32 ; i386 _time32 replaced by alias
+_tolower_l
+_toupper_l
+_towlower_l
+_towupper_l
+_ui64toa_s
+_ui64tow_s
+_ultoa_s
+_ultow_s
+                    ; i386 and x64 _umask_s replaced by emu
+_utime32 ; i386 _utime32 replaced by alias
+_vcprintf
+_vcprintf_l
+_vcprintf_p
+_vcprintf_p_l
+                       ; i386 and x64 _vcprintf_s replaced by emu
+                         ; i386 and x64 _vcprintf_s_l replaced by emu
+_vcwprintf
+_vcwprintf_l
+_vcwprintf_p
+_vcwprintf_p_l
+                        ; i386 and x64 _vcwprintf_s replaced by emu
+                          ; i386 and x64 _vcwprintf_s_l replaced by emu
+_vfprintf_l
+_vfprintf_p
+_vfprintf_p_l
+_vfprintf_s_l
+_vfwprintf_l
+_vfwprintf_p
+_vfwprintf_p_l
+_vfwprintf_s_l
+_vprintf_l
+_vprintf_p
+_vprintf_p_l
+_vprintf_s_l
+_vscprintf_l
+_vscprintf_p_l
+_vscwprintf_l
+_vscwprintf_p_l
+_vsnprintf_c
+_vsnprintf_c_l
+_vsnprintf_l
+_vsnprintf_s
+_vsnprintf_s_l
+_vsnwprintf_l
+_vsnwprintf_s
+_vsnwprintf_s_l
+_vsprintf_l
+_vsprintf_p
+_vsprintf_p_l
+_vsprintf_s_l
+                      ; i386 and x64 _vswprintf replaced by renamed vswprintf symbol
+_vswprintf_c
+_vswprintf_c_l
+_vswprintf_l
+_vswprintf_p_l
+_vswprintf_s_l
+_vwprintf_l
+_vwprintf_p
+_vwprintf_p_l
+_vwprintf_s_l
+                      ; i386 and x64 _waccess_s replaced by emu
+                       ; i386 and x64 _wasctime_s replaced by emu
+                    ; i386 and x64 _wassert replaced by emu
+_wcscoll_l
+_wcsdup_dbg
+_wcserror_s
+_wcsftime_l
+_wcsicmp_l
+_wcsicoll_l
+_wcslwr_l
+_wcslwr_s
+_wcslwr_s_l
+_wcsncoll_l
+_wcsnicmp_l
+_wcsnicoll_l
+_wcsnset_s
+_wcsset_s
+_wcstoi64_l
+_wcstol_l
+_wcstombs_l
+_wcstombs_s_l
+_wcstoui64_l
+_wcstoul_l
+_wcsupr_l
+_wcsupr_s
+_wcsupr_s_l
+_wcsxfrm_l
+_wctime32 ; i386 _wctime32 replaced by alias
+                       ; i386 and x64 _wctime32_s replaced by emu
+                       ; i386 and x64 _wctime64_s replaced by emu
+_wctomb_l
+_wctomb_s_l
+_wfopen_s
+_wfreopen_s
+_wfullpath_dbg
+_wgetenv_s
+_winput_s
+_wmakepath_s
+                      ; i386 and x64 _wmktemp_s replaced by emu
+_woutput_s
+_wprintf_l
+_wprintf_p
+_wprintf_p_l
+_wprintf_s_l
+_wputenv_s
+_wscanf_l
+_wscanf_s_l
+_wsearchenv_s
+_wsopen_s
+_wsplitpath_s
+                       ; i386 and x64 _wstrdate_s replaced by emu
+                       ; i386 and x64 _wstrtime_s replaced by emu
+_wtempnam_dbg
+_wtmpnam_s
+_wtof_l
+_wtoi64_l
+_wtoi_l
+_wtol_l
+_wutime32 ; i386 _wutime32 replaced by alias
+                     ; i386 and x64 asctime_s replaced by emu
+bsearch_s
+; btowc replaced by emu for consistency with wctob
+clearerr_s
+fopen_s
+fprintf_s
+freopen_s
+fscanf_s
+fwprintf_s
+fwscanf_s
+                    ; i386 and x64 getenv_s replaced by emu
+; mbrlen replaced by emu, CRT version does not conform to C95
+; mbrtowc replaced by emu, CRT version does not conform to C95
+mbsdup_dbg
+; mbsrtowcs replaced by emu, CRT version does not conform to C95
+mbsrtowcs_s
+mbstowcs_s
+                    ; i386 and x64 memcpy_s replaced by emu
+                     ; i386 and x64 memmove_s replaced by emu
+printf_s
+qsort_s
+                  ; i386 and x64 rand_s replaced by emu
+scanf_s
+                     ; i386 and x64 sprintf_s replaced by emu
+sscanf_s
+strcat_s
+strcpy_s
+                      ; i386 and x64 strerror_s replaced by emu
+strncat_s
+strncpy_s
+                   ; i386 and x64 strnlen replaced by emu
+strtok_s
+swprintf_s
+swscanf_s
+                 ; i386 tanhf provided by emu and x64 tanhf replaced by emu
+tmpfile_s
+tmpnam_s
+                 ; i386 and x64 utime replaced by alias in crt-aliases.def.in
+vfprintf_s
+vfwprintf_s
+vprintf_s
+; vsnprintf replaced by emu, in msvcrt.dll it is alias to _vsnprintf, which is not C99 compatible
+                      ; i386 and x64 vsprintf_s replaced by emu
+vswprintf_s
+vwprintf_s
+; wcrtomb replaced by emu, CRT version does not report invalid conversion state
+wcrtomb_s
+wcscat_s
+wcscpy_s
+wcsncat_s
+wcsncpy_s
+                   ; i386 and x64 wcsnlen replaced by emu
+; wcsrtombs replaced by emu, CRT version does not report invalid conversion state
+wcsrtombs_s
+__msvcrt_wcstok_s == wcstok_s ; wcstok_s replaced by emu, it does not call exception handler for invalid arguments
+wcstombs_s
+; wctob replaced by emu, CRT version may sign-extend its return value
+wctomb_s
+wprintf_s
+wscanf_s
+; These symbols were added in Windows 8 OS system version of msvcrt.dll
+; This is the first ARM32 version of msvcrt.dll, all symbols in this section and also above this section are present in all ARM32 versions of msvcrt.dll
+                          ; i386 and x64 _create_locale replaced by emu
+                        ; i386 and x64 _free_locale replaced by emu
+                               ; i386 and x64 _get_current_locale replaced by emu
+_wcstod_l
+                    ; i386 and x64 fabsf provided by emu
+; These symbols were added in Windows 8.1 OS system version of msvcrt.dll
+__ExceptionPtrAssign
+__ExceptionPtrCompare
+__ExceptionPtrCopy
+__ExceptionPtrCopyException
+__ExceptionPtrCreate
+__ExceptionPtrCurrentException
+__ExceptionPtrDestroy
+__ExceptionPtrRethrow
+__ExceptionPtrSwap
+__ExceptionPtrToBool
+_W_Getdays
+_W_Getmonths
+_W_Gettnames
+_Wcsftime
+__AdjustPointer
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; This is end of the list of symbols available in the Windows OS system versions of msvcrt.dll ;
+; All symbols defined below this line are not available in any version of msvcrt.dll library ;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; This includes list of some symbol alises for compatibility with C99 and POSIX functions and symbols from other msvcr* libraries
+; i386 llabs and imaxabs alias provided by emu
+; i386 strtoll, strtoull, strtoimax, strtoumax, wcstoll, wcstoull, wcstoimax and wcstoumax aliases provided by emu
+; This uses functions that are available since Vista. ARM/AArch64/ARM64EC
+; can assume that those fucntions always are available; on x86 we provide
+; fallbacks in the import library.
+; This is list of symbol aliases from the Visual C++ 1.0 oldnames.lib library
+; FIXME: some of these symbol aliases are commented, check and document why
+access == _access
+; cgets == _cgets
+chdir == _chdir
+chmod == _chmod
+chsize == _chsize
+close == _close
+; cprintf == _cprintf
+; cputs == _cputs
+creat == _creat
+; cscanf == _cscanf
+cwait == _cwait
+daylight DATA == _daylight
+dup == _dup
+dup2 == _dup2
+ecvt == _ecvt
+; environ DATA == _environ
+eof == _eof
+execl == _execl
+execle == _execle
+execlp == _execlp
+execlpe == _execlpe
+execv == _execv
+execve == _execve
+execvp == _execvp
+execvpe == _execvpe
+fcloseall == _fcloseall
+fcvt == _fcvt
+fdopen == _fdopen
+fgetchar == _fgetchar
+filelength == _filelength
+fileno == _fileno
+; flushall == _flushall
+fputchar == _fputchar
+; fstat for non-UCRT is provided by mingw to workaround S_IFDIR issue in _fstat
+; ftime is provided in misc/ftime32.c or misc/ftime64.c as MS _ftime is not ABI compatible with POSIX ftime
+HUGE DATA == _HUGE
+gcvt == _gcvt
+getch == _getch
+getche == _getche
+getcwd == _getcwd
+; msvcrt.dll for arm/arm64 lacks _getpid
+getpid == _getpid
+getw == _getw
+isatty == _isatty
+itoa == _itoa
+kbhit == _kbhit
+lfind == _lfind
+; locking == _locking
+lsearch == _lsearch
+lseek == _lseek
+ltoa == _ltoa
+memccpy == _memccpy
+memicmp == _memicmp
+mkdir == _mkdir
+mktemp == _mktemp
+; onexit function alias is provided by misc/_onexit.c
+open == _open
+putch == _putch
+putenv == _putenv
+putw == _putw
+read == _read
+rmdir == _rmdir
+rmtmp == _rmtmp
+setmode == _setmode
+sopen == _sopen
+spawnl == _spawnl
+spawnle == _spawnle
+spawnlp == _spawnlp
+spawnlpe == _spawnlpe
+spawnv == _spawnv
+spawnve == _spawnve
+spawnvp == _spawnvp
+spawnvpe == _spawnvpe
+; stat for non-UCRT is provided by mingw to workaround trailing slash issue in _stat
+; Symbol _strcmpi is natively present and defined in the library def file
+; So define strcmpi as an alias to _strcmpi
+strcmpi == _strcmpi
+strdup == _strdup
+stricmp == _stricmp
+strlwr == _strlwr
+strnicmp == _strnicmp
+strnset == _strnset
+strrev == _strrev
+strset == _strset
+strupr == _strupr
+swab == _swab
+; sys_errlist DATA == _sys_errlist
+; sys_nerr DATA == _sys_nerr
+tell == _tell
+tempnam == _tempnam
+timezone DATA == _timezone
+tzname DATA == _tzname
+tzset == _tzset
+; ultoa == _ultoa
+umask == _umask
+ungetch == _ungetch
+unlink == _unlink
+utime == _utime
+write == _write
+; This is list of symbol aliases added in the Visual C++ 2.0 oldnames.lib library
+; All these symbols with leading underscore are present also in pre-2.0 CRT versions: crtdll.dll and msvcrt10.dll
+; control87 == _control87
+fpreset == _fpreset
+wcsdup == _wcsdup
+wcsicmp == _wcsicmp
+wcsicoll == _wcsicoll
+wcslwr == _wcslwr
+wcsnicmp == _wcsnicmp
+wcsnset == _wcsnset
+wcsrev == _wcsrev
+wcsset == _wcsset
+wcsupr == _wcsupr
+; This is list of symbol aliases added in the Visual C++ 4.0 oldnames.lib library
+; All these symbols with leading underscore are present also in pre-4.0 CRT versions: crtdll.dll, msvcrt10.dll and msvcrt20.dll
+; cabs == _cabs
+; hypot is provided by math/hypot.c as a wrapper around _hypot
+j0 == _j0
+j1 == _j1
+jn == _jn
+y0 == _y0
+y1 == _y1
+yn == _yn
+; This is list of symbol aliases for C95 functions
+; This is list of symbol aliases for C99 functions
+; logb == _logb
+nextafter == _nextafter
+; This is list of symbol aliases for C99 ARM long double functions
+; They are defined as aliases to regular double symbols as on ARM, long double is equal to regular double
+acosl == acos
+asinl == asin
+atan2l == atan2
+atanl == atan
+ceill == ceil
+cosl == cos
+expl == exp
+floorl == floor
+fmodl == fmod
+log10l == log10
+logl == log
+; FIXME: Why is powl alias defined only for UCRT?
+sinl == sin
+tanl == tan
+_chgsignl == _chgsign
+; This is list of symbol aliases for C11 functions
+; This is list of symbol aliases for POSIX functions
+isascii == __isascii
+toascii == __toascii
+pclose == _pclose
+popen == _popen
+fseeko == fseek
+ftello == ftell
+ftruncate == _chsize
+; scalb == _scalb
+; This is list of symbol aliases for Large File Specification (extension to Single UNIX Specification)
+; https:
+creat64 == _creat
+open64 == _open
+fopen64 == fopen
+freopen64 == freopen
+; fgetpos and fsetpos are already 64-bit
+fgetpos64 == fgetpos
+fsetpos64 == fsetpos
+lseek64 == _lseeki64
+; fstat for non-UCRT is provided by mingw to workaround S_IFDIR issue in _fstat
+; stat for non-UCRT is provided by mingw to workaround trailing slash issue in _stat
+fseeko64 == _fseeki64
+; This is list of symbol aliases for GNU functions which are not part of POSIX or ISO C
+strcasecmp == _stricmp
+strncasecmp == _strnicmp
+; This is list of various symbol aliases which are needed for compatibility
+; Some symbols in some version of CRT library were added and some other symbols were removed or renamed
+; This list provides some level of backward and forward compatibility
+atoll == _atoi64
+_wtoll == _wtoi64
+_atoll_l == _atoi64_l
+_wtoll_l == _wtoi64_l
+llabs == _abs64
+imaxabs == _abs64
+strtoll == _strtoi64
+strtoull == _strtoui64
+strtoimax == _strtoi64
+strtoumax == _strtoui64
+wcstoll == _wcstoi64
+wcstoull == _wcstoui64
+wcstoimax == _wcstoi64
+wcstoumax == _wcstoui64
+_strtoll_l == _strtoi64_l
+_strtoull_l == _strtoui64_l
+_strtoimax_l == _strtoi64_l
+_strtoumax_l == _strtoui64_l
+_wcstoll_l == _wcstoi64_l
+_wcstoull_l == _wcstoui64_l
+_wcstoimax_l == _wcstoi64_l
+_wcstoumax_l == _wcstoui64_l
+; This is list of find symbol aliases, every CRT library has either find symbols with SIZE suffix or without them
+_findfirst64i32 == _findfirst
+_findnext64i32 == _findnext
+_wfindfirst64i32 == _wfindfirst
+_wfindnext64i32 == _wfindnext
+; This is list of stat symbol aliases, every CRT library has either stat symbols with SIZE suffix or without them
+_fstat64i32 == _fstat
+_stat64i32 == _stat
+_wstat64i32 == _wstat
+; This is list of time symbol aliases, every CRT library except msvcrt.dll has either time symbols with SIZE suffix or without them
+; This is list of symbols which are present in msvcrt but not in UCRT
+; This is list of printf/scanf symbol aliases with __ms_ prefix
+__ms_fprintf == fprintf
+__ms_fscanf == fscanf
+__ms_fwprintf == fwprintf
+__ms_fwscanf == fwscanf
+__ms_printf == printf
+__ms_scanf == scanf
+__ms_sprintf == sprintf
+__ms_sscanf == sscanf
+__ms_swscanf == swscanf
+__ms_vfprintf == vfprintf
+__ms_vfwprintf == vfwprintf
+__ms_vprintf == vprintf
+__ms_vsprintf == vsprintf
+__ms_vwprintf == vwprintf
+__ms_wprintf == wprintf
+__ms_wscanf == wscanf
+; This is list of additional symbol aliases not available in any library as neither native symbols nor aliases
+; FIXME: check if these really are needed
+; This is wstat and wstat64 symbol available only in mingw but for a long time
+; wstat for non-UCRT is provided by mingw to workaround trailing slash issue in _wstat
+; Origin of the symbol wcscmpi is unknown. This symbol is not present in
+; crtdll.dll and neither in any msvcr* version. The only source of wcscmpi is
+; wcstr.h header file from the Microsoft Visual C++ 1.0 (32-bit for NT) and
+; Microsoft Windows NT 3.1 SDK where wcscmpi and _wcscmpi are defined as
+; macros which expand to _wcsicmp. So the raw wcscmpi is not linkable symbol
+; even in the old Visual C++ versions.
+wcscmpi == _wcsicmp
+; Origin of these symbols is unknown too.
+chgsign == _chgsign
+fgetwchar == _fgetwchar
+finite == _finite
+fpclass == _fpclass
+fputwchar == _fputwchar
+heapwalk == _heapwalk
+iscsymf == __iscsymf
+iscsym == __iscsym
+searchenv == _searchenv
+stricoll == _stricoll
+vsnprintf_s == _vsnprintf_s
+wpopen == _wpopen

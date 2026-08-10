@@ -47,6 +47,14 @@ export struct TargetSpec {
         return triple_.contains("linux") && triple_.contains("musl");
     }
 
+    bool is_windows() const {
+        return triple_.contains("windows");
+    }
+
+    bool is_windows_gnu() const {
+        return triple_.contains("windows") && triple_.contains("gnu");
+    }
+
     // Architecture component — first segment of the triple.
     std::string arch() const {
         auto pos = triple_.find('-');
@@ -110,6 +118,17 @@ export TargetSpec parse_target(std::string_view spec) {
     // Normalize architecture aliases to LLVM canonical names.
     if (kept[0] == "arm64")  kept[0] = "aarch64";
     if (kept[0] == "amd64")  kept[0] = "x86_64";
+
+    // Normalize MinGW triples: x86_64-w64-mingw32 → x86_64-windows-gnu.
+    // LLVM canonical form is <arch>-windows-gnu; the legacy w64-mingw32
+    // suffix is the historical MinGW-w64 convention.
+    for (size_t i = 1; i < kept.size(); ++i) {
+        if (kept[i].starts_with("mingw32")) {
+            kept.erase(kept.begin() + 1, kept.end());
+            kept.push_back("windows-gnu");
+            break;
+        }
+    }
 
     t.triple_ = kept[0];
     for (size_t i = 1; i < kept.size(); ++i)
@@ -200,7 +219,6 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
     if (!compile_as_c) {
         for (const auto& [mod_name, _] : cc.module_deps) {
             if (mod_name == "std" || mod_name == "std.compat") {
-                cmd.push_back("-stdlib=libc++");
                 cmd.push_back("-Wno-reserved-module-identifier");
                 break;
             }
@@ -463,6 +481,11 @@ export ModuleFileMap ensure_std_modules(
 
     Path libcxx_inc = find_lib_dir() / "libcxx" / "include";
 
+    // Select libc++ config_site based on target: mingw-config for windows-gnu,
+    // cross-config for other cross-compile targets.
+    std::string config_subdir = tc.target.is_windows_gnu()
+        ? "mingw-config" : "cross-config";
+
     if (!std_pcm.is_regular_file()) {
         std::println("   Preparing standard library module");
 
@@ -476,7 +499,7 @@ export ModuleFileMap ensure_std_modules(
             cmd.push_back("-target");
             cmd.push_back(tc.target.triple());
             cmd.push_back("-isystem");
-            cmd.push_back((find_lib_dir() / "libcxx" / "cross-config").string());
+            cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
         }
 
         cmd.push_back("-isystem");
@@ -484,6 +507,7 @@ export ModuleFileMap ensure_std_modules(
         cmd.push_back("-isystem");
         cmd.push_back((find_lib_dir() / "include").string());
         cmd.push_back("-Wno-reserved-module-identifier");
+        cmd.push_back("-Wno-unused-command-line-argument");
         cmd.push_back("-c");
         cmd.push_back(std_src.string());
         cmd.push_back("--precompile");
@@ -506,7 +530,7 @@ export ModuleFileMap ensure_std_modules(
             cmd.push_back("-target");
             cmd.push_back(tc.target.triple());
             cmd.push_back("-isystem");
-            cmd.push_back((find_lib_dir() / "libcxx" / "cross-config").string());
+            cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
         }
 
         cmd.push_back("-isystem");
@@ -514,6 +538,7 @@ export ModuleFileMap ensure_std_modules(
         cmd.push_back("-isystem");
         cmd.push_back((find_lib_dir() / "include").string());
         cmd.push_back("-Wno-reserved-module-identifier");
+        cmd.push_back("-Wno-unused-command-line-argument");
         cmd.push_back("-fmodule-file=std=" + std_pcm.string());
         cmd.push_back("-c");
         cmd.push_back(compat_src.string());
@@ -549,8 +574,12 @@ export ToolchainCacheInfo bake_build_cache_info(
     return {key, dir};
 }
 
-export std::string library_name(std::string_view base_name, MoidType type) {
+export std::string library_name(std::string_view base_name, MoidType type,
+                                const TargetSpec& target = {}) {
+    bool target_windows = !target.is_native() && target.is_windows();
+
     if (type == MoidType::Dylib) {
+        if (target_windows) return std::string(base_name) + ".dll";
 #if defined(__APPLE__)
         return "lib" + std::string(base_name) + ".dylib";
 #elif defined(_WIN32)
@@ -560,12 +589,10 @@ export std::string library_name(std::string_view base_name, MoidType type) {
 #endif
     }
     if (type == MoidType::Lib) {
-#if defined(_WIN32)
-        return std::string(base_name) + ".lib";
-#else
+        // MinGW and ELF both use GNU convention: lib<name>.a
         return "lib" + std::string(base_name) + ".a";
-#endif
     }
+    if (target_windows) return std::string(base_name) + ".exe";
 #if defined(_WIN32)
     return std::string(base_name) + ".exe";
 #else
@@ -579,7 +606,7 @@ export std::string library_name(std::string_view base_name, MoidType type) {
 
 static bool write_archive(const Path& archive_path,
                           const std::vector<Path>& members,
-                          bool is_darwin) {
+                          bool is_darwin, bool is_windows = false) {
     std::vector<std::string> paths;
     std::vector<const char *> cstrs;
     paths.reserve(members.size());
@@ -588,7 +615,7 @@ static bool write_archive(const Path& archive_path,
         paths.push_back(m.string());
         cstrs.push_back(paths.back().c_str());
     }
-    int kind = is_darwin ? 2 : 0;  // 0=GNU, 2=DARWIN
+    int kind = is_darwin ? 2 : is_windows ? 3 : 0;  // DARWIN, COFF, GNU
     return bake_ar_write(archive_path.string().c_str(),
                          cstrs.data(), cstrs.size(), kind) == 0;
 }
@@ -621,10 +648,10 @@ static bool write_archive(const Path& archive_path,
 // ── Libc family: the single dispatch point for runtime selection ──
 
 export enum class LibcFamily {
-    Musl,    // built from vendored source
-    Darwin,  // libSystem via vendored .tbd (cross) or system SDK (native)
-    None,    // freestanding (no libc)
-    // Future: Windows (mingw-w64), Glibc, Ohos
+    Musl,     // built from vendored source
+    Darwin,   // libSystem via vendored .tbd (cross) or system SDK (native)
+    Windows,  // MinGW-w64 (built from vendored source)
+    None,     // freestanding (no libc)
 };
 
 export enum class LinkMode {
@@ -653,11 +680,16 @@ export struct RuntimeArtifacts {
     std::vector<std::string> link_dirs;        // -L paths (SDK or vendored)
     std::vector<std::string> framework_dirs;   // -F paths
     std::string macos_deployment_target;       // -mmacosx-version-min value
+
+    // windows (mingw) link helpers
+    std::vector<std::string> always_link_libs; // system libs to inject
+    std::string mingw_import_dir;              // path to generated import libs
 };
 
 export LibcFamily resolve_libc_family(const TargetSpec& target) {
-    if (target.is_linux_musl()) return LibcFamily::Musl;
-    if (target.is_darwin())     return LibcFamily::Darwin;
+    if (target.is_linux_musl())  return LibcFamily::Musl;
+    if (target.is_windows_gnu()) return LibcFamily::Windows;
+    if (target.is_darwin())      return LibcFamily::Darwin;
     return LibcFamily::None;
 }
 
@@ -749,7 +781,7 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
     result.libcxx_a    = cache_dir / "libc++.a";
     result.libcxxabi_a = cache_dir / "libc++abi.a";
 
-    bool needs_libunwind = tc.target.is_linux_musl();
+    bool needs_libunwind = tc.target.is_linux_musl() || tc.target.is_windows();
     if (needs_libunwind)
         result.libunwind_a = cache_dir / "libunwind.a";
 
@@ -803,8 +835,7 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
     };
 
     auto archive = [&](const Path& ar_path, const std::vector<Path>& objs) {
-        bool is_darwin = tc.target.is_darwin();
-        write_archive(ar_path, objs, is_darwin);
+        write_archive(ar_path, objs, tc.target.is_darwin(), tc.target.is_windows());
     };
 
     int total = 0;
@@ -928,6 +959,22 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
             objs.push_back(obj);
             ++total;
         }
+
+        // Windows-specific support (locale, threads, etc.).
+        if (tc.target.is_windows()) {
+            static const char* win32_support_files[] = {
+                "support/win32/locale_win32.cpp",
+                "support/win32/support.cpp",
+                "support/win32/thread_win32.cpp",
+            };
+            for (auto* f : win32_support_files) {
+                auto obj = compile(flags, libcxx_src, f, "libcxx");
+                if (obj.string().empty()) return result;
+                objs.push_back(obj);
+                ++total;
+            }
+        }
+
         archive(result.libcxx_a, objs);
     }
 
@@ -1205,7 +1252,8 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     if (arch_dir.is_directory()) {
         for (auto& entry : fs::recursive_directory_iterator(arch_dir.fs())) {
             auto ext = entry.path().extension().string();
-            if (ext != ".c" && ext != ".cpp") continue;
+            if (ext != ".c" && ext != ".cpp" && ext != ".S" && ext != ".s")
+                continue;
             Path src(entry.path());
             auto rel = fs::relative(src.fs(), arch_dir.fs());
             std::string stem = rel.lexically_normal().generic_string();
@@ -1225,11 +1273,513 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     }
 
     if (!obj_files.empty()) {
-        write_archive(result_a, obj_files, is_darwin);
+        write_archive(result_a, obj_files, is_darwin, tc.target.is_windows());
     }
 
     write_file(sentinel, "");
     return result_a;
+}
+
+// ── mingw-w64 (windows-gnu) ──
+//
+// Builds CRT objects + libmingw32.a from vendored MinGW-w64 source, and
+// generates import libraries from .def files using LLD's COFF driver.
+// Cache is global, keyed by target triple.
+
+export struct MingwObjects {
+    Path crt2_o;          // exe entry point (from crt/crtexe.c)
+    Path dllcrt2_o;       // DLL entry point (from crt/crtdll.c)
+    Path libmingw32_a;    // static helper library (includes winpthreads)
+    Path import_lib_dir;  // generated import libraries (.lib from .def)
+};
+
+// Source file lists — curated from MinGW-w64, matching Zig's selection.
+// See https://github.com/ziglang/zig/blob/master/src/libs/mingw.zig
+
+static const char* mingw32_crt_src[] = {
+    "crt/crtexewin.c", "crt/dll_argv.c", "crt/gccmain.c",
+    "crt/natstart.c", "crt/pseudo-reloc-list.c", "crt/wildcard.c",
+    "crt/charmax.c", "crt/ucrtexewin.c", "crt/dllargv.c",
+    "crt/_newmode.c", "crt/tlssup.c", "crt/xncommod.c",
+    "crt/cinitexe.c", "crt/merr.c", "crt/usermatherr.c",
+    "crt/pesect.c", "crt/udllargc.c", "crt/xthdloc.c",
+    "crt/mingw_helpers.c", "crt/pseudo-reloc.c", "crt/udll_argv.c",
+    "crt/xtxtmode.c", "crt/crt_handler.c", "crt/tlsthrd.c",
+    "crt/tlsmthread.c", "crt/tlsmcrt.c", "crt/cxa_atexit.c",
+    "crt/cxa_thread_atexit.c", "crt/tls_atexit.c",
+    "intrincs/RtlSecureZeroMemory.c",
+};
+
+static const char* mingw32_complex_src[] = {
+    "complex/_cabs.c", "complex/cabs.c", "complex/cabsf.c",
+    "complex/cabsl.c", "complex/cacos.c", "complex/cacosf.c",
+    "complex/cacosl.c", "complex/carg.c", "complex/cargf.c",
+    "complex/cargl.c", "complex/casin.c", "complex/casinf.c",
+    "complex/casinl.c", "complex/catan.c", "complex/catanf.c",
+    "complex/catanl.c", "complex/ccos.c", "complex/ccosf.c",
+    "complex/ccosl.c", "complex/cexp.c", "complex/cexpf.c",
+    "complex/cexpl.c", "complex/cimag.c", "complex/cimagf.c",
+    "complex/cimagl.c", "complex/clog.c", "complex/clog10.c",
+    "complex/clog10f.c", "complex/clog10l.c", "complex/clogf.c",
+    "complex/clogl.c", "complex/conj.c", "complex/conjf.c",
+    "complex/conjl.c", "complex/cpow.c", "complex/cpowf.c",
+    "complex/cpowl.c", "complex/cproj.c", "complex/cprojf.c",
+    "complex/cprojl.c", "complex/creal.c", "complex/crealf.c",
+    "complex/creall.c", "complex/csin.c", "complex/csinf.c",
+    "complex/csinl.c", "complex/csqrt.c", "complex/csqrtf.c",
+    "complex/csqrtl.c", "complex/ctan.c", "complex/ctanf.c",
+    "complex/ctanl.c",
+};
+
+static const char* mingw32_gdtoa_src[] = {
+    "gdtoa/arithchk.c", "gdtoa/dmisc.c", "gdtoa/dtoa.c",
+    "gdtoa/g__fmt.c", "gdtoa/g_dfmt.c", "gdtoa/g_ffmt.c",
+    "gdtoa/g_xfmt.c", "gdtoa/gdtoa.c", "gdtoa/gethex.c",
+    "gdtoa/gmisc.c", "gdtoa/hd_init.c", "gdtoa/hexnan.c",
+    "gdtoa/misc.c", "gdtoa/qnan.c", "gdtoa/smisc.c",
+    "gdtoa/strtodg.c", "gdtoa/strtodnrp.c", "gdtoa/strtof.c",
+    "gdtoa/strtopx.c", "gdtoa/sum.c", "gdtoa/ulp.c",
+};
+
+static const char* mingw32_math_src[] = {
+    "math/coshl.c", "math/fp_consts.c", "math/fp_constsf.c",
+    "math/fp_constsl.c", "math/fpclassify.c", "math/fpclassifyf.c",
+    "math/fpclassifyl.c", "math/frexpf.c", "math/frexpl.c",
+    "math/hypotf.c", "math/hypotl.c", "math/ldexpf.c",
+    "math/lgamma.c", "math/lgammaf.c", "math/lgammal.c",
+    "math/modfl.c", "math/powi.c", "math/powif.c",
+    "math/powil.c", "math/signbit.c", "math/signbitf.c",
+    "math/signbitl.c", "math/signgam.c", "math/sinhl.c",
+    "math/sqrtl.c", "math/tanhl.c",
+    // ucrtbase
+    "math/_huge.c",
+};
+
+static const char* mingw32_misc_src[] = {
+    "misc/alarm.c", "misc/btowc.c", "misc/delay-f.c",
+    "misc/delay-n.c", "misc/delayimp.c", "misc/dirent.c",
+    "misc/dirname.c", "misc/dllmain.c", "misc/feclearexcept.c",
+    "misc/fegetenv.c", "misc/fegetexceptflag.c", "misc/fegetround.c",
+    "misc/feholdexcept.c", "misc/feraiseexcept.c", "misc/fesetenv.c",
+    "misc/fesetexceptflag.c", "misc/fesetround.c", "misc/fetestexcept.c",
+    "misc/mingw_controlfp.c", "misc/mingw_setfp.c", "misc/feupdateenv.c",
+    "misc/ftruncate.c", "misc/ftw32.c", "misc/ftw32i64.c",
+    "misc/ftw64.c", "misc/ftw64i32.c", "misc/fwide.c",
+    "misc/getlogin.c", "misc/getopt.c", "misc/gettimeofday.c",
+    "misc/mempcpy.c", "misc/mingw-access.c", "misc/mingw-aligned-malloc.c",
+    "misc/mingw_getsp.S", "misc/mingw_longjmp.S", "misc/mingw_matherr.c",
+    "misc/mingw_mbwc_convert.c", "misc/mingw_usleep.c",
+    "misc/mingw_wcstod.c", "misc/mingw_wcstof.c", "misc/mingw_wcstold.c",
+    "misc/mkstemp.c", "misc/sleep.c", "misc/strnlen.c",
+    "misc/strsafe.c", "misc/tdelete.c", "misc/tdestroy.c",
+    "misc/tfind.c", "misc/tsearch.c", "misc/twalk.c",
+    "misc/wcsnlen.c", "misc/wcstof.c", "misc/wcstoimax.c",
+    "misc/wcstold.c", "misc/wcstoumax.c", "misc/wctob.c",
+    "misc/wdirent.c", "misc/winbs_uint64.c", "misc/winbs_ulong.c",
+    "misc/winbs_ushort.c", "misc/wmemchr.c", "misc/wmemcmp.c",
+    "misc/wmemcpy.c", "misc/wmemmove.c", "misc/wmempcpy.c",
+    "misc/wmemset.c",
+    // ucrtbase
+    "misc/__initenv.c", "misc/__winitenv.c", "misc/__p___initenv.c",
+    "misc/__p___winitenv.c", "misc/_onexit.c", "misc/ucrt-access.c",
+    "misc/ucrt__getmainargs.c", "misc/ucrt__wgetmainargs.c",
+    "misc/ucrt_amsg_exit.c", "misc/ucrt_at_quick_exit.c",
+    "misc/ucrt_tzset.c",
+};
+
+static const char* mingw32_stdio_src[] = {
+    "stdio/_Exit.c", "stdio/_findfirst64i32.c", "stdio/_findnext64i32.c",
+    "stdio/_fstat64i32.c", "stdio/_stat64i32.c", "stdio/_wfindfirst64i32.c",
+    "stdio/_wfindnext64i32.c", "stdio/_wstat64i32.c",
+    "stdio/__mingw_fix_stat_path.c", "stdio/__mingw_fix_wstat_path.c",
+    "stdio/asprintf.c", "stdio/fopen64.c", "stdio/fseeko32.c",
+    "stdio/fseeko64.c", "stdio/ftello.c", "stdio/ftello64.c",
+    "stdio/ftruncate64.c", "stdio/lltoa.c", "stdio/lltow.c",
+    "stdio/lseek64.c", "stdio/mingw_asprintf.c", "stdio/mingw_fprintf.c",
+    "stdio/mingw_fwprintf.c", "stdio/mingw_fscanf.c",
+    "stdio/mingw_fwscanf.c", "stdio/mingw_pformat.c",
+    "stdio/mingw_sformat.c", "stdio/mingw_swformat.c",
+    "stdio/mingw_wpformat.c", "stdio/mingw_printf.c",
+    "stdio/mingw_wprintf.c", "stdio/mingw_scanf.c",
+    "stdio/mingw_snprintf.c", "stdio/mingw_snwprintf.c",
+    "stdio/mingw_sprintf.c", "stdio/mingw_swprintf.c",
+    "stdio/mingw_sscanf.c", "stdio/mingw_swscanf.c",
+    "stdio/mingw_vasprintf.c", "stdio/mingw_vfprintf.c",
+    "stdio/mingw_vfwprintf.c", "stdio/mingw_vfscanf.c",
+    "stdio/mingw_vprintf.c", "stdio/mingw_vsscanf.c",
+    "stdio/mingw_vwprintf.c", "stdio/mingw_vsnprintf.c",
+    "stdio/mingw_vsnwprintf.c", "stdio/mingw_vsprintf.c",
+    "stdio/mingw_vswprintf.c", "stdio/mingw_wscanf.c",
+    "stdio/mingw_vfwscanf.c", "stdio/mingw_vswscanf.c",
+    "stdio/snprintf.c", "stdio/snwprintf.c", "stdio/strtok_r.c",
+    "stdio/truncate.c", "stdio/ulltoa.c", "stdio/ulltow.c",
+    "stdio/vasprintf.c", "stdio/vsnprintf.c", "stdio/vsnwprintf.c",
+    "stdio/wtoll.c",
+    // ucrtbase
+    "stdio/ucrt__scprintf.c", "stdio/ucrt__snprintf.c",
+    "stdio/ucrt__snscanf.c", "stdio/ucrt__snwprintf.c",
+    "stdio/ucrt__vscprintf.c", "stdio/ucrt__vsnprintf.c",
+    "stdio/ucrt__vsnwprintf.c", "stdio/ucrt___local_stdio_printf_options.c",
+    "stdio/ucrt___local_stdio_scanf_options.c", "stdio/ucrt_fprintf.c",
+    "stdio/ucrt_fscanf.c", "stdio/ucrt_fwprintf.c",
+    "stdio/ucrt_fwscanf.c", "stdio/ucrt_ms_fwprintf.c",
+    "stdio/ucrt_printf.c", "stdio/ucrt_scanf.c",
+    "stdio/ucrt_snprintf.c", "stdio/ucrt_snwprintf.c",
+    "stdio/ucrt_sprintf.c", "stdio/ucrt_sscanf.c",
+    "stdio/ucrt_swscanf.c", "stdio/ucrt_swprintf.c",
+    "stdio/ucrt_vfprintf.c", "stdio/ucrt_vfscanf.c",
+    "stdio/ucrt_vfwscanf.c", "stdio/ucrt_vfwprintf.c",
+    "stdio/ucrt_vprintf.c", "stdio/ucrt_vscanf.c",
+    "stdio/ucrt_vsnprintf.c", "stdio/ucrt_vsnwprintf.c",
+    "stdio/ucrt_vsprintf.c", "stdio/ucrt_vswprintf.c",
+    "stdio/ucrt_vsscanf.c", "stdio/ucrt_vwscanf.c",
+    "stdio/ucrt_wscanf.c", "stdio/ucrt_vwprintf.c",
+    "stdio/ucrt_wprintf.c",
+};
+
+static const char* mingw32_string_src[] = {
+    "string/ucrt__wcstok.c",
+};
+
+static const char* mingw32_libsrc_src[] = {
+    "libsrc/ativscp-uuid.c", "libsrc/atsmedia-uuid.c",
+    "libsrc/bth-uuid.c", "libsrc/cguid-uuid.c",
+    "libsrc/comcat-uuid.c", "libsrc/ctxtcall-uuid.c",
+    "libsrc/devguid.c", "libsrc/docobj-uuid.c",
+    "libsrc/dxva-uuid.c", "libsrc/exdisp-uuid.c",
+    "libsrc/extras-uuid.c", "libsrc/fwp-uuid.c",
+    "libsrc/guid_nul.c", "libsrc/hlguids-uuid.c",
+    "libsrc/hlink-uuid.c", "libsrc/mlang-uuid.c",
+    "libsrc/msctf-uuid.c", "libsrc/mshtmhst-uuid.c",
+    "libsrc/mshtml-uuid.c", "libsrc/msxml-uuid.c",
+    "libsrc/netcfg-uuid.c", "libsrc/netcon-uuid.c",
+    "libsrc/ntddkbd-uuid.c", "libsrc/ntddmou-uuid.c",
+    "libsrc/ntddpar-uuid.c", "libsrc/ntddscsi-uuid.c",
+    "libsrc/ntddser-uuid.c", "libsrc/ntddstor-uuid.c",
+    "libsrc/ntddvdeo-uuid.c", "libsrc/oaidl-uuid.c",
+    "libsrc/objidl-uuid.c", "libsrc/objsafe-uuid.c",
+    "libsrc/ocidl-uuid.c", "libsrc/oleacc-uuid.c",
+    "libsrc/olectlid-uuid.c", "libsrc/oleidl-uuid.c",
+    "libsrc/power-uuid.c", "libsrc/powrprof-uuid.c",
+    "libsrc/uianimation-uuid.c", "libsrc/usbcamdi-uuid.c",
+    "libsrc/usbiodef-uuid.c", "libsrc/uuid.c",
+    "libsrc/vds-uuid.c", "libsrc/virtdisk-uuid.c",
+    "libsrc/vss-uuid.c", "libsrc/wia-uuid.c",
+    "libsrc/windowscodecs.c",
+    "libsrc/ws2_32.c",
+    "libsrc/ws2tcpip/in6_addr_equal.c", "libsrc/ws2tcpip/in6addr_isany.c",
+    "libsrc/ws2tcpip/in6addr_isloopback.c", "libsrc/ws2tcpip/in6addr_setany.c",
+    "libsrc/ws2tcpip/in6addr_setloopback.c", "libsrc/ws2tcpip/in6_is_addr_linklocal.c",
+    "libsrc/ws2tcpip/in6_is_addr_loopback.c", "libsrc/ws2tcpip/in6_is_addr_mc_global.c",
+    "libsrc/ws2tcpip/in6_is_addr_mc_linklocal.c", "libsrc/ws2tcpip/in6_is_addr_mc_nodelocal.c",
+    "libsrc/ws2tcpip/in6_is_addr_mc_orglocal.c", "libsrc/ws2tcpip/in6_is_addr_mc_sitelocal.c",
+    "libsrc/ws2tcpip/in6_is_addr_multicast.c", "libsrc/ws2tcpip/in6_is_addr_sitelocal.c",
+    "libsrc/ws2tcpip/in6_is_addr_unspecified.c", "libsrc/ws2tcpip/in6_is_addr_v4compat.c",
+    "libsrc/ws2tcpip/in6_is_addr_v4mapped.c", "libsrc/ws2tcpip/in6_set_addr_loopback.c",
+    "libsrc/ws2tcpip/in6_set_addr_unspecified.c", "libsrc/ws2tcpip/gai_strerrorA.c",
+    "libsrc/ws2tcpip/gai_strerrorW.c",
+    "libsrc/wspiapi/WspiapiStrdup.c", "libsrc/wspiapi/WspiapiParseV4Address.c",
+    "libsrc/wspiapi/WspiapiNewAddrInfo.c", "libsrc/wspiapi/WspiapiQueryDNS.c",
+    "libsrc/wspiapi/WspiapiLookupNode.c", "libsrc/wspiapi/WspiapiClone.c",
+    "libsrc/wspiapi/WspiapiLegacyFreeAddrInfo.c", "libsrc/wspiapi/WspiapiLegacyGetAddrInfo.c",
+    "libsrc/wspiapi/WspiapiLegacyGetNameInfo.c", "libsrc/wspiapi/WspiapiLoad.c",
+    "libsrc/wspiapi/WspiapiGetAddrInfo.c", "libsrc/wspiapi/WspiapiGetNameInfo.c",
+    "libsrc/wspiapi/WspiapiFreeAddrInfo.c",
+    "libsrc/dinput_kbd.c", "libsrc/dinput_joy.c", "libsrc/dinput_joy2.c",
+    "libsrc/dinput_mouse.c", "libsrc/dinput_mouse2.c",
+    "libsrc/dloadhelper.c",
+    "libsrc/bits.c", "libsrc/shell32.c", "libsrc/dmoguids.c",
+    "libsrc/dxerr8.c", "libsrc/dxerr8w.c", "libsrc/dxerr9.c",
+    "libsrc/dxerr9w.c", "libsrc/mfuuid.c", "libsrc/msxml2.c",
+    "libsrc/msxml6.c", "libsrc/amstrmid.c", "libsrc/wbemuuid.c",
+    "libsrc/wmcodecdspuuid.c", "libsrc/dxguid.c", "libsrc/ksuser.c",
+    "libsrc/largeint.c", "libsrc/locationapi.c", "libsrc/sapi.c",
+    "libsrc/sensorsapi.c", "libsrc/portabledeviceguids.c",
+    "libsrc/taskschd.c", "libsrc/strmiids.c", "libsrc/gdiplus.c",
+    "libsrc/activeds-uuid.c",
+};
+
+static const char* mingw32_other_src[] = {
+    "cfguard/mingw_cfguard_support.c",
+    "libsrc/mingwthrd_mt.c",
+};
+
+static const char* mingw32_winpthreads_src[] = {
+    "winpthreads/barrier.c", "winpthreads/clock.c", "winpthreads/cond.c",
+    "winpthreads/misc.c", "winpthreads/mutex.c", "winpthreads/nanosleep.c",
+    "winpthreads/rwlock.c", "winpthreads/sched.c", "winpthreads/sem.c",
+    "winpthreads/spinlock.c", "winpthreads/thread.c",
+};
+
+// x86-family (x86 + x86_64) math sources.
+static const char* mingw32_x86_src[] = {
+    "math/x86/_chgsignl.S",
+    "math/x86/acoshl.c", "math/x86/acosl.c", "math/x86/asinhl.c",
+    "math/x86/asinl.c", "math/x86/atan2l.c", "math/x86/atanhl.c",
+    "math/x86/atanl.c", "math/x86/copysignl.S", "math/x86/cosl.c",
+    "math/x86/cosl_internal.S", "math/x86/cossinl.c",
+    "math/x86/exp2l.S", "math/x86/expl.c", "math/x86/expm1l.c",
+    "math/x86/fmodl.c", "math/x86/fucom.c", "math/x86/ilogbl.S",
+    "math/x86/internal_logl.S", "math/x86/ldexp.c", "math/x86/ldexpl.c",
+    "math/x86/log10l.S", "math/x86/log1pl.S", "math/x86/log2l.S",
+    "math/x86/logbl.c", "math/x86/logl.c", "math/x86/nearbyintl.S",
+    "math/x86/powl.c", "math/x86/remainderl.S", "math/x86/remquol.S",
+    "math/x86/scalbn.S", "math/x86/scalbnf.S", "math/x86/scalbnl.S",
+    "math/x86/sinl.c", "math/x86/sinl_internal.S", "math/x86/tanl.S",
+    "math/cbrtl.c", "math/erfl.c", "math/fdiml.c", "math/fmal.c",
+    "math/fmaxl.c", "math/fminl.c", "math/llrintl.c", "math/llroundl.c",
+    "math/lrintl.c", "math/lroundl.c", "math/rintl.c", "math/roundl.c",
+    "math/tgammal.c", "math/nextafterl.c", "math/nexttoward.c",
+    "math/nexttowardf.c",
+    "crt/CRT_fp10.c",
+};
+
+// Libraries that must always be linked on Windows targets.
+static const char* mingw_always_link_libs[] = {
+    "api-ms-win-crt-conio-l1-1-0", "api-ms-win-crt-convert-l1-1-0",
+    "api-ms-win-crt-environment-l1-1-0", "api-ms-win-crt-filesystem-l1-1-0",
+    "api-ms-win-crt-heap-l1-1-0", "api-ms-win-crt-locale-l1-1-0",
+    "api-ms-win-crt-math-l1-1-0", "api-ms-win-crt-multibyte-l1-1-0",
+    "api-ms-win-crt-private-l1-1-0", "api-ms-win-crt-process-l1-1-0",
+    "api-ms-win-crt-runtime-l1-1-0", "api-ms-win-crt-stdio-l1-1-0",
+    "api-ms-win-crt-string-l1-1-0", "api-ms-win-crt-time-l1-1-0",
+    "api-ms-win-crt-utility-l1-1-0",
+    "advapi32", "kernel32", "ntdll", "shell32", "user32",
+};
+
+export MingwObjects ensure_mingw_objects(const Toolchain& tc) {
+    MingwObjects result;
+    if (!tc.target.is_windows_gnu()) return result;
+
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return result;
+
+    Path mingw_src = lib / "libc" / "mingw";
+    if (!mingw_src.is_directory()) {
+        std::println(std::cerr,
+            "bake: MinGW-w64 source not found at {}\n"
+            "  Run scripts/fetch-mingw.sh to vendor MinGW-w64 for windows-gnu targets.",
+            mingw_src.string());
+        return result;
+    }
+
+    Path cache_dir = get_cache_dir().parent() / "mingw-objects" / tc.target.triple();
+    Path sentinel = cache_dir / ".done";
+
+    result.import_lib_dir = cache_dir / "implib";
+
+    if (sentinel.is_regular_file()) {
+        result.crt2_o       = cache_dir / "crt2.o";
+        result.dllcrt2_o    = cache_dir / "dllcrt2.o";
+        result.libmingw32_a = cache_dir / "libmingw32.a";
+        if (result.crt2_o.is_regular_file() &&
+            result.libmingw32_a.is_regular_file())
+            return result;
+    }
+
+    cache_dir.mkdir_recursive();
+    result.import_lib_dir.mkdir_recursive();
+    std::println("   Compiling mingw-w64 for {} (cached)", tc.target.triple());
+
+    std::string arch = tc.target.arch();
+    std::string machine = (arch == "x86_64") ? "X64" : "ARM64";
+    std::string def_arch_dir = (arch == "x86_64") ? "lib64" : "libarm64";
+
+    // ── Common compile flags ──
+    auto make_base_flags = [&]() {
+        std::vector<std::string> flags;
+        flags.push_back(tc.exe_path);
+        flags.push_back("cc");
+        flags.push_back("-target");
+        flags.push_back(tc.target.triple());
+        flags.push_back("-c");
+        flags.push_back("-std=gnu11");
+        flags.push_back("-D__USE_MINGW_ANSI_STDIO=0");
+        flags.push_back("-isystem");
+        flags.push_back((lib / "libc" / "include" / "any-windows-any").string());
+        flags.push_back("-Os");
+        flags.push_back("-w");
+        return flags;
+    };
+
+    // CRT-specific extra flags (for crt2.o, dllcrt2.o, and libmingw32.a sources).
+    auto crt_extra = std::vector<std::string>{
+        "-D__MSVCRT_VERSION__=0x700",
+        "-D_CTYPE_DISABLE_MACROS",  // Call CRT functions directly, not via iswctype macros
+        "-D_CRTBLD",
+        "-D_SYSCRT=1",
+        "-D_WIN32_WINNT=0x0f00",
+        "-DCRTDLL=1",
+        "-I" + (mingw_src / "include").string(),
+    };
+
+    auto compile = [&](std::vector<std::string> flags,
+                       const std::string& filename,
+                       const std::string& prefix) -> Path {
+        std::string stem = filename;
+        for (auto& c : stem) if (c == '/' || c == '.') c = '_';
+        Path obj = cache_dir / (prefix + "__" + stem + ".o");
+        if (obj.is_regular_file()) return obj;
+
+        flags.push_back((mingw_src / filename).string());
+        flags.push_back("-o");
+        flags.push_back(obj.string());
+
+        auto r = run_process(flags, Path(), true);
+        if (!r.success()) {
+            std::print(std::cerr, "{}", r.stderr_output);
+            std::println(std::cerr, "bake: failed to compile {}:{}", prefix, filename);
+            return Path();
+        }
+        return obj;
+    };
+
+    int total = 0;
+
+    // ── crt2.o (exe entry point) ──
+    {
+        result.crt2_o = cache_dir / "crt2.o";
+        if (!result.crt2_o.is_regular_file()) {
+            auto flags = make_base_flags();
+            for (auto& f : crt_extra) flags.push_back(f);
+            flags.push_back((mingw_src / "crt" / "crtexe.c").string());
+            flags.push_back("-o");
+            flags.push_back(result.crt2_o.string());
+            auto r = run_process(flags, Path(), true);
+            if (!r.success()) {
+                std::print(std::cerr, "{}", r.stderr_output);
+                std::println(std::cerr, "bake: failed to compile crt2.o");
+                return result;
+            }
+            ++total;
+        }
+    }
+
+    // ── dllcrt2.o (DLL entry point) ──
+    {
+        result.dllcrt2_o = cache_dir / "dllcrt2.o";
+        if (!result.dllcrt2_o.is_regular_file()) {
+            auto flags = make_base_flags();
+            for (auto& f : crt_extra) flags.push_back(f);
+            flags.push_back((mingw_src / "crt" / "crtdll.c").string());
+            flags.push_back("-o");
+            flags.push_back(result.dllcrt2_o.string());
+            auto r = run_process(flags, Path(), true);
+            if (!r.success()) {
+                std::print(std::cerr, "{}", r.stderr_output);
+                std::println(std::cerr, "bake: failed to compile dllcrt2.o");
+                return result;
+            }
+            ++total;
+        }
+    }
+
+    // ── libmingw32.a ──
+    result.libmingw32_a = cache_dir / "libmingw32.a";
+    {
+        auto base_flags = make_base_flags();
+        for (auto& f : crt_extra) base_flags.push_back(f);
+
+        // winpthreads sources get -DIN_WINPTHREAD.
+        auto winpthreads_flags = make_base_flags();
+        winpthreads_flags.push_back("-DIN_WINPTHREAD");
+        winpthreads_flags.push_back("-Wno-unknown-warning-option");
+        for (auto& f : crt_extra) winpthreads_flags.push_back(f);
+        winpthreads_flags.push_back(
+            "-I" + (mingw_src / "winpthreads").string());
+
+        std::vector<Path> objs;
+
+        auto compile_list = [&](const char* const* list, std::size_t count,
+                                const std::string& prefix,
+                                const std::vector<std::string>& flags) -> bool {
+            for (std::size_t i = 0; i < count; ++i) {
+                // Skip sources that don't exist (some are arch-specific).
+                Path src = mingw_src / list[i];
+                if (!src.is_regular_file()) continue;
+                auto obj = compile(flags, list[i], prefix);
+                if (obj.string().empty()) return false;
+                objs.push_back(obj);
+                ++total;
+            }
+            return true;
+        };
+
+#define COMPILE_LIST(lst, pfx, flags) \
+    compile_list(lst, sizeof(lst)/sizeof(lst[0]), pfx, flags)
+
+        if (!COMPILE_LIST(mingw32_crt_src,       "crt",       base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_complex_src,    "complex",   base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_gdtoa_src,      "gdtoa",     base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_math_src,       "math",      base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_misc_src,       "misc",      base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_stdio_src,      "stdio",     base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_string_src,     "string",    base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_libsrc_src,     "libsrc",    base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_other_src,      "other",     base_flags))      return result;
+        if (!COMPILE_LIST(mingw32_winpthreads_src,"winpthr",   winpthreads_flags)) return result;
+
+        // x86-family sources (x86_64 only for now).
+        if (arch == "x86_64" || arch == "i686" || arch == "i386") {
+            if (!COMPILE_LIST(mingw32_x86_src,    "x86",       base_flags))      return result;
+        }
+
+#undef COMPILE_LIST
+
+        write_archive(result.libmingw32_a, objs, false, true);  // COFF format
+    }
+
+    // ── Import libraries from .def files (via LLD COFF driver) ──
+    {
+        for (auto* lib_name : mingw_always_link_libs) {
+            // LLD's COFF driver forces a "lib" prefix and ".lib" extension,
+            // producing "lib<name>.lib". The MinGW driver (ld.lld) searches
+            // for "<name>.lib" (pattern 4), so we rename after generation.
+            Path final_lib = result.import_lib_dir /
+                             (std::string(lib_name) + ".lib");
+            if (final_lib.is_regular_file()) continue;
+
+            // Find .def: arch-specific first, then generic.
+            Path def_file = mingw_src / def_arch_dir /
+                            (std::string(lib_name) + ".def");
+            if (!def_file.is_regular_file()) {
+                def_file = mingw_src / "lib-common" /
+                           (std::string(lib_name) + ".def");
+            }
+            if (!def_file.is_regular_file()) continue;
+
+            std::vector<const char*> lld_args;
+            lld_args.push_back("lld-link");
+            std::string def_arg = "/def:" + def_file.string();
+            std::string out_arg = "/out:" + final_lib.string();
+            std::string mach_arg = "/machine:" + machine;
+            lld_args.push_back(def_arg.c_str());
+            lld_args.push_back(out_arg.c_str());
+            lld_args.push_back(mach_arg.c_str());
+
+            if (bake_lld_link(LldFlavor::COFF,
+                              static_cast<int>(lld_args.size()),
+                              lld_args.data()) != 0) {
+                std::println(std::cerr,
+                    "bake: failed to generate import library for {}", lib_name);
+                // Non-fatal: the linker will report unresolved symbols if needed.
+            }
+
+            // LLD creates "lib<name>.lib" — rename to "<name>.lib".
+            Path lld_output = result.import_lib_dir /
+                              ("lib" + std::string(lib_name) + ".lib");
+            if (lld_output.is_regular_file() && !final_lib.is_regular_file()) {
+                std::error_code ec;
+                std::filesystem::rename(lld_output.string(),
+                                        final_lib.string(), ec);
+            }
+            ++total;
+        }
+    }
+
+    std::println("   Compiled {} mingw-w64 artifacts", total);
+    write_file(sentinel, "");
+    return result;
 }
 
 // ── Unified runtime preparation ──
@@ -1307,6 +1857,21 @@ export RuntimeArtifacts prepare_runtime(
         } else {
             rt.link_dirs.push_back((lib / "libc" / "darwin").string());
         }
+        break;
+    }
+    case LibcFamily::Windows: {
+        auto mingw = ensure_mingw_objects(tc);
+        rt.libc = mingw.libmingw32_a;
+        // Don't inject crt entry — the Clang driver adds crt2.o itself as
+        // a bare filename. We just need it in the -L search path (below).
+        // Link search paths: cache dir (for crt2.o, libmingw32.a) + import libs.
+        if (!mingw.crt2_o.string().empty()) {
+            rt.link_dirs.push_back(mingw.crt2_o.parent().string());
+            rt.mingw_import_dir = mingw.import_lib_dir.string();
+        }
+        // Always-link system libraries.
+        for (auto* lib : mingw_always_link_libs)
+            rt.always_link_libs.push_back(lib);
         break;
     }
     case LibcFamily::None:
