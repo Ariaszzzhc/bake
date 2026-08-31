@@ -2,7 +2,7 @@
 
 ## What is bake
 
-bake is an all-in-one C/C++ build system and compiler toolchain. Think "Cargo for C++" meets `zig cc`: convention-based builds, a `build.cpp` escape hatch, package management, and an integrated LLVM/Clang toolchain — all in one binary, zero external dependencies.
+bake is an all-in-one C/C++ build system and compiler toolchain. Think "Cargo for C++" meets `zig cc`: default source discovery, programmable `build.cpp` input declarations, package management, and an integrated LLVM/Clang toolchain — all in one binary, zero external dependencies.
 
 APIs are not frozen — make changes clean, not backward-compatible.
 
@@ -12,7 +12,7 @@ APIs are not frozen — make changes clean, not backward-compatible.
 # Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 19 + libc++)
 cmake -G Ninja -B build && cmake --build build
 
-# Run the test suite (55 end-to-end tests)
+# Run the test suite (62 end-to-end tests)
 ctest --test-dir build --output-on-failure
 
 # Self-host: stage 0 bake builds itself → out/bin/bake
@@ -64,10 +64,10 @@ A "moid" (模具) is bake's unit of compilation — one `bake.toml` describes on
 
 ### Build pipeline (single path)
 
-Convention mode and `build.cpp` mode both produce the same `MoidDeclaration` JSON. After configure, everything converges:
+Every moid follows one configure and build pipeline:
 
 1. **resolve_moid_graph** — resolve workspace + dependencies into a topological `MoidGraph`.
-2. **configure_moid_graph** — for each moid: run `build.cpp` (if present) or convention scan → `MoidDeclaration` JSON in `out/.bake/`.
+2. **configure_moid_graph** — for each moid: obtain inputs from default discovery or `build.cpp`, merge authoritative `bake.toml` configuration, then write one `MoidDeclaration` JSON in `out/.bake/`.
 3. **build_graph** — translate declarations into a flat `BuildAction` list (compile, compile_module, archive, link) with dependency edges.
 4. **execute_graph** — parallel executor with content-based fingerprinting. Dirty detection + propagation, thread pool, incremental rebuilds.
 
@@ -138,7 +138,7 @@ bake/
 ├── tests/
 │   ├── test_runner.cpp          custom test framework, spawns bake binary
 │   ├── graph_test.cpp           unit tests for graph/moid logic
-│   └── projects/                fixture projects (55 test cases)
+│   └── projects/                fixture projects (62 test cases)
 └── external/              LLVM source + prebuilt install (git submodule)
 ```
 
@@ -149,7 +149,10 @@ bake/
 name = "myapp"
 version = "0.1.0"
 type = "executable"          # executable (default) | lib | dylib
-std = "c++23"                # c11 | c17 | c23 | c++17 | c++20 | c++23
+
+[language]                    # defaults: c++17 / c17
+cxx = "c++23"                # c++17 | c++20 | c++23
+c = "c17"                    # c11 | c17 | c23
 
 [options]                    # bool-only feature flags → BAKE_<MOID>_<OPTION> macros
 use_tls = false

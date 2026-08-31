@@ -258,6 +258,11 @@ private:
 class TestRegistration {
 public:
     TestRegistration& set_default() {
+        // Later calls override earlier ones: at most one default exists.
+        if (siblings_) {
+            for (auto& other : *siblings_)
+                other.is_default = false;
+        }
         is_default = true;
         return *this;
     }
@@ -265,6 +270,10 @@ public:
     std::string name;
     std::string binary;
     bool is_default = false;
+
+private:
+    friend class Builder;
+    std::vector<TestRegistration>* siblings_ = nullptr;
 };
 
 class Builder {
@@ -363,7 +372,11 @@ public:
 
     TestRegistration& add_test(std::string_view test_name,
                                std::string_view binary_name) {
-        tests_.push_back({std::string(test_name), std::string(binary_name), false});
+        TestRegistration registration;
+        registration.name = std::string(test_name);
+        registration.binary = std::string(binary_name);
+        registration.siblings_ = &tests_;
+        tests_.push_back(std::move(registration));
         return tests_.back();
     }
 

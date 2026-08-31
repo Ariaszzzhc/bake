@@ -416,6 +416,21 @@ export void print_command_help(std::string_view cmd) {
         "    --offline                No network access\n"
         "    --frozen                 --locked + --offline\n"
         "    -v, --verbose            Show per-file compile progress");
+  } else if (cmd == "test") {
+    std::println(
+        "bake test — Build and run registered tests\n"
+        "\n"
+        "USAGE:\n"
+        "    bake test [name] [options]\n"
+        "\n"
+        "Runs the default test registered via build.cpp (b.add_test()), the\n"
+        "named test, or every test with --all. Exits non-zero if any test\n"
+        "fails.\n"
+        "\n"
+        "OPTIONS:\n"
+        "    --all                     Run every registered test\n"
+        "    -p <member>               Test specific workspace member\n"
+        "    -j <n>                    Parallel job count for the build");
   } else if (cmd == "clean") {
     std::println("bake clean — Remove build artifacts\n"
                  "\n"
@@ -559,7 +574,7 @@ export int cmd_init(const ParsedArgs &args) {
 //
 // Compiles build.cpp + bake.build.cppm into a small executable. The script
 // persists its declaration at BAKE_DECLARATION_PATH, which is then read through
-// the same strict codec used by convention mode.
+// the same strict codec used for every input declaration.
 
 MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
                                           const Manifest &manifest,
@@ -768,7 +783,7 @@ namespace {
 
 // Merge bake.toml configuration (profile, target conditions, options, link)
 // into a declaration. Called after obtaining the input description from
-// either convention scan or build.cpp.
+// either default discovery or build.cpp.
 void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
                            const Toolchain &tc,
                            const std::string &profile_name) {
@@ -971,9 +986,24 @@ configure_moid_graph(MoidGraph &graph, const Toolchain &tc, const Path &out_dir,
     } else {
       // Default: scan src/ + public/
       auto layout = Layout::detect(moid_dir);
-      declaration = convention_declare(*manifest, layout, node.id.value,
-                                       node.declaration.options,
-                                       node.declaration.dependencies);
+      declaration = declare_default_inputs(*manifest, layout, node.id.value,
+                                           node.declaration.options,
+                                           node.declaration.dependencies);
+    }
+
+    // Incremental mode: a build.cpp that describes no main-moid inputs
+    // (only binaries, tests, or prebuilt libs) keeps default input
+    // discovery for the main moid.
+    if ((moid_dir / "build.cpp").is_regular_file() &&
+        declaration.sources.empty() &&
+        declaration.public_include_dirs.empty()) {
+      auto layout = Layout::detect(moid_dir);
+      auto discovered = declare_default_inputs(
+          *manifest, layout, node.id.value, node.declaration.options,
+          node.declaration.dependencies);
+      declaration.sources = std::move(discovered.sources);
+      declaration.public_include_dirs =
+          std::move(discovered.public_include_dirs);
     }
 
     // 3. Merge bake.toml configuration
@@ -1635,7 +1665,11 @@ export int cmd_update(const ParsedArgs &args) {
   return 0;
 }
 
-// ===== Stub commands =====
+// ===== test command =====
+//
+// Orchestration layer: builds the project, then runs the test binaries that
+// build.cpp registered via b.add_test(). The tests' "testness" lives inside
+// the binaries; bake only discovers, builds, runs, and reports.
 
 export int cmd_test(const ParsedArgs &args) {
   // Build first with dev profile.
@@ -1643,9 +1677,119 @@ export int cmd_test(const ParsedArgs &args) {
   if (build_result != 0)
     return build_result;
 
-  // TODO: collect test registrations from declarations and run them.
-  std::println("bake: test not yet fully implemented");
-  return 0;
+  auto root = find_project_root();
+  if (!root)
+    return 1;
+
+  auto manifest = Manifest::load(*root);
+  if (!manifest) {
+    std::println(std::cerr, "bake: failed to load bake.toml");
+    return 1;
+  }
+
+  auto selected_member =
+      resolve_workspace_member_selection(*manifest, args.get_option("p"));
+  if (!selected_member) {
+    std::println(std::cerr, "bake: {}", selected_member.error());
+    return 1;
+  }
+
+  BuildSelection selection;
+  selection.workspace_member = std::move(*selected_member);
+  ResolvePolicy policy;
+  policy.locked = args.has_option("locked") || args.has_option("frozen");
+  policy.offline = args.has_option("offline") || args.has_option("frozen");
+  auto outer_graph = resolve_moid_graph(*manifest, selection, policy);
+  if (!outer_graph) {
+    std::println(std::cerr, "bake: {}", outer_graph.error());
+    return 1;
+  }
+
+  // Must match what cmd_build used.
+  TargetSpec target;
+  if (auto t = args.get_option("target"))
+    target = parse_target(*t);
+  else if (auto t = args.get_option("t"))
+    target = parse_target(*t);
+  std::string triple_dir =
+      target.is_native() ? detect_host_target().triple_ : target.triple_;
+  const Path out_dir = *root / "out" / triple_dir;
+
+  // Collect registrations from the selected roots, in declaration order.
+  struct Registration {
+    std::string name;
+    std::string binary;
+    bool is_default = false;
+  };
+  std::vector<Registration> registrations;
+  for (const auto &id : outer_graph->roots) {
+    auto declaration =
+        read_moid_declaration(moid_declaration_path(out_dir, id.value));
+    if (!declaration) {
+      std::println(std::cerr, "bake: {}", declaration.error());
+      return 1;
+    }
+    for (const auto &test : declaration->tests)
+      registrations.push_back({test.name, test.binary, test.is_default});
+  }
+
+  if (registrations.empty()) {
+    std::println("bake: no tests registered");
+    return 0;
+  }
+
+  // --all runs everything; a positional names one test; otherwise the
+  // registration marked default runs (the last marker wins).
+  std::vector<Registration> selected;
+  if (args.has_option("all")) {
+    selected = registrations;
+  } else if (!args.positional.empty()) {
+    for (const auto &registration : registrations)
+      if (registration.name == args.positional[0])
+        selected.push_back(registration);
+    if (selected.empty()) {
+      std::println(std::cerr, "bake: no test named '{}'", args.positional[0]);
+      return 1;
+    }
+  } else {
+    const Registration *default_test = nullptr;
+    for (const auto &registration : registrations)
+      if (registration.is_default)
+        default_test = &registration;
+    if (!default_test) {
+      std::println(std::cerr,
+                   "bake: no default test registered; use 'bake test <name>' "
+                   "or --all");
+      return 1;
+    }
+    selected.push_back(*default_test);
+  }
+
+  int failures = 0;
+  for (const auto &registration : selected) {
+    Path binary_path = out_dir / "bin" /
+        library_name(registration.binary, MoidType::Executable, target);
+    if (!binary_path.exists()) {
+      std::println(std::cerr, "bake: test binary '{}' not found at {}",
+                   registration.binary, binary_path.string());
+      ++failures;
+      continue;
+    }
+    std::println("   Running {}", registration.name);
+    auto result = run_process(binary_path.string(), {}, *root);
+    if (result.success()) {
+      std::println("   Passed {}", registration.name);
+    } else {
+      std::println(std::cerr, "   Failed {} (exit {})", registration.name,
+                   result.exit_code);
+      ++failures;
+    }
+  }
+
+  if (failures > 0)
+    std::println(std::cerr, "bake: {} of {} selected test(s) failed", failures,
+                 selected.size());
+  return failures > 0 ? 1 : 0;
 }
 
 // ===== Main dispatch =====

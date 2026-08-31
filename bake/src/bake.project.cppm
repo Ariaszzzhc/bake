@@ -419,11 +419,11 @@ export struct Manifest {
     }
 };
 
-// ===== Layout (directory conventions) =====
+// ===== Default source layout =====
 //
-// Convention-based source discovery: src/ for implementation, public/ for
-// headers and module interfaces. All build outputs go under out/ and are
-// managed by the build graph — Layout only describes source-side structure.
+// Default input discovery uses src/ for implementation and public/ for headers
+// and module interfaces. All build outputs go under out/ and are managed by the
+// build graph — Layout only describes source-side structure.
 
 export struct Layout {
     Path root;          // source root (contains bake.toml)

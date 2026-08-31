@@ -1,5 +1,5 @@
 [package]
-name = "convention-source-extensions"
+name = "default-source-extensions"
 version = "0.1.0"
 type = "executable"
 

@@ -43,31 +43,26 @@ bake 结合了两者：Cargo 的人体工学 + zig cc 的自包含工具链，�
 
 ## 功能
 
-### 约定式构建
+### 默认源码发现
 
 在 `src/` 旁边放一个 `bake.toml`，bake 自动发现源码、编译、链接。不需要任何构建脚本。
 
-### `build.cpp` 逃生舱
+### 使用 `build.cpp` 描述可编程输入
 
-约定不够用时，写一个 `build.cpp`：
+当 moid 需要显式发现源码、声明 public 头文件、预构建库、额外 binary 或测试注册时，使用 `build.cpp`：
 
 ```cpp
 import bake.build;
 
 int main() {
     bake::Builder builder;
-    builder.executable("myapp")
-        .sources("src/*.cpp")
-        .sources("src/platform/*.cpp", {
-            .defines = {"PLATFORM_LINUX"}
-        })
-        .include_dirs("include")
-        .std("c++23");
+    builder.sources({"src/*.cpp", "src/platform/*.cpp"})
+        .include_dirs("include");
     return builder.build();
 }
 ```
 
-bake 在 configure 阶段编译并执行这个脚本。两条路径产出相同的内部表示——没有二等公民。
+bake 在解析输入时编译并执行这个脚本。语言标准、profile、target 条件、define 和系统库仍由 `bake.toml` 配置；统一的 configure 管线将它们合并为一个 `MoidDeclaration`。
 
 ### 交叉编译
 

@@ -8,8 +8,7 @@ int main() {
     include_dir.push_back('\x01');
 
     bake::Builder builder;
-    builder.executable("declaration-json-escape")
-        .sources("src/main.cpp")
+    builder.sources("src/main.cpp")
         .include_dirs(include_dir);
     return builder.build();
 }

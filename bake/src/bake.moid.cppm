@@ -18,6 +18,18 @@ export struct MoidDependency {
     std::vector<std::string> options;
 };
 
+export struct BinaryDeclaration {
+    std::string name;
+    std::vector<SourceGroup> sources;
+    std::vector<std::string> include_dirs;
+};
+
+export struct TestRegistration {
+    std::string name;
+    std::string binary;
+    bool is_default = false;
+};
+
 export struct MoidDeclaration {
     std::string id;
     std::string name;
@@ -39,6 +51,10 @@ export struct MoidDeclaration {
     std::vector<std::string> link_flags;
     // Prebuilt libraries (.a/.so paths for linking)
     std::vector<std::string> prebuilt_libs;
+    // Extra executables sharing the main moid's exports and configuration
+    std::vector<BinaryDeclaration> binaries;
+    // Named test mappings onto declared binaries
+    std::vector<TestRegistration> tests;
 };
 
 namespace {
@@ -130,6 +146,44 @@ std::expected<std::map<std::string, BuildOption>, std::string> required_options(
     return options_from_json(**value, field_path(parent, name));
 }
 
+std::expected<std::vector<SourceGroup>, std::string> source_groups_from_json(
+        const Json& value, std::string_view path) {
+    if (!value.is_array()) {
+        return std::unexpected(
+            "moid declaration field '" + std::string(path) +
+            "' must be an array");
+    }
+
+    std::vector<SourceGroup> result;
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        const std::string entry_path =
+            std::string(path) + "[" + std::to_string(i) + "]";
+        if (!value[i].is_object()) {
+            return std::unexpected(
+                "moid declaration field '" + entry_path +
+                "' must be an object");
+        }
+
+        SourceGroup group;
+        auto pattern = required_string(value[i], "pattern", entry_path);
+        if (!pattern) return std::unexpected(pattern.error());
+        group.pattern = std::move(*pattern);
+
+        auto visibility =
+            required_string(value[i], "visibility", entry_path);
+        if (!visibility) return std::unexpected(visibility.error());
+        if (*visibility == "public") {
+            group.is_public = true;
+        } else if (*visibility != "private") {
+            return std::unexpected(
+                "unknown source visibility '" + *visibility + "'");
+        }
+        result.push_back(std::move(group));
+    }
+    return result;
+}
+
+
 Json options_to_json(const std::map<std::string, BuildOption>& options) {
     Json result = Json::object();
     for (const auto& [name, option] : options) {
@@ -212,6 +266,30 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
     document["link_flags"] = declaration.link_flags;
     document["prebuilt_libs"] = declaration.prebuilt_libs;
 
+    document["binaries"] = Json::array();
+    for (const auto& binary : declaration.binaries) {
+        Json entry;
+        entry["name"] = binary.name;
+        entry["sources"] = Json::array();
+        for (const auto& source : binary.sources) {
+            entry["sources"].push_back({
+                {"pattern", source.pattern},
+                {"visibility", source.is_public ? "public" : "private"},
+            });
+        }
+        entry["include_dirs"] = binary.include_dirs;
+        document["binaries"].push_back(std::move(entry));
+    }
+
+    document["tests"] = Json::array();
+    for (const auto& test : declaration.tests) {
+        document["tests"].push_back({
+            {"name", test.name},
+            {"binary", test.binary},
+            {"is_default", test.is_default},
+        });
+    }
+
     return document;
 }
 
@@ -267,30 +345,10 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
         return std::unexpected(
             "moid declaration field 'sources' must be an array");
     }
-    for (std::size_t i = 0; i < (**sources).size(); ++i) {
-        const Json& source = (**sources)[i];
-        const std::string path = "sources[" + std::to_string(i) + "]";
-        if (!source.is_object()) {
-            return std::unexpected(
-                "moid declaration field '" + path + "' must be an object");
-        }
-
-        SourceGroup group;
-        auto pattern = required_string(source, "pattern", path);
-        if (!pattern) return std::unexpected(pattern.error());
-        group.pattern = std::move(*pattern);
-
-        auto visibility = required_string(source, "visibility", path);
-        if (!visibility) return std::unexpected(visibility.error());
-        if (*visibility == "public") {
-            group.is_public = true;
-        } else if (*visibility != "private") {
-            return std::unexpected(
-                "unknown source visibility '" + *visibility + "'");
-        }
-
-        declaration.sources.push_back(std::move(group));
-    }
+    auto source_groups =
+        source_groups_from_json(**sources, "sources");
+    if (!source_groups) return std::unexpected(source_groups.error());
+    declaration.sources = std::move(*source_groups);
 
     auto public_include_dirs =
         required_string_array(document, "public_include_dirs");
@@ -374,6 +432,99 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
     auto prebuilt_libs = required_string_array(document, "prebuilt_libs");
     if (!prebuilt_libs) return std::unexpected(prebuilt_libs.error());
     declaration.prebuilt_libs = std::move(*prebuilt_libs);
+    // Optional: extra binaries and test registrations (build.cpp-declared
+    // inputs). Cached declarations written before these fields existed parse
+    // as empty.
+    std::set<std::string> binary_names;
+    auto binaries_field = document.find("binaries");
+    if (binaries_field != document.end()) {
+        if (!binaries_field->is_array()) {
+            return std::unexpected(
+                "moid declaration field 'binaries' must be an array");
+        }
+        for (std::size_t i = 0; i < binaries_field->size(); ++i) {
+            const Json& entry = (*binaries_field)[i];
+            const std::string path =
+                "binaries[" + std::to_string(i) + "]";
+            if (!entry.is_object()) {
+                return std::unexpected(
+                    "moid declaration field '" + path +
+                    "' must be an object");
+            }
+
+            BinaryDeclaration binary;
+            auto name = required_string(entry, "name", path);
+            if (!name) return std::unexpected(name.error());
+            binary.name = std::move(*name);
+            if (!binary_names.insert(binary.name).second) {
+                return std::unexpected(
+                    "duplicate binary name '" + binary.name + "'");
+            }
+
+            auto sources = required_field(entry, "sources", path);
+            if (!sources) return std::unexpected(sources.error());
+            auto source_groups =
+                source_groups_from_json(**sources, path + ".sources");
+            if (!source_groups)
+                return std::unexpected(source_groups.error());
+            binary.sources = std::move(*source_groups);
+
+            auto include_dirs =
+                required_string_array(entry, "include_dirs", path);
+            if (!include_dirs)
+                return std::unexpected(include_dirs.error());
+            binary.include_dirs = std::move(*include_dirs);
+
+            declaration.binaries.push_back(std::move(binary));
+        }
+    }
+
+    auto tests_field = document.find("tests");
+    if (tests_field != document.end()) {
+        if (!tests_field->is_array()) {
+            return std::unexpected(
+                "moid declaration field 'tests' must be an array");
+        }
+        std::set<std::string> test_names;
+        for (std::size_t i = 0; i < tests_field->size(); ++i) {
+            const Json& entry = (*tests_field)[i];
+            const std::string path = "tests[" + std::to_string(i) + "]";
+            if (!entry.is_object()) {
+                return std::unexpected(
+                    "moid declaration field '" + path +
+                    "' must be an object");
+            }
+
+            TestRegistration test;
+            auto name = required_string(entry, "name", path);
+            if (!name) return std::unexpected(name.error());
+            test.name = std::move(*name);
+            if (!test_names.insert(test.name).second) {
+                return std::unexpected(
+                    "duplicate test name '" + test.name + "'");
+            }
+
+            auto binary_name = required_string(entry, "binary", path);
+            if (!binary_name) return std::unexpected(binary_name.error());
+            test.binary = std::move(*binary_name);
+            if (!binary_names.contains(test.binary)) {
+                return std::unexpected(
+                    "test '" + test.name + "' references undeclared binary '" +
+                    test.binary + "'");
+            }
+
+            auto is_default = required_field(entry, "is_default", path);
+            if (!is_default) return std::unexpected(is_default.error());
+            if (!(**is_default).is_boolean()) {
+                return std::unexpected(
+                    "moid declaration field '" + path +
+                    ".is_default' must be a boolean");
+            }
+            test.is_default = (**is_default).get<bool>();
+
+            declaration.tests.push_back(std::move(test));
+        }
+    }
 
     return declaration;
 }

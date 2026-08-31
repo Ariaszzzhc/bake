@@ -4,8 +4,7 @@ import std;
 int main() {
     bake::Builder b;
     const auto upstream = std::string(b.dep_src_dir("upstream"));
-    b.lib("base")
-        .sources(upstream + (b.option_bool("wolfssl")
+    b.sources(upstream + (b.option_bool("wolfssl")
             ? "/src/base_wolfssl.cpp"
             : "/src/base_mbedtls.cpp"))
         .public_headers(upstream + "/include");

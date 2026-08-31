@@ -12,7 +12,7 @@ import nlohmann.json;
 // bake.engine — MoidDeclaration, unified DAG, executor
 //
 // Two-phase architecture:
-//   Configure: convention or build.cpp → MoidDeclaration JSON
+//   Configure: resolve inputs + merge bake.toml config → MoidDeclaration JSON
 //   Build:      declarations → unified DAG → graph.json → execute
 // ============================================================
 
@@ -283,11 +283,11 @@ export struct BuildGraph {
     Path project_root;           // workspace root (execution working dir)
 };
 
-// ===== Convention declaration =====
+// ===== Default input declaration =====
 //
-// Scans src/ and public/ per bake conventions and produces a declaration.
+// Discovers inputs from the default src/ and public/ layout.
 
-export MoidDeclaration convention_declare(
+export MoidDeclaration declare_default_inputs(
         const Manifest& manifest, const Layout& layout,
         const std::string& canonical_id,
         const std::map<std::string, BuildOption>& options,
@@ -398,8 +398,9 @@ export MoidDeclaration convention_declare(
 //        ▼
 //   Link / archive → terminal artifacts (executable / .a / .dylib)
 //
-// Convention mode and build.cpp mode both produce the same MoidDeclaration
-// JSON, so they converge here — the DAG builder never distinguishes them.
+// Input discovery and bake.toml configuration are resolved before this point;
+// the DAG builder consumes one MoidDeclaration and never distinguishes how its
+// inputs were described.
 
 namespace {
 
@@ -621,18 +622,21 @@ export std::expected<BuildGraph, std::string> build_graph(
     std::vector<std::string> moid_order;
     std::map<std::string, std::string> storage_owners;
 
-    for (const auto& id : *topology) {
-        const auto& decl = outer_graph.nodes.at(id).declaration;
+    // Resolves one declaration (main moid or extra binary) into the graph:
+    // expands sources, validates the terminal name, claims the output path.
+    auto resolve_into_graph = [&](const std::string& canonical_id,
+                                  const MoidDeclaration& decl)
+            -> std::expected<void, std::string> {
         ResolvedMoid rm;
         rm.decl = &decl;
-        rm.canonical_id = id.value;
-        rm.storage_key = moid_storage_key(id.value);
+        rm.canonical_id = canonical_id;
+        rm.storage_key = moid_storage_key(canonical_id);
         auto [storage, storage_inserted] =
-            storage_owners.emplace(rm.storage_key, id.value);
-        if (!storage_inserted && storage->second != id.value) {
+            storage_owners.emplace(rm.storage_key, canonical_id);
+        if (!storage_inserted && storage->second != canonical_id) {
             return std::unexpected(
                 "canonical moid storage key collision between '" +
-                storage->second + "' and '" + id.value + "'");
+                storage->second + "' and '" + canonical_id + "'");
         }
 
         rm.source_dir = Path(decl.root);
@@ -707,13 +711,13 @@ export std::expected<BuildGraph, std::string> build_graph(
                 declared_name.filename() != declared_name) {
                 return std::unexpected(
                     "invalid terminal output name '" + decl.name +
-                    "' for moid '" + id.value +
+                    "' for moid '" + canonical_id +
                     "': expected a single filename component");
             }
             if (!is_portable_terminal_name(decl.name)) {
                 return std::unexpected(
                     "invalid terminal output name '" + decl.name +
-                    "' for moid '" + id.value +
+                    "' for moid '" + canonical_id +
                     "': expected a portable ASCII name matching "
                     "[A-Za-z0-9][A-Za-z0-9._+@-]* without a trailing dot or "
                     "reserved device name");
@@ -732,10 +736,10 @@ export std::expected<BuildGraph, std::string> build_graph(
             }
             const std::string output_key =
                 portable_terminal_key(*relative_output);
-            TerminalClaim owner{id.value, decl.name};
+            TerminalClaim owner{canonical_id, decl.name};
             auto [claim, inserted] =
                 terminal_claims.emplace(output_key, owner);
-            if (!inserted && claim->second.canonical_id != id.value) {
+            if (!inserted && claim->second.canonical_id != canonical_id) {
                 TerminalClaim left = claim->second;
                 TerminalClaim right = std::move(owner);
                 if (right.canonical_id < left.canonical_id)
@@ -753,9 +757,59 @@ export std::expected<BuildGraph, std::string> build_graph(
         if (has_terminal)
             rm.output.parent().mkdir_recursive();
 
-        moids.emplace(id.value, std::move(rm));
-        moid_exports.try_emplace(id.value);
-        moid_order.push_back(id.value);
+        moids.emplace(canonical_id, std::move(rm));
+        moid_exports.try_emplace(canonical_id);
+        moid_order.push_back(canonical_id);
+        return {};
+    };
+
+    for (const auto& id : *topology) {
+        auto resolved = resolve_into_graph(
+            id.value, outer_graph.nodes.at(id).declaration);
+        if (!resolved) return std::unexpected(resolved.error());
+    }
+
+    // ── Extra binaries: synthetic executable moids that depend on the moid
+    // declaring them. Each binary inherits the merged configuration and the
+    // declaring moid's public usage through the normal dependency mechanism.
+    std::map<std::string, MoidDeclaration> binary_declarations;
+    for (std::size_t index = 0; index < moid_order.size(); ++index) {
+        // Index-based: binaries appended below must not be visited as
+        // declaring moids.
+        const std::string main_id = moid_order[index];
+        const MoidDeclaration& decl = *moids.at(main_id).decl;
+        if (decl.binaries.empty()) continue;
+        if (decl.type == MoidType::Executable) {
+            return std::unexpected(
+                "binary declarations require moid '" + decl.name +
+                "' to be a lib or dylib, not an executable");
+        }
+
+        for (const auto& binary : decl.binaries) {
+            const std::string synthetic_id =
+                "binary:" + main_id + ":" + binary.name;
+            MoidDeclaration& synthetic = binary_declarations[synthetic_id];
+            synthetic = decl;
+            synthetic.id = synthetic_id;
+            synthetic.name = binary.name;
+            synthetic.type = MoidType::Executable;
+            synthetic.sources = binary.sources;
+            synthetic.public_include_dirs.clear();
+            synthetic.extra_include_dirs = binary.include_dirs;
+            synthetic.extra_include_dirs.insert(
+                synthetic.extra_include_dirs.end(),
+                decl.extra_include_dirs.begin(),
+                decl.extra_include_dirs.end());
+            synthetic.libraries.clear();
+            synthetic.frameworks.clear();
+            synthetic.prebuilt_libs.clear();
+            synthetic.dependencies = {MoidDependency{"", main_id, {}}};
+            synthetic.binaries.clear();
+            synthetic.tests.clear();
+
+            auto resolved = resolve_into_graph(synthetic_id, synthetic);
+            if (!resolved) return std::unexpected(resolved.error());
+        }
     }
 
     // Dependencies precede consumers in moid_order. Merge each reachable

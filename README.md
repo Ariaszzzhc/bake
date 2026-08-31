@@ -45,31 +45,26 @@ All three libc families are self-contained — no SDK, no sysroot, no NDK needed
 
 ## Features
 
-### Convention-based builds
+### Default source discovery
 
 Drop a `bake.toml` next to `src/` and bake does the rest. It discovers sources, compiles them, links the result. No build script required.
 
-### The `build.cpp` escape hatch
+### Programmable inputs with `build.cpp`
 
-When conventions aren't enough, write a `build.cpp`:
+Use `build.cpp` when a moid needs explicit source discovery, public headers, prebuilt libraries, extra binaries, or test registrations:
 
 ```cpp
 import bake.build;
 
 int main() {
     bake::Builder builder;
-    builder.executable("myapp")
-        .sources("src/*.cpp")
-        .sources("src/platform/*.cpp", {
-            .defines = {"PLATFORM_LINUX"}
-        })
-        .include_dirs("include")
-        .std("c++23");
+    builder.sources({"src/*.cpp", "src/platform/*.cpp"})
+        .include_dirs("include");
     return builder.build();
 }
 ```
 
-bake compiles and runs this script during configure. Both paths produce the same internal representation — no second-class citizen.
+bake compiles and runs this script while resolving inputs. Language standards, profiles, target conditions, defines, and system libraries remain in `bake.toml`; the unified configure pipeline merges them into one `MoidDeclaration`.
 
 ### Cross-compilation
 

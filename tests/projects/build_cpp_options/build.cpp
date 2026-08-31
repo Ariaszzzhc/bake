@@ -3,12 +3,11 @@ import bake.build;
 int main() {
     bake::Builder b;
 
-    b.executable("option-app")
-        .sources({
-            "src/main.c",
-            "src/left/value.c",
-            "src/right/value.c",
-        });
+    b.sources({
+        "src/main.c",
+        "src/left/value.c",
+        "src/right/value.c",
+    });
 
     if (b.option_bool("native-backend"))
         b.sources("src/backend/native.c");

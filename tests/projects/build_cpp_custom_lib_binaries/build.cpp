@@ -3,11 +3,10 @@ import bake.build;
 int main() {
     bake::Builder b;
 
-    // This describes inputs for the main lib already defined by bake.toml.
-    // It does not create, rename, or retype the main moid.
-    b.lib("custom-input-lib")
-        .sources("custom/src/value.cpp")
-        .public_headers("custom/include");
+    // Top-level calls describe inputs for the main lib already defined by
+    // bake.toml. They do not create, rename, or retype the main moid.
+    b.sources("custom/src/value.cpp");
+    b.public_headers("custom/include");
 
     b.binary("custom-tool-a")
         .sources("tools/tool_a.cpp");

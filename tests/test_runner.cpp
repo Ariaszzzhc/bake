@@ -471,116 +471,116 @@ TestResult test_invalid_moid_type() {
     return {};
 }
 
-TestResult test_declaration_equivalence() {
-    auto dir = make_temp_dir("declaration_equivalence");
-    auto convention_dir = dir / "convention";
-    auto scripted_dir = dir / "scripted";
-    copy_fixture("declaration_equivalence/convention", convention_dir);
-    copy_fixture("declaration_equivalence/scripted", scripted_dir);
+TestResult test_input_declaration_equivalence() {
+    auto dir = make_temp_dir("input_declaration_equivalence");
+    auto default_dir = dir / "default_discovery";
+    auto build_cpp_dir = dir / "build_cpp";
+    copy_fixture("declaration_equivalence/default_discovery", default_dir);
+    copy_fixture("declaration_equivalence/build_cpp", build_cpp_dir);
 
-    auto convention_build = run_bake("build", convention_dir);
-    auto scripted_build = run_bake("build", scripted_dir);
-    CHECK(convention_build.success(),
-          "convention declaration build failed: " + convention_build.stdout);
+    auto default_build = run_bake("build", default_dir);
+    auto build_cpp_build = run_bake("build", build_cpp_dir);
+    CHECK(default_build.success(),
+          "default input declaration build failed: " + default_build.stdout);
 
-    auto convention_path = find_moid_declaration(
-        target_output_dir(convention_dir) / ".bake");
-    CHECK(convention_path.has_value(),
-          "convention build did not persist a .moid.json declaration");
-    const std::string convention_json = read_file(*convention_path);
-    CHECK_EQ(json_scalar_field(convention_json, "name").value_or("<missing>"),
+    auto default_path = find_moid_declaration(
+        target_output_dir(default_dir) / ".bake");
+    CHECK(default_path.has_value(),
+          "default input discovery did not persist a .moid.json declaration");
+    const std::string default_json = read_file(*default_path);
+    CHECK_EQ(json_scalar_field(default_json, "name").value_or("<missing>"),
              std::string("declaration-equivalence"),
-             "convention declaration has the wrong name");
-    CHECK_EQ(json_scalar_field(convention_json, "type").value_or("<missing>"),
+             "default input declaration has the wrong name");
+    CHECK_EQ(json_scalar_field(default_json, "type").value_or("<missing>"),
              std::string("executable"),
-             "convention declaration did not normalize the default type");
-    CHECK_EQ(json_key_count(convention_json, "pattern"), std::size_t(1),
-             "convention declaration must contain exactly one source group");
-    CHECK_EQ(json_scalar_field(convention_json, "pattern").value_or("<missing>"),
+             "default input declaration did not normalize the default type");
+    CHECK_EQ(json_key_count(default_json, "pattern"), std::size_t(1),
+             "default input declaration must contain exactly one source group");
+    CHECK_EQ(json_scalar_field(default_json, "pattern").value_or("<missing>"),
              std::string("src/main.cpp"),
-             "convention declaration has the wrong source pattern");
-    CHECK_EQ(json_scalar_field(convention_json, "visibility").value_or("<missing>"),
+             "default input declaration has the wrong source pattern");
+    CHECK_EQ(json_scalar_field(default_json, "visibility").value_or("<missing>"),
              std::string("private"),
-             "convention declaration has the wrong source visibility");
-    CHECK_EQ(json_value_field(convention_json, "options").value_or("<missing>"),
-             std::string("{}"), "convention declaration options are not empty");
-    CHECK(json_value_field(convention_json, "flags").has_value(),
-          "convention declaration has no source flags field");
-    CHECK(json_value_field(convention_json, "defines").has_value(),
-          "convention declaration has no source defines field");
-    CHECK(json_value_field(convention_json, "include_dirs").has_value(),
-          "convention declaration has no source include_dirs field");
-    CHECK_EQ(json_value_field(convention_json, "public_include_dirs").value_or("<missing>"),
+             "default input declaration has the wrong source visibility");
+    CHECK_EQ(json_value_field(default_json, "options").value_or("<missing>"),
+             std::string("{}"), "default input declaration options are not empty");
+    CHECK(json_value_field(default_json, "flags").has_value(),
+          "default input declaration has no source flags field");
+    CHECK(json_value_field(default_json, "defines").has_value(),
+          "default input declaration has no source defines field");
+    CHECK(json_value_field(default_json, "include_dirs").has_value(),
+          "default input declaration has no source include_dirs field");
+    CHECK_EQ(json_value_field(default_json, "public_include_dirs").value_or("<missing>"),
              std::string("[]"),
-             "convention public_include_dirs are not empty");
-    CHECK_EQ(json_value_field(convention_json, "libraries").value_or("<missing>"),
-             std::string("[]"), "convention libraries are not empty");
-    CHECK_EQ(json_value_field(convention_json, "frameworks").value_or("<missing>"),
-             std::string("[]"), "convention frameworks are not empty");
-    CHECK_EQ(json_value_field(convention_json, "prebuilt_libs").value_or("<missing>"),
-             std::string("[]"), "convention prebuilt_libs are not empty");
-    CHECK_EQ(json_value_field(convention_json, "dependencies").value_or("<missing>"),
-             std::string("[]"), "convention dependencies are not empty");
+             "default public_include_dirs are not empty");
+    CHECK_EQ(json_value_field(default_json, "libraries").value_or("<missing>"),
+             std::string("[]"), "default input libraries are not empty");
+    CHECK_EQ(json_value_field(default_json, "frameworks").value_or("<missing>"),
+             std::string("[]"), "default input frameworks are not empty");
+    CHECK_EQ(json_value_field(default_json, "prebuilt_libs").value_or("<missing>"),
+             std::string("[]"), "default input prebuilt_libs are not empty");
+    CHECK_EQ(json_value_field(default_json, "dependencies").value_or("<missing>"),
+             std::string("[]"), "default input dependencies are not empty");
 
-    CHECK(scripted_build.success(),
-          "scripted declaration build failed: " + scripted_build.stdout);
-    auto scripted_path = find_moid_declaration(
-        target_output_dir(scripted_dir) / ".bake");
-    CHECK(scripted_path.has_value(),
-          "scripted build did not persist a .moid.json declaration");
-    const std::string scripted_json = read_file(*scripted_path);
-    CHECK_EQ(json_scalar_field(scripted_json, "name").value_or("<missing>"),
+    CHECK(build_cpp_build.success(),
+          "build.cpp input declaration failed: " + build_cpp_build.stdout);
+    auto build_cpp_path = find_moid_declaration(
+        target_output_dir(build_cpp_dir) / ".bake");
+    CHECK(build_cpp_path.has_value(),
+          "build.cpp input declaration did not persist a .moid.json file");
+    const std::string build_cpp_json = read_file(*build_cpp_path);
+    CHECK_EQ(json_scalar_field(build_cpp_json, "name").value_or("<missing>"),
              std::string("declaration-equivalence"),
-             "scripted declaration has the wrong name");
-    CHECK_EQ(json_scalar_field(scripted_json, "type").value_or("<missing>"),
+             "build.cpp input declaration has the wrong name");
+    CHECK_EQ(json_scalar_field(build_cpp_json, "type").value_or("<missing>"),
              std::string("executable"),
-             "scripted declaration did not normalize the default type");
-    CHECK_EQ(json_key_count(scripted_json, "pattern"), std::size_t(1),
-             "scripted declaration must contain exactly one source group");
-    CHECK_EQ(json_scalar_field(scripted_json, "pattern").value_or("<missing>"),
+             "build.cpp input declaration did not normalize the default type");
+    CHECK_EQ(json_key_count(build_cpp_json, "pattern"), std::size_t(1),
+             "build.cpp input declaration must contain exactly one source group");
+    CHECK_EQ(json_scalar_field(build_cpp_json, "pattern").value_or("<missing>"),
              std::string("src/main.cpp"),
-             "scripted declaration has the wrong source pattern");
-    CHECK_EQ(json_scalar_field(scripted_json, "visibility").value_or("<missing>"),
+             "build.cpp input declaration has the wrong source pattern");
+    CHECK_EQ(json_scalar_field(build_cpp_json, "visibility").value_or("<missing>"),
              std::string("private"),
-             "scripted declaration has the wrong source visibility");
-    CHECK_EQ(json_value_field(scripted_json, "options").value_or("<missing>"),
-             std::string("{}"), "scripted declaration options are not empty");
-    CHECK(json_value_field(scripted_json, "flags").has_value(),
-          "scripted declaration has no source flags field");
-    CHECK(json_value_field(scripted_json, "defines").has_value(),
-          "scripted declaration has no source defines field");
-    CHECK(json_value_field(scripted_json, "include_dirs").has_value(),
-          "scripted declaration has no source include_dirs field");
-    CHECK_EQ(json_value_field(scripted_json, "public_include_dirs").value_or("<missing>"),
-             std::string("[]"), "scripted public_include_dirs are not empty");
-    CHECK_EQ(json_value_field(scripted_json, "libraries").value_or("<missing>"),
-             std::string("[]"), "scripted libraries are not empty");
-    CHECK_EQ(json_value_field(scripted_json, "frameworks").value_or("<missing>"),
-             std::string("[]"), "scripted frameworks are not empty");
-    CHECK_EQ(json_value_field(scripted_json, "prebuilt_libs").value_or("<missing>"),
-             std::string("[]"), "scripted prebuilt_libs are not empty");
-    CHECK_EQ(json_value_field(scripted_json, "dependencies").value_or("<missing>"),
-             std::string("[]"), "scripted dependencies are not empty");
+             "build.cpp input declaration has the wrong source visibility");
+    CHECK_EQ(json_value_field(build_cpp_json, "options").value_or("<missing>"),
+             std::string("{}"), "build.cpp declaration options are not empty");
+    CHECK(json_value_field(build_cpp_json, "flags").has_value(),
+          "build.cpp declaration has no source flags field");
+    CHECK(json_value_field(build_cpp_json, "defines").has_value(),
+          "build.cpp declaration has no source defines field");
+    CHECK(json_value_field(build_cpp_json, "include_dirs").has_value(),
+          "build.cpp declaration has no source include_dirs field");
+    CHECK_EQ(json_value_field(build_cpp_json, "public_include_dirs").value_or("<missing>"),
+             std::string("[]"), "build.cpp public_include_dirs are not empty");
+    CHECK_EQ(json_value_field(build_cpp_json, "libraries").value_or("<missing>"),
+             std::string("[]"), "build.cpp input libraries are not empty");
+    CHECK_EQ(json_value_field(build_cpp_json, "frameworks").value_or("<missing>"),
+             std::string("[]"), "build.cpp input frameworks are not empty");
+    CHECK_EQ(json_value_field(build_cpp_json, "prebuilt_libs").value_or("<missing>"),
+             std::string("[]"), "build.cpp prebuilt_libs are not empty");
+    CHECK_EQ(json_value_field(build_cpp_json, "dependencies").value_or("<missing>"),
+             std::string("[]"), "build.cpp dependencies are not empty");
 
-    const auto convention_id = json_scalar_field(convention_json, "id");
-    const auto scripted_id = json_scalar_field(scripted_json, "id");
-    CHECK(convention_id && convention_id->rfind("path:", 0) == 0,
-          "convention declaration did not use a canonical path identity");
-    CHECK(scripted_id && scripted_id->rfind("path:", 0) == 0,
-          "scripted declaration did not use a canonical path identity");
-    CHECK(*convention_id != *scripted_id,
+    const auto default_id = json_scalar_field(default_json, "id");
+    const auto build_cpp_id = json_scalar_field(build_cpp_json, "id");
+    CHECK(default_id && default_id->rfind("path:", 0) == 0,
+          "default input declaration did not use a canonical path identity");
+    CHECK(build_cpp_id && build_cpp_id->rfind("path:", 0) == 0,
+          "build.cpp declaration did not use a canonical path identity");
+    CHECK(*default_id != *build_cpp_id,
           "distinct canonical source roots unexpectedly share an identity");
 
-    auto convention_fields = declaration_semantics(convention_json);
-    auto scripted_fields = declaration_semantics(scripted_json);
-    CHECK(convention_fields.has_value(),
-          "convention declaration is missing required semantic fields: " +
-              convention_json);
-    CHECK(scripted_fields.has_value(),
-          "scripted declaration is missing required semantic fields: " +
-              scripted_json);
-    CHECK_EQ(*convention_fields, *scripted_fields,
-             "convention and scripted declarations differ semantically");
+    auto default_fields = declaration_semantics(default_json);
+    auto build_cpp_fields = declaration_semantics(build_cpp_json);
+    CHECK(default_fields.has_value(),
+          "default input declaration is missing required semantic fields: " +
+              default_json);
+    CHECK(build_cpp_fields.has_value(),
+          "build.cpp declaration is missing required semantic fields: " +
+              build_cpp_json);
+    CHECK_EQ(*default_fields, *build_cpp_fields,
+             "default-discovered and build.cpp-declared inputs differ semantically");
 
     return {};
 }
@@ -592,7 +592,7 @@ TestResult test_declaration_json_escape() {
 
     auto result = run_bake("build", dir);
     CHECK(result.success(),
-          "scripted declaration with control characters failed: " + result.stdout);
+          "build.cpp declaration with control characters failed: " + result.stdout);
 
     auto path = find_moid_declaration(target_output_dir(dir) / ".bake");
     CHECK(path.has_value(), "control-character declaration was not persisted");
@@ -784,7 +784,7 @@ TestResult test_pure_c_build() {
         }
     }
     CHECK_EQ(same_stem_objects, 2,
-             "convention build overwrote same-named source objects");
+             "default input discovery overwrote same-named source objects");
 
     return {};
 }
@@ -2031,23 +2031,22 @@ TestResult test_executable_dependency() {
               std::string::npos,
           "missing executable dependency diagnostic: " + result.stdout);
 
-    auto scripted = make_temp_dir("scripted_executable_dependency");
-    copy_fixture("executable_dependency", scripted);
-    write_file(scripted / "tool/bake.toml",
+    auto build_cpp_project = make_temp_dir("build_cpp_executable_dependency");
+    copy_fixture("executable_dependency", build_cpp_project);
+    write_file(build_cpp_project / "tool/bake.toml",
         "[package]\n"
         "name = \"tool\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
         "[language]\ncxx = \"c++23\"\n");
-    write_file(scripted / "tool/build.cpp",
+    write_file(build_cpp_project / "tool/build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
-        "    builder.executable(\"tool\")\n"
-        "        .sources(\"src/*.cpp\");\n"
+        "    builder.sources(\"src/*.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
-    write_file(scripted / "app/build.cpp",
+    write_file(build_cpp_project / "app/build.cpp",
         "import bake.build;\n"
         "import std;\n\n"
         "int main() {\n"
@@ -2055,149 +2054,132 @@ TestResult test_executable_dependency() {
         "    marker << \"configured\";\n"
         "    marker.close();\n"
         "    bake::Builder builder;\n"
-        "    builder.executable(\"app\")\n"
-        "        .sources(\"src/*.cpp\");\n"
+        "    builder.sources(\"src/*.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
 
-    auto scripted_result = run_bake("build -j 1", scripted);
-    CHECK(!scripted_result.success(),
-          "scripted executable dependency unexpectedly succeeded");
-    CHECK(scripted_result.stdout.find(
+    auto build_cpp_result = run_bake("build -j 1", build_cpp_project);
+    CHECK(!build_cpp_result.success(),
+          "build.cpp-declared executable dependency unexpectedly succeeded");
+    CHECK(build_cpp_result.stdout.find(
               "moid 'app' cannot use executable moid 'tool' as a normal dependency") !=
               std::string::npos,
-          "scripted dependency lost the executable diagnostic: " +
-              scripted_result.stdout);
-    CHECK(!fs::exists(scripted / "app/configured.marker"),
+          "build.cpp dependency lost the executable diagnostic: " +
+              build_cpp_result.stdout);
+    CHECK(!fs::exists(build_cpp_project / "app/configured.marker"),
           "consumer build.cpp ran after its dependency declared executable");
 
-    auto scripted_library = make_temp_dir("scripted_library_dependency");
-    copy_fixture("executable_dependency", scripted_library);
-    write_file(scripted_library / "tool/bake.toml",
+    auto build_cpp_library = make_temp_dir("build_cpp_library_dependency");
+    copy_fixture("executable_dependency", build_cpp_library);
+    write_file(build_cpp_library / "tool/bake.toml",
         "[package]\n"
         "name = \"tool\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
         "[language]\ncxx = \"c++23\"\n");
-    write_file(scripted_library / "tool/build.cpp",
+    write_file(build_cpp_library / "tool/build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
-        "    builder.lib(\"tool\")\n"
-        "        .sources(\"src/*.cpp\");\n"
+        "    builder.sources(\"src/*.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
-    write_file(scripted_library / "tool/src/main.cpp",
+    write_file(build_cpp_library / "tool/src/main.cpp",
         "int tool_value() { return 42; }\n");
-    write_file(scripted_library / "app/src/main.cpp",
+    write_file(build_cpp_library / "app/src/main.cpp",
         "int tool_value();\n"
         "int main() { return tool_value() == 42 ? 0 : 1; }\n");
 
-    auto library_result = run_bake("build -j 1", scripted_library);
+    auto library_result = run_bake("build -j 1", build_cpp_library);
     CHECK(library_result.success(),
-          "scripted library was rejected by its provisional manifest type: " +
+          "build.cpp-declared library was rejected by its manifest type: " +
               library_result.stdout);
     auto library_run = run_cmd(
-        (target_output_dir(scripted_library) / "bin/app").string(),
-        scripted_library);
+        (target_output_dir(build_cpp_library) / "bin/app").string(),
+        build_cpp_library);
     CHECK(library_run.success(),
-          "consumer did not link the scripted library dependency");
+          "consumer did not link the build.cpp-declared library dependency");
 
     return {};
 }
 
-TestResult test_run_scripted_declaration() {
-    auto scripted_executable = make_temp_dir("run_final_executable");
-    write_file(scripted_executable / "bake.toml",
+TestResult test_run_build_cpp_declaration() {
+    auto build_cpp_executable = make_temp_dir("run_build_cpp_executable");
+    write_file(build_cpp_executable / "bake.toml",
         "[package]\n"
-        "name = \"scripted-run\"\n"
+        "name = \"build-cpp-run\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
         "[language]\ncxx = \"c++23\"\n");
-    write_file(scripted_executable / "build.cpp",
+    write_file(build_cpp_executable / "build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
-        "    builder.executable(\"scripted-run\")\n"
-        "        .sources(\"src/main.cpp\");\n"
+        "    builder.sources(\"src/main.cpp\");\n"
         "    return builder.build();\n"
         "}\n");
-    write_file(scripted_executable / "src/main.cpp",
+    write_file(build_cpp_executable / "src/main.cpp",
         "import std;\n"
         "int main() { std::println(\"RUNTIME_FINAL_DECLARATION_SENTINEL\"); "
         "return 0; }\n");
 
-    auto executable_run = run_bake("run -j 1", scripted_executable);
+    auto executable_run = run_bake("run -j 1", build_cpp_executable);
     CHECK(executable_run.success(),
-          "run ignored the scripted executable declaration: " +
+          "run ignored the build.cpp executable declaration: " +
               executable_run.stdout);
     CHECK(executable_run.stdout.find(
               "RUNTIME_FINAL_DECLARATION_SENTINEL\n") != std::string::npos,
-          "run did not execute the scripted declaration output: " +
+          "run did not execute the build.cpp declaration output: " +
               executable_run.stdout);
 
     return {};
 }
 
-// bake.toml is authoritative for the one main moid. A build.cpp main
-// declaration may replace source discovery, but it cannot rename or retype
-// that moid.
-TestResult test_build_cpp_cannot_override_manifest() {
-    auto type_mismatch = make_temp_dir("build_cpp_manifest_type_mismatch");
-    write_file(type_mismatch / "bake.toml",
+// Binary sources consume the main moid's public module interfaces the same
+// way external consumers do.
+TestResult test_build_cpp_binary_module_imports() {
+    auto dir = make_temp_dir("build_cpp_binary_module_imports");
+    write_file(dir / "bake.toml",
         "[package]\n"
-        "name = \"authoritative-lib\"\n"
+        "name = \"binary-module-imports\"\n"
         "version = \"0.1.0\"\n"
         "type = \"lib\"\n"
-        "[language]\nc = \"c17\"\n");
-    write_file(type_mismatch / "src/value.c",
-        "int value(void) { return 1; }\n");
-    write_file(type_mismatch / "build.cpp",
+        "[language]\ncxx = \"c++23\"\n");
+    write_file(dir / "public/mod.cppm",
+        "export module bmi_math;\n\n"
+        "export int triple(int x) { return x * 3; }\n");
+    write_file(dir / "tools/user.cpp",
+        "import std;\n"
+        "import bmi_math;\n\n"
+        "int main() {\n"
+        "    std::println(\"BMI_MATH_{}\", triple(14));\n"
+        "    return 0;\n"
+        "}\n");
+    write_file(dir / "build.cpp",
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder b;\n"
-        "    b.executable(\"authoritative-lib\")\n"
-        "        .sources(\"src/value.c\");\n"
+        "    b.public_modules(\"public/mod.cppm\");\n"
+        "    b.binary(\"module-user\")\n"
+        "        .sources(\"tools/user.cpp\");\n"
         "    return b.build();\n"
         "}\n");
 
-    auto wrong_type = run_bake("build", type_mismatch);
-    CHECK(!wrong_type.success(),
-          "build.cpp changed the manifest lib into an executable");
-    CHECK(wrong_type.stdout.find("type") != std::string::npos &&
-              wrong_type.stdout.find("lib") != std::string::npos &&
-              wrong_type.stdout.find("executable") != std::string::npos,
-          "main moid type mismatch lacked both manifest and script values: " +
-              wrong_type.stdout);
-
-    auto name_mismatch = make_temp_dir("build_cpp_manifest_name_mismatch");
-    write_file(name_mismatch / "bake.toml",
-        "[package]\n"
-        "name = \"authoritative-lib\"\n"
-        "version = \"0.1.0\"\n"
-        "type = \"lib\"\n"
-        "[language]\nc = \"c17\"\n");
-    write_file(name_mismatch / "src/value.c",
-        "int value(void) { return 1; }\n");
-    write_file(name_mismatch / "build.cpp",
-        "import bake.build;\n\n"
-        "int main() {\n"
-        "    bake::Builder b;\n"
-        "    b.lib(\"script-renamed-lib\")\n"
-        "        .sources(\"src/value.c\");\n"
-        "    return b.build();\n"
-        "}\n");
-
-    auto wrong_name = run_bake("build", name_mismatch);
-    CHECK(!wrong_name.success(),
-          "build.cpp renamed the manifest main lib");
-    CHECK(wrong_name.stdout.find("name") != std::string::npos &&
-              wrong_name.stdout.find("authoritative-lib") !=
-                  std::string::npos &&
-              wrong_name.stdout.find("script-renamed-lib") !=
-                  std::string::npos,
-          "main moid name mismatch lacked both manifest and script values: " +
-              wrong_name.stdout);
+    auto build = run_bake("build", dir);
+    CHECK(build.success(),
+          "binary importing a public module failed to build: " + build.stdout);
+    const fs::path out = target_output_dir(dir);
+#ifdef _WIN32
+    const fs::path main_library = out / "lib/binary-module-imports.lib";
+#else
+    const fs::path main_library = out / "lib/libbinary-module-imports.a";
+#endif
+    CHECK(fs::exists(main_library), "main lib archive was not produced");
+    const fs::path user = native_executable_path(out, "module-user");
+    CHECK(fs::exists(user), "module-importing binary was not produced");
+    auto run = run_cmd(user.string(), dir);
+    CHECK(run.success() && run.stdout.find("BMI_MATH_42") != std::string::npos,
+          "module-importing binary did not run correctly: " + run.stdout);
 
     return {};
 }
@@ -2269,10 +2251,10 @@ TestResult test_run_requires_member_for_multiple_executables() {
     return {};
 }
 
-// A convention-mode consumer needs only bake.toml and src/. Bake must build
-// each Bake-native dependency's own recipe and automatically consume its
-// exported usage requirements; the consumer must not need build.cpp glue.
-TestResult test_convention_meta_dependency() {
+// A consumer using default input discovery needs only bake.toml and src/.
+// Bake must build each native dependency's own recipe and automatically consume
+// its exported usage requirements; the consumer must not need build.cpp glue.
+TestResult test_default_discovery_meta_dependency() {
     auto dir = make_temp_dir("build_cpp_meta_dep");
     copy_fixture("build_cpp_meta_dep", dir);
 
@@ -2420,8 +2402,7 @@ TestResult test_overlapping_source_groups() {
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
-        "    builder.executable(\"duplicate-sources\")\n"
-        "        .sources(\"src/*.c\")\n"
+        "    builder.sources(\"src/*.c\")\n"
         "        .sources(\"src/main.c\");\n"
         "    return builder.build();\n"
         "}\n");
@@ -2451,8 +2432,7 @@ TestResult test_overlapping_source_groups() {
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
-        "    builder.executable(\"triple-sources\")\n"
-        "        .sources(\"src/*.c\")\n"
+        "    builder.sources(\"src/*.c\")\n"
         "        .sources(\"src/main.c\")\n"
         "        .sources(\"src/main.c\");\n"
         "    return builder.build();\n"
@@ -2486,8 +2466,7 @@ TestResult test_symlink_source_identity() {
         "import bake.build;\n\n"
         "int main() {\n"
         "    bake::Builder builder;\n"
-        "    builder.executable(\"symlink-sources\")\n"
-        "        .sources(\"src/main.c\")\n"
+        "    builder.sources(\"src/main.c\")\n"
         "        .sources(\"src/main-link.c\");\n"
         "    return builder.build();\n"
         "}\n");
@@ -2683,21 +2662,24 @@ TestResult test_build_cpp_transitive_modules() {
     return {};
 }
 
-// Convention build must provide std.compat so end-user C++ can use global
-// compatibility names (size_t, uintmax_t) via `import std.compat;`.
-TestResult test_std_compat_convention() {
-    auto dir = make_temp_dir("std_compat_convention");
-    copy_fixture("std_compat_convention", dir);
+// Default input discovery must provide std.compat so end-user C++ can use
+// global compatibility names (size_t, uintmax_t) via `import std.compat;`.
+TestResult test_std_compat_default_discovery() {
+    auto dir = make_temp_dir("std_compat_default_discovery");
+    copy_fixture("std_compat_default_discovery", dir);
 
     auto build = run_bake("build", dir);
     CHECK(build.success(),
-          "convention build with import std.compat failed: " + build.stdout);
+          "default-discovered inputs with import std.compat failed: " +
+              build.stdout);
 
     const fs::path out = target_output_dir(dir);
-    fs::path exe = out / "bin" / "std-compat-convention";
-    CHECK(fs::exists(exe), "std.compat convention executable was not produced");
+    fs::path exe = out / "bin" / "std-compat-default-discovery";
+    CHECK(fs::exists(exe),
+          "std.compat default-discovery executable was not produced");
     auto run = run_cmd(exe.string(), dir);
-    CHECK(run.success(), "std.compat convention executable returned failure");
+    CHECK(run.success(),
+          "std.compat default-discovery executable returned failure");
 
     // Toolchain PCMs are now in the global cache, not project-local.
     fs::path local_std = out / ".bmi" / ".std";
@@ -2762,9 +2744,9 @@ TestResult test_cache_sharing() {
     auto proj_a = base / "proj_a";
     auto proj_b = base / "proj_b";
 
-    // Both projects use import std — reuse existing std_compat_convention.
-    copy_fixture("std_compat_convention", proj_a);
-    copy_fixture("std_compat_convention", proj_b);
+    // Both projects use import std — reuse the default-discovery fixture.
+    copy_fixture("std_compat_default_discovery", proj_a);
+    copy_fixture("std_compat_default_discovery", proj_b);
 
     std::string env = "BAKE_CACHE_DIR=" + cache_dir.string();
 
@@ -2774,7 +2756,7 @@ TestResult test_cache_sharing() {
           "project A build failed: " + build_a.stdout);
 
     const fs::path out_a = target_output_dir(proj_a);
-    fs::path exe_a = out_a / "bin" / "std-compat-convention";
+    fs::path exe_a = out_a / "bin" / "std-compat-default-discovery";
     CHECK(fs::exists(exe_a), "project A executable was not produced");
 
     // Cache must contain std.pcm and std.compat.pcm under <key>/std/.
@@ -2805,7 +2787,7 @@ TestResult test_cache_sharing() {
           "project B build failed: " + build_b.stdout);
 
     const fs::path out_b = target_output_dir(proj_b);
-    fs::path exe_b = out_b / "bin" / "std-compat-convention";
+    fs::path exe_b = out_b / "bin" / "std-compat-default-discovery";
     CHECK(fs::exists(exe_b), "project B executable was not produced");
     auto run_b = run_cmd(exe_b.string(), proj_b);
     CHECK(run_b.success(), "project B executable returned failure");
@@ -3128,9 +3110,9 @@ TestResult test_graph_json_round_trip() {
 
 // Built-in profiles require no manifest declaration. A custom profile uses
 // the same semantic fields and must affect both compile and link actions.
-TestResult test_convention_profiles() {
-    auto dir = make_temp_dir("convention_profiles");
-    copy_fixture("convention_profiles", dir);
+TestResult test_profile_configuration() {
+    auto dir = make_temp_dir("profile_configuration");
+    copy_fixture("profile_configuration", dir);
 
     auto dev = run_bake("build", dir);
     CHECK(dev.success(), "implicit dev profile failed: " + dev.stdout);
@@ -3142,7 +3124,7 @@ TestResult test_convention_profiles() {
     CHECK(!contains_command_token(commands, "-flto=thin"),
           "dev profile leaked release-only flags: " + commands);
     const fs::path exe = native_executable_path(
-        target_output_dir(dir), "convention-profiles");
+        target_output_dir(dir), "profile-configuration");
     auto dev_run = run_cmd(exe.string(), dir);
     CHECK(dev_run.success() && dev_run.stdout == "NDEBUG=0\n",
           "dev profile unexpectedly defined NDEBUG: " + dev_run.stdout);
@@ -3292,15 +3274,15 @@ TestResult test_target_conditions() {
     return {};
 }
 
-TestResult test_convention_source_extensions() {
-    auto dir = make_temp_dir("convention_source_extensions");
-    copy_fixture("convention_source_extensions", dir);
+TestResult test_default_source_extensions() {
+    auto dir = make_temp_dir("default_source_extensions");
+    copy_fixture("default_source_extensions", dir);
 
     auto build = run_bake("build", dir);
     CHECK(build.success(),
-          "default convention extensions did not build: " + build.stdout);
+          "default source extensions did not build: " + build.stdout);
     const fs::path exe = native_executable_path(
-        target_output_dir(dir), "convention-source-extensions");
+        target_output_dir(dir), "default-source-extensions");
     CHECK(fs::exists(exe), "default-extension executable was not produced");
     auto run = run_cmd(exe.string(), dir);
     CHECK(run.success(),
@@ -3373,7 +3355,7 @@ TestResult test_build_cpp_test_orchestration() {
     const fs::path main_library = out / "lib/libbuild-cpp-tests.a";
 #endif
     CHECK(fs::exists(main_library),
-          "incremental build.cpp mode did not preserve the convention main moid");
+          "build.cpp-declared tests did not preserve default-discovered main inputs");
     for (const std::string_view binary : {
              "unit_string", "unit_parser", "integration"}) {
         CHECK(fs::exists(out / "bin" /
@@ -3402,8 +3384,8 @@ TestResult test_build_cpp_test_orchestration() {
 }
 
 // A main lib can use fully custom input discovery and still contribute
-// several binaries. b.lib() binds to the bake.toml-defined main lib; it does
-// not create a second moid or change manifest configuration.
+// several binaries. Top-level input calls describe the bake.toml-defined
+// main lib; they do not create a second moid or change its configuration.
 TestResult test_build_cpp_custom_lib_with_binaries() {
     auto dir = make_temp_dir("build_cpp_custom_lib_binaries");
     copy_fixture("build_cpp_custom_lib_binaries", dir);
@@ -3434,7 +3416,7 @@ TestResult test_build_cpp_custom_lib_with_binaries() {
 
     const std::string graph = read_file(out / ".bake/graph.json");
     CHECK(graph.find("must_not_compile.cpp") == std::string::npos,
-          "explicit main-lib inputs did not replace convention source scanning");
+          "explicit main-lib inputs did not replace default source discovery");
     CHECK(graph.find("custom/src/value.cpp") != std::string::npos &&
               graph.find("tools/tool_a.cpp") != std::string::npos &&
               graph.find("tools/tool_b.cpp") != std::string::npos,
@@ -3496,7 +3478,7 @@ static std::vector<TestCase> all_tests = {
     {"simple_app_build",              test_simple_app_build},
     {"default_executable_type",       test_default_executable_type},
     {"invalid_moid_type",             test_invalid_moid_type},
-    {"declaration_equivalence",       test_declaration_equivalence},
+    {"input_declaration_equivalence", test_input_declaration_equivalence},
     {"declaration_json_escape",       test_declaration_json_escape},
     {"declaration_reader_validation", test_declaration_reader_validation},
     {"static_lib_build",              test_static_lib_build},
@@ -3532,25 +3514,25 @@ static std::vector<TestCase> all_tests = {
     {"workspace_duplicate_canonical_member", test_workspace_duplicate_canonical_member},
     {"workspace_symlink_selector",    test_workspace_symlink_selector},
     {"executable_dependency",         test_executable_dependency},
-    {"run_scripted_declaration",      test_run_scripted_declaration},
-    {"build_cpp_cannot_override_manifest", test_build_cpp_cannot_override_manifest},
+    {"run_build_cpp_declaration",     test_run_build_cpp_declaration},
+    {"build_cpp_binary_module_imports", test_build_cpp_binary_module_imports},
     {"source_less_executable_rejects_stale_output", test_source_less_executable_rejects_stale_output},
     {"run_requires_member_for_multiple_executables", test_run_requires_member_for_multiple_executables},
-    {"convention_meta_dependency",    test_convention_meta_dependency},
+    {"default_discovery_meta_dependency", test_default_discovery_meta_dependency},
     {"overlapping_source_groups",     test_overlapping_source_groups},
     {"symlink_source_identity",       test_symlink_source_identity},
     {"build_cpp_options",             test_build_cpp_options},
     {"options_reject_non_bool",       test_options_reject_non_bool},
     {"build_cpp_transitive_modules",  test_build_cpp_transitive_modules},
-    {"std_compat_convention",         test_std_compat_convention},
+    {"std_compat_default_discovery",  test_std_compat_default_discovery},
     {"std_compat_build_cpp",          test_std_compat_build_cpp},
     {"cache_sharing",                 test_cache_sharing},
     {"remote_archive_extract",        test_remote_archive_extract},
     {"module_archive_edges",          test_module_archive_edges},
     {"graph_json_round_trip",         test_graph_json_round_trip},
-    {"convention_profiles",           test_convention_profiles},
+    {"profile_configuration",         test_profile_configuration},
     {"target_conditions",             test_target_conditions},
-    {"convention_source_extensions",  test_convention_source_extensions},
+    {"default_source_extensions",     test_default_source_extensions},
     {"header_only_dependency",        test_header_only_dependency},
     {"build_cpp_test_orchestration",  test_build_cpp_test_orchestration},
     {"build_cpp_custom_lib_with_binaries", test_build_cpp_custom_lib_with_binaries},

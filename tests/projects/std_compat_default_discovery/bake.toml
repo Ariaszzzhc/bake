@@ -1,5 +1,5 @@
 [package]
-name = "std-compat-convention"
+name = "std-compat-default-discovery"
 version = "0.1.0"
 type = "executable"
 
