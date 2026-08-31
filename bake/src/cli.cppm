@@ -505,12 +505,18 @@ export int cmd_init(const ParsedArgs &args) {
   (target_dir / "public").mkdir_recursive();
   (target_dir / "tests").mkdir_recursive();
 
-  // Write bake.toml
+  // Write bake.toml. The language standard lives in [language]; only that
+  // table feeds the manifest parser.
   std::string toml_content = std::string("[package]\n") + "name = \"" +
                              project_name + "\"\n" + "version = \"0.1.0\"\n" +
                              "type = \"" +
-                             std::string(moid_type_str(moid_type)) + "\"\n" +
-                             "std = \"" + std_ver + "\"\n\n";
+                             std::string(moid_type_str(moid_type)) +
+                             "\"\n\n";
+  if (is_c_standard(std_ver)) {
+    toml_content += "[language]\nc = \"" + std_ver + "\"\n";
+  } else {
+    toml_content += "[language]\ncxx = \"" + std_ver + "\"\n";
+  }
 
   write_file(target_dir / "bake.toml", toml_content);
 
