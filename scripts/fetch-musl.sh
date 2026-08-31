@@ -137,67 +137,38 @@ fi
 echo "  → generic-musl/ ($(find "$GENERIC_DST" -name '*.h' | wc -l | tr -d ' ') headers)"
 
 # ════════════════════════════════════════════════════════════════════════
-# 4. Linux kernel UAPI headers
+# 4. Linux kernel UAPI headers (shared infrastructure)
 # ════════════════════════════════════════════════════════════════════════
-echo "==> Fetching Linux kernel UAPI headers..."
-
-# 4a. Common headers (arch-independent): linux/, asm-generic/, drm/, etc.
-#     These are the same on any arch's linux-headers package.
-docker run --rm \
-  -v "$WORK:/out" \
-  alpine:3.20 sh -c '
-    set -e
-    apk add --no-cache linux-headers >/dev/null 2>&1
-    mkdir -p /out/linux-uapi
-    for d in linux asm-generic drm rdma scsi sound video xen misc mtd cxl regulator fwctl; do
-      [ -d "/usr/include/$d" ] && cp -R "/usr/include/$d" "/out/linux-uapi/" || true
-    done
-  '
-
-ANY="$LIBC/include/any-linux-any"
-rm -rf "$ANY"
-mkdir -p "$ANY"
-if [ -d "$WORK/linux-uapi" ]; then
-  cp -R "$WORK/linux-uapi/"* "$ANY/"
+# any-linux-any/ and <arch>-linux-any/ are libc-agnostic: consumed by the
+# musl AND gnu header chains. Owned and produced solely by
+# fetch-linux-headers.sh — this script only bootstraps them when absent.
+LINUX_UAPI_DIRS=(
+  "$LIBC/include/any-linux-any"
+  "$LIBC/include/x86-linux-any"
+  "$LIBC/include/aarch64-linux-any"
+)
+missing=0
+for d in "${LINUX_UAPI_DIRS[@]}"; do
+  [ -d "$d" ] || missing=1
+done
+if [ "$missing" -eq 1 ]; then
+  echo "==> Kernel UAPI headers missing — running fetch-linux-headers.sh"
+  "$ROOT/scripts/fetch-linux-headers.sh"
+else
+  echo "==> Kernel UAPI headers present (kernel $(cat "$LIBC/include/linux-uapi-VERSION" 2>/dev/null || echo '?') ," \
+       "owned by fetch-linux-headers.sh)"
 fi
-echo "  → any-linux-any/ ($(find "$ANY" -name '*.h' | wc -l | tr -d ' ') headers)"
-
-# 4b. Per-arch asm/ headers
-#     /usr/include/asm on x86_64 Alpine = x86 UAPI; on aarch64 Alpine = arm64 UAPI.
-fetch_arch_asm() {
-  local arch="$1" platform="$2" dirname="$3"
-  echo "  → ${arch} asm headers (Docker ${platform})"
-
-  docker run --rm --platform "$platform" \
-    -v "$WORK:/out" \
-    alpine:3.20 sh -c "
-      apk add --no-cache linux-headers >/dev/null 2>&1
-      mkdir -p /out/asm-${arch}
-      cp -R /usr/include/asm /out/asm-${arch}/
-    "
-
-  local dst="$LIBC/include/${dirname}"
-  rm -rf "$dst"
-  mkdir -p "$dst"
-  if [ -d "$WORK/asm-${arch}" ]; then
-    cp -R "$WORK/asm-${arch}/"* "$dst/"
-  fi
-  echo "    ($(find "$dst" -name '*.h' | wc -l | tr -d ' ') headers)"
-}
-
-fetch_arch_asm x86_64   linux/amd64 x86-linux-any
-fetch_arch_asm aarch64  linux/arm64 aarch64-linux-any
-
 # ════════════════════════════════════════════════════════════════════════
 # Summary
 # ════════════════════════════════════════════════════════════════════════
 echo ""
 echo "==> Done."
 printf "    %-42s %s\n" "musl/ (source)" "$(du -sh "$LIBC/musl" | cut -f1)"
-for d in generic-musl any-linux-any x86_64-linux-musl aarch64-linux-musl x86-linux-any aarch64-linux-any; do
+for d in generic-musl x86_64-linux-musl aarch64-linux-musl; do
   if [ -d "$LIBC/include/$d" ]; then
     count=$(find "$LIBC/include/$d" -name '*.h' | wc -l | tr -d ' ')
     printf "    %-42s %s  (%s .h)\n" "include/$d/" "$(du -sh "$LIBC/include/$d" | cut -f1)" "$count"
   fi
 done
+echo "    (kernel UAPI: any-linux-any/, *-linux-any/ — owned by fetch-linux-headers.sh)"
 printf "    %-42s %s\n" "TOTAL lib/libc/" "$(du -sh "$LIBC" | cut -f1)"
