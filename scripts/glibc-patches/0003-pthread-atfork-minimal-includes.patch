@@ -1,0 +1,25 @@
+From: bake
+Subject: [PATCH 3/3] pthread_atfork: minimal includes
+
+Same rationale as 0001. pthreadP.h/fork.h drag the entire nptl internal
+graph (descr.h → build-generated headers); the externals used are
+declared directly. Bodies are unchanged.
+
+--- a/nptl/pthread_atfork.c
++++ b/nptl/pthread_atfork.c
+@@ -35,9 +35,12 @@
+
+    <http://www.gnu.org/licenses/>.  */
+
+-#include "pthreadP.h"
+-#include <fork.h>
+-#include <dso_handle.h>
++extern int __register_atfork (void (*prepare) (void),
++                              void (*parent) (void),
++                              void (*child) (void),
++                              void *dso_handle);
++libc_hidden_proto (__register_atfork)
++extern void *__dso_handle __attribute__ ((__visibility__ ("hidden")));
+
+
+ /* Hide the symbol so that no definition but the one locally in the

@@ -34,6 +34,14 @@ export struct TargetSpec {
     std::string triple_;  // "arch-os[-abi]" (empty when native)
     bool native_ = true;  // true = compiling for host (no -target flag)
 
+    // glibc target version ("x86_64-linux-gnu.2.17" → {2,17}). Only
+    // meaningful for the gnu libc family. Defaults to bake's baseline.
+    int glibc_major_ = 0;
+    int glibc_minor_ = 0;
+
+    static constexpr int default_glibc_major = 2;
+    static constexpr int default_glibc_minor = 28;
+
     bool is_native() const { return native_; }
 
     bool is_darwin() const {
@@ -45,6 +53,16 @@ export struct TargetSpec {
 
     bool is_linux_musl() const {
         return triple_.contains("linux") && triple_.contains("musl");
+    }
+
+    bool is_android() const {
+        return triple_.contains("linux") && triple_.contains("android");
+    }
+
+    // glibc ("*-linux-gnu", optionally ".2.17"-versioned). The default
+    // Linux ELF ABI — a bare "linux" triple with no libc segment is gnu.
+    bool is_linux_gnu() const {
+        return is_linux() && !is_linux_musl() && !is_android();
     }
 
     bool is_windows() const {
@@ -62,7 +80,16 @@ export struct TargetSpec {
     }
 
     // Returns the triple string for the -target flag, or "" for native.
+    // Never carries the glibc version suffix — LLVM triples can't encode it.
     std::string triple() const { return native_ ? "" : triple_; }
+
+    int glibc_major() const {
+        return glibc_major_ ? glibc_major_ : default_glibc_major;
+    }
+    int glibc_minor() const {
+        return glibc_minor_ || glibc_major_ ? glibc_minor_
+                                            : default_glibc_minor;
+    }
 };
 
 // Detect host platform. This is the ONLY place with #ifdef for host detection.
@@ -73,7 +100,18 @@ export TargetSpec detect_host_target() {
     t.triple_ = "aarch64-apple-darwin";
 #elif defined(__APPLE__) && defined(__x86_64__)
     t.triple_ = "x86_64-apple-darwin";
+#elif defined(__linux__) && defined(__GLIBC__) && defined(__aarch64__)
+    // Linked against the host's glibc (stage-0 build on a glibc distro):
+    // native gnu — may use the system libc directly (SystemGnu layout).
+    t.triple_ = "aarch64-linux-gnu";
+    t.glibc_major_ = __GLIBC__;
+    t.glibc_minor_ = __GLIBC_MINOR__;
+#elif defined(__linux__) && defined(__GLIBC__) && defined(__x86_64__)
+    t.triple_ = "x86_64-linux-gnu";
+    t.glibc_major_ = __GLIBC__;
+    t.glibc_minor_ = __GLIBC_MINOR__;
 #elif defined(__linux__) && defined(__aarch64__)
+    // Self-hosted bake is a static musl binary — hermetic musl everywhere.
     t.triple_ = "aarch64-linux-musl";
 #elif defined(__linux__) && defined(__x86_64__)
     t.triple_ = "x86_64-linux-musl";
@@ -125,6 +163,35 @@ export TargetSpec parse_target(std::string_view spec) {
     // triples (arch-os-libc) consistently.
     if (segments.size() == 4 && segments[1] == "unknown")
         segments.erase(segments.begin() + 1);
+
+    // glibc version suffix: last segment "gnu.2.17" → triple keeps "gnu",
+    // {2,17} stored on the spec (LLVM triples cannot encode it).
+    auto& last = segments.back();
+    if (last.starts_with("gnu.")) {
+        std::string_view suffix(last.data() + 4, last.size() - 4);
+        int major = 0, minor = 0;
+        size_t i = 0;
+        bool ok = suffix.size() > 2;  // at least "N.M"
+        for (; ok && i < suffix.size() && suffix[i] != '.'; ++i) {
+            if (suffix[i] < '0' || suffix[i] > '9') { ok = false; break; }
+            major = major * 10 + (suffix[i] - '0');
+        }
+        if (ok && (i >= suffix.size() || i == 0)) ok = false;
+        for (++i; ok && i < suffix.size(); ++i) {
+            if (suffix[i] < '0' || suffix[i] > '9') { ok = false; break; }
+            minor = minor * 10 + (suffix[i] - '0');
+        }
+        if (ok && i != suffix.size()) ok = false;
+        if (ok && major == 2 && minor > 0) {
+            last = "gnu";
+            t.glibc_major_ = major;
+            t.glibc_minor_ = minor;
+        }
+    }
+
+    // Bare "arch-linux" defaults to gnu (the default Linux ELF ABI).
+    if (segments.size() == 2 && segments[1] == "linux")
+        segments.push_back("gnu");
 
     t.triple_ = segments[0];
     for (size_t i = 1; i < segments.size(); ++i)
@@ -653,7 +720,8 @@ export ModuleFileMap ensure_std_modules(
     // Select libc++ config_site based on target: mingw-config for windows-gnu,
     // cross-config for other cross-compile targets.
     std::string config_subdir = tc.target.is_windows_gnu()
-        ? "mingw-config" : "cross-config";
+        ? "mingw-config"
+        : tc.target.is_linux_gnu() ? "gnu-config" : "cross-config";
 
     if (!std_pcm.is_regular_file()) {
         std::println("   Preparing standard library module");
@@ -820,6 +888,7 @@ export enum class LibcFamily {
     Musl,     // built from vendored source
     Darwin,   // libSystem via vendored .tbd (cross) or system SDK (native)
     Windows,  // MinGW-w64 (built from vendored source)
+    Gnu,      // glibc: crt from vendored source, libc via synthesized stubs
     None,     // freestanding (no libc)
 };
 
@@ -853,12 +922,15 @@ export struct RuntimeArtifacts {
     // windows (mingw) link helpers
     std::vector<std::string> always_link_libs; // system libs to inject
     std::string mingw_import_dir;              // path to generated import libs
-};
 
+    std::vector<std::string> gnu_stub_libs;     // full paths, link order
+    std::string dynamic_linker;                // PT_INTERP path (ld-linux)
+};
 export LibcFamily resolve_libc_family(const TargetSpec& target) {
     if (target.is_linux_musl())  return LibcFamily::Musl;
     if (target.is_windows_gnu()) return LibcFamily::Windows;
     if (target.is_darwin())      return LibcFamily::Darwin;
+    if (target.is_linux_gnu())   return LibcFamily::Gnu;
     return LibcFamily::None;
 }
 
@@ -870,16 +942,34 @@ export DarwinSdkLayout resolve_darwin_sdk(const TargetSpec& target) {
     return DarwinSdkLayout::Vendored;
 }
 
+export enum class GnuSdkLayout {
+    SystemGnu,  // native glibc host: system /usr/include + /usr/lib directly
+    Vendored,   // cross (or non-glibc host): vendored headers + synthesized stubs
+};
+
+export GnuSdkLayout resolve_gnu_sdk(const TargetSpec& target) {
+    // Only a bake binary linked against the host's glibc (stage-0 build on
+    // a glibc distro) and targeting its own arch may use the system libc.
+    // Unlike darwin, glibc headers are strictly per-arch: cross-arch from a
+    // glibc host still needs the vendored/synthesized layout.
+    auto host = detect_host_target();
+    if (host.is_linux_gnu() && target.is_linux_gnu() &&
+        host.arch() == target.arch())
+        return GnuSdkLayout::SystemGnu;
+    return GnuSdkLayout::Vendored;
+}
 export LinkMode parse_link_mode(const std::vector<std::string>& args) {
     bool is_shared = false;
+    bool is_static = false;
     bool is_static_pie = false;
     for (auto& a : args) {
         if (a == "-shared" || a == "-Bshareable") is_shared = true;
         if (a == "-static-pie") is_static_pie = true;
+        if (a == "-static" || a == "-Bstatic") is_static = true;
     }
     if (is_static_pie) return LinkMode::StaticPie;
-    if (is_shared)     return LinkMode::Dynamic;
-    return LinkMode::Static;
+    if (is_static && !is_shared) return LinkMode::Static;
+    return LinkMode::Dynamic;
 }
 
 // prepare_runtime() is defined after all ensure_* functions (below).
@@ -950,7 +1040,9 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
     result.libcxx_a    = cache_dir / "libc++.a";
     result.libcxxabi_a = cache_dir / "libc++abi.a";
 
-    bool needs_libunwind = tc.target.is_linux_musl() || tc.target.is_windows();
+    bool needs_libunwind = tc.target.is_linux_musl() ||
+                           tc.target.is_linux_gnu() ||
+                           tc.target.is_windows();
     if (needs_libunwind)
         result.libunwind_a = cache_dir / "libunwind.a";
 
@@ -2114,6 +2206,627 @@ export Path ensure_mingw_import_lib(const Toolchain& tc,
     return final_lib.is_regular_file() ? final_lib : Path();
 }
 
+// ── glibc (linux-gnu): crt + libc_nonshared from vendored source ──
+//
+// The libc itself is never built: link-time stubs are synthesized from the
+// vendored abilists (ensure_glibc_stubs) and real glibc on the target
+// machine provides the implementations. glibc 2.28 is the header/source
+// baseline: targets below it are rejected (use musl for older baselines).
+
+export struct GlibcObjects {
+    Path crt_entry;         // Scrt1.o (old-form start; works for all >= floor)
+    Path libc_nonshared_a;
+    Path stub_dir;          // lib<name>.so.<sover> stub libraries
+    std::string dynamic_linker;
+};
+
+static const char* glibc_nonshared_sources[] = {
+    "csu/elf-init.c",
+    "stdlib/atexit.c",
+    "stdlib/at_quick_exit.c",
+    "nptl/pthread_atfork.c",
+    "debug/stack_chk_fail_local.c",
+    "io/stat.c", "io/fstat.c", "io/lstat.c",
+    "io/stat64.c", "io/fstat64.c", "io/lstat64.c",
+    "io/fstatat.c", "io/fstatat64.c",
+    "io/mknod.c", "io/mknodat.c",
+};
+
+// Internal include chain for compiling glibc's own sources (mirrors the
+// upstream sysdirs order for arch-linux-gnu, pruned to the vendored subset).
+static std::vector<std::string> glibc_internal_include_chain(
+        const Path& glibc, std::string_view arch) {
+    std::string a(arch);
+    std::string x86_alt = "x86";  // x86_64 falls back to x86 dirs
+    std::vector<std::string> dirs;
+    auto add = [&](const std::string& d) { dirs.push_back(d); };
+
+    add((glibc / "include").string());
+
+    // Canonical sysdirs order for arch-linux-gnu (matches the -I chain a
+    // real glibc build uses; pruned to the vendored subset).
+    auto usl = [&](const std::string& sub) {
+        add((glibc / "sysdeps" / "unix" / "sysv" / "linux" / sub).string());
+    };
+    auto us  = [&](const std::string& sub) {
+        add((glibc / "sysdeps" / "unix" / sub).string());
+    };
+    auto sd  = [&](const std::string& sub) {
+        add((glibc / "sysdeps" / sub).string());
+    };
+    auto sd2 = [&](const std::string& a, const std::string& sub) {
+        add((glibc / "sysdeps" / a / sub).string());
+    };
+
+    usl(a);
+    if (a == "x86_64") usl("x86");
+    sd2(a, "nptl");
+    if (a == "x86_64") sd2("x86", "nptl");
+    usl("wordsize-64");
+    usl("include");
+    usl("generic");
+    usl("");
+    sd("nptl");
+    sd("pthread");
+    sd("gnu");
+    us("inet");
+    us("sysv");
+    us(a);
+    if (a == "x86_64") us("x86");
+    us("");
+    sd("posix");
+    sd(a);
+    if (a == "x86_64") sd("x86");
+    sd("wordsize-64");
+    sd("generic");
+    add((glibc / "nptl").string());
+    // Source root last: internal headers include each other with
+    // path-style names like <sysdeps/unix/sysv/linux/sysdep.h>.
+    add(glibc.string());
+    return dirs;
+}
+
+export GlibcObjects ensure_glibc_objects(const Toolchain& tc, LinkMode) {
+    GlibcObjects result;
+    if (!tc.target.is_linux_gnu()) return result;
+
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return result;
+
+    Path glibc = lib / "libc" / "glibc";
+    if (!glibc.is_directory()) {
+        std::println(std::cerr,
+            "bake: glibc source subset not found at {}\n"
+            "  Run scripts/fetch-glibc.sh to vendor glibc for linux-gnu targets.",
+            glibc.string());
+        return result;
+    }
+
+    if (tc.target.glibc_major() < 2 ||
+        (tc.target.glibc_major() == 2 && tc.target.glibc_minor() < 28)) {
+        std::println(std::cerr,
+            "bake: glibc {}.{} is below the vendored baseline (2.28);\n"
+            "  use a linux-musl target for older baselines.",
+            tc.target.glibc_major(), tc.target.glibc_minor());
+        return result;
+    }
+
+    std::string arch = tc.target.arch();
+    std::string ver = std::to_string(tc.target.glibc_major()) + "." +
+                      std::to_string(tc.target.glibc_minor());
+    Path cache_dir = get_cache_dir().parent() / "glibc-objects" /
+                     (tc.target.triple() + "-v" + ver);
+    Path sentinel = cache_dir / ".done";
+
+    result.crt_entry = cache_dir / "Scrt1.o";
+    result.libc_nonshared_a = cache_dir / "libc_nonshared.a";
+    result.stub_dir = cache_dir / "stubs";
+    result.dynamic_linker = (arch == "x86_64")
+        ? "/lib64/ld-linux-x86-64.so.2"
+        : "/lib/ld-linux-aarch64.so.1";
+
+    if (sentinel.is_regular_file() &&
+        result.crt_entry.is_regular_file() &&
+        result.libc_nonshared_a.is_regular_file())
+        return result;
+
+    cache_dir.mkdir_recursive();
+    std::println("   Compiling glibc crt for {} (glibc {}, cached)",
+                 tc.target.triple(), ver);
+
+    // ── Flags (ported from upstream build; see csu/Makefile + zig's
+    //    glibc.zig buildCrtFile for the reference selection) ──
+    std::vector<std::string> base;
+    base.push_back(tc.exe_path);
+    base.push_back("cc");
+    base.push_back("-target");
+    base.push_back(tc.target.triple());
+    base.push_back("-c");
+    base.push_back("-w");
+    base.push_back("-fPIC");  // exes may be PIE (clang default) — crt must be PIC
+    base.push_back("-O2");
+    base.push_back("-DPIC");
+    base.push_back("-DMODULE_NAME=libc");
+    base.push_back("-DTOP_NAMESPACE=glibc");
+    base.push_back("-DNO_INITFINI");
+    base.push_back("-Wno-nonportable-include-path");
+    base.push_back("-include");
+    base.push_back((glibc / "include" / "libc-modules.h").string());
+    base.push_back("-include");
+    base.push_back((glibc / "include" / "libc-symbols.h").string());
+
+    for (auto& d : glibc_internal_include_chain(glibc, arch))
+        base.push_back("-I" + d);
+    // Public vendored headers complete the chain (gnu/stubs.h etc.).
+    base.push_back("-I" + (lib / "libc" / "include" /
+                           tc.target.triple()).string());
+    base.push_back("-I" + (lib / "libc" / "include" / "generic-glibc").string());
+    std::string arch_os = (arch == "x86_64") ? "x86" : arch;
+    base.push_back("-I" + (lib / "libc" / "include" /
+                           (arch_os + "-linux-any")).string());
+    base.push_back("-I" + (lib / "libc" / "include" / "any-linux-any").string());
+
+    auto compile_one = [&](const char* src_rel, const char* obj_name,
+                           bool is_asm, bool is_c) -> bool {
+        Path src = glibc / src_rel;
+        Path obj = cache_dir / obj_name;
+        if (obj.is_regular_file()) return true;
+        if (!src.is_regular_file()) {
+            std::println(std::cerr, "bake: glibc source missing: {}", src_rel);
+            return false;
+        }
+        std::vector<std::string> cmd = base;
+        if (is_asm) {
+            cmd.push_back("-DASSEMBLER");
+            cmd.push_back("-Wa,--noexecstack");
+        }
+        if (is_c) {
+            cmd.push_back("-std=gnu11");
+            cmd.push_back("-fgnu89-inline");
+            cmd.push_back("-fmerge-all-constants");
+            cmd.push_back("-frounding-math");
+            cmd.push_back("-fno-common");
+            cmd.push_back("-fmath-errno");
+            cmd.push_back("-ftls-model=initial-exec");
+            cmd.push_back("-DPIC");
+            cmd.push_back("-DLIBC_NONSHARED=1");
+        }
+        cmd.push_back(src.string());
+        cmd.push_back("-o");
+        cmd.push_back(obj.string());
+        auto r = run_process(cmd, Path(), true);
+        if (!r.success()) {
+            std::print(std::cerr, "{}", r.stderr_output);
+            std::println(std::cerr, "bake: failed to compile {}", src_rel);
+            return false;
+        }
+        return true;
+    };
+
+    // ── Scrt1.o = start.S + abi-note.S + init.c, merged relocatable ──
+    std::string arch_dir = (arch == "x86_64") ? "x86_64" : "aarch64";
+    std::string start_s = "sysdeps/" + arch_dir + "/start.S";
+    if (!compile_one(start_s.c_str(), "crt__start.o", true, false))
+        return GlibcObjects{};
+    // abi-note.S wants csu/ first on its include path.
+    {
+        std::vector<std::string> cmd = base;
+        cmd.push_back("-DASSEMBLER");
+        cmd.push_back("-Wa,--noexecstack");
+        cmd.push_back("-I" + (glibc / "csu").string());
+        cmd.push_back((glibc / "csu" / "abi-note.S").string());
+        cmd.push_back("-o");
+        cmd.push_back((cache_dir / "crt__abi-note.o").string());
+        if (!(cache_dir / "crt__abi-note.o").is_regular_file()) {
+            auto r = run_process(cmd, Path(), true);
+            if (!r.success()) {
+                std::print(std::cerr, "{}", r.stderr_output);
+                return GlibcObjects{};
+            }
+        }
+    }
+    if (!compile_one("csu/init.c", "crt__init.o", false, true))
+        return GlibcObjects{};
+    {
+        std::vector<std::string> objs = {
+            (cache_dir / "crt__start.o").string(),
+            (cache_dir / "crt__abi-note.o").string(),
+            (cache_dir / "crt__init.o").string(),
+            "-o", result.crt_entry.string(),
+        };
+        std::vector<const char*> argv;
+        argv.push_back("ld.lld");
+        argv.push_back("-r");
+        for (auto& s : objs) argv.push_back(s.c_str());
+        if (!result.crt_entry.is_regular_file() &&
+            bake_lld_link(LldFlavor::ELF,
+                          static_cast<int>(argv.size()),
+                          argv.data()) != 0)
+            return GlibcObjects{};
+    }
+
+    // ── libc_nonshared.a ──
+    std::vector<Path> members;
+    for (auto* src : glibc_nonshared_sources) {
+        std::string stem = src;
+        for (auto& c : stem) if (c == '/') c = '_';
+        stem = stem.substr(0, stem.rfind('.'));
+        Path obj = cache_dir / ("ns__" + stem + ".o");
+        if (!compile_one(src, obj.filename().string().c_str(), false, true))
+            return GlibcObjects{};
+        members.push_back(obj);
+    }
+    if (!write_archive(result.libc_nonshared_a, members, false))
+        return GlibcObjects{};
+
+    write_file(sentinel, "");
+    return result;
+}
+
+// ── glibc stub libraries — synthesized from the vendored abilists ──
+//
+// The abilists table (plain text, scripts/glibc-abi-gen.py format) records
+// every exported symbol of the eight stub-able glibc libraries with the
+// version node at which it was introduced. Link-time stub .so files are
+// generated per target glibc version: every symbol whose introduction is
+// <= the target version becomes a zero-body definition with a .symver
+// directive; the real glibc on the target machine provides implementations
+// at run time. This is how one vendored table serves every target version
+// from the baseline up to the seed version.
+
+struct GlibcVer {
+    int maj = 0, min = 0, pat = 0;
+    bool operator<=(const GlibcVer& o) const {
+        return std::tie(maj, min, pat) <= std::tie(o.maj, o.min, o.pat);
+    }
+    bool operator<(const GlibcVer& o) const {
+        return std::tie(maj, min, pat) < std::tie(o.maj, o.min, o.pat);
+    }
+};
+
+struct GlibcAbiTable {
+    struct Lib {
+        std::string name;
+        int sover = 0;
+        bool removed = false;
+        GlibcVer removed_in{};
+    };
+    struct Sym {
+        std::string name;
+        int lib = 0;
+        bool is_obj = false;
+        long size = 0;
+        std::vector<GlibcVer> vers;
+    };
+    std::vector<Lib> libs;
+    std::vector<std::string> targets;          // declaration order
+    std::map<std::string, std::vector<Sym>> syms;
+};
+
+static bool glibc_parse_version(std::string_view s, GlibcVer& v) {
+    int parts[3] = {0, 0, 0};
+    int idx = 0;
+    size_t i = 0;
+    while (i < s.size() && idx < 3) {
+        int val = 0;
+        bool any = false;
+        while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+            val = val * 10 + (s[i] - '0');
+            ++i;
+            any = true;
+        }
+        if (!any) return false;
+        parts[idx++] = val;
+        if (i < s.size()) {
+            if (s[i] != '.') return false;
+            ++i;
+        }
+    }
+    if (idx == 0 || i != s.size()) return false;
+    v = {parts[0], parts[1], parts[2]};
+    return true;
+}
+
+static bool glibc_parse_abilists(std::string_view text, GlibcAbiTable& t) {
+    std::string current_target;
+    size_t pos = 0;
+    auto next_line = [&](std::string_view& line) {
+        if (pos >= text.size()) return false;
+        size_t eol = text.find('\n', pos);
+        if (eol == std::string_view::npos) eol = text.size();
+        line = text.substr(pos, eol - pos);
+        pos = eol + 1;
+        return true;
+    };
+    auto split_ws = [](std::string_view s) {
+        std::vector<std::string_view> out;
+        size_t i = 0;
+        while (i < s.size()) {
+            while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+            size_t start = i;
+            while (i < s.size() && s[i] != ' ' && s[i] != '\t') ++i;
+            if (i > start) out.push_back(s.substr(start, i - start));
+        }
+        return out;
+    };
+    auto parse_vers = [&](std::string_view csv,
+                          std::vector<GlibcVer>& out) -> bool {
+        size_t i = 0;
+        while (i <= csv.size()) {
+            size_t comma = csv.find(',', i);
+            if (comma == std::string_view::npos) comma = csv.size();
+            GlibcVer v;
+            if (!glibc_parse_version(csv.substr(i, comma - i), v))
+                return false;
+            out.push_back(v);
+            if (comma == csv.size()) break;
+            i = comma + 1;
+        }
+        return !out.empty();
+    };
+
+    std::string_view line;
+    while (next_line(line)) {
+        if (line.empty() || line[0] == '#') continue;
+        if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
+        if (!line.empty() && line[0] == '[') {           // [target X]
+            size_t rb = line.find(']');
+            if (rb == std::string_view::npos) return false;
+            current_target = std::string(line.substr(8, rb - 8));
+            t.syms[current_target];
+            continue;
+        }
+        auto f = split_ws(line);
+        if (f.empty()) continue;
+        if (f[0] == "format" || f[0] == "seed") continue;
+        if (f[0] == "lib" && f.size() >= 4) {
+            GlibcAbiTable::Lib l;
+            l.name = std::string(f[1]);
+            l.sover = std::stoi(std::string(f[3]));
+            if (f.size() >= 6 && f[4] == "removed-in")
+                if (glibc_parse_version(f[5], l.removed_in))
+                    l.removed = true;
+            t.libs.push_back(std::move(l));
+            continue;
+        }
+        if (f[0] == "target" && f.size() == 2) {
+            t.targets.emplace_back(f[1]);
+            continue;
+        }
+        if (current_target.empty()) continue;
+        if (f[0] == "fn" && f.size() == 4) {
+            GlibcAbiTable::Sym s;
+            s.name = std::string(f[1]);
+            for (size_t i = 0; i < t.libs.size(); ++i)
+                if (t.libs[i].name == f[2]) { s.lib = static_cast<int>(i); break; }
+            if (!parse_vers(f[3], s.vers)) return false;
+            t.syms[current_target].push_back(std::move(s));
+            continue;
+        }
+        if (f[0] == "obj" && f.size() == 5) {
+            GlibcAbiTable::Sym s;
+            s.name = std::string(f[1]);
+            s.is_obj = true;
+            s.size = std::stol(std::string(f[3]));
+            for (size_t i = 0; i < t.libs.size(); ++i)
+                if (t.libs[i].name == f[2]) { s.lib = static_cast<int>(i); break; }
+            if (!parse_vers(f[4], s.vers)) return false;
+            t.syms[current_target].push_back(std::move(s));
+            continue;
+        }
+    }
+    return !t.libs.empty() && !t.syms.empty();
+}
+
+static Path glibc_objects_cache_dir(const Toolchain& tc) {
+    std::string ver = std::to_string(tc.target.glibc_major()) + "." +
+                      std::to_string(tc.target.glibc_minor());
+    return get_cache_dir().parent() / "glibc-objects" /
+           (tc.target.triple() + "-v" + ver);
+}
+
+export Path ensure_glibc_stubs(const Toolchain& tc) {
+    if (!tc.target.is_linux_gnu()) return Path();
+
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return Path();
+
+    Path abilists = lib / "libc" / "glibc" / "abilists";
+    auto content = read_file(abilists);
+    if (!content) {
+        std::println(std::cerr,
+            "bake: glibc abilists not found at {}\n"
+            "  Run scripts/fetch-glibc.sh to vendor glibc.",
+            abilists.string());
+        return Path();
+    }
+
+    GlibcAbiTable table;
+    if (!glibc_parse_abilists(*content, table)) {
+        std::println(std::cerr, "bake: malformed glibc abilists ({})",
+                     abilists.string());
+        return Path();
+    }
+
+    std::string triple = tc.target.triple();
+    if (!table.syms.count(triple)) {
+        std::println(std::cerr,
+            "bake: glibc abilists has no data for {} (supported: {})",
+            triple, [&]{
+                std::string j;
+                for (auto& [k, _] : table.syms) {
+                    if (!j.empty()) j += ", ";
+                    j += k;
+                }
+                return j;
+            }());
+        return Path();
+    }
+
+    GlibcVer target_ver{tc.target.glibc_major(), tc.target.glibc_minor(), 0};
+    Path stub_dir = glibc_objects_cache_dir(tc) / "stubs";
+    // Cache key: abilists content + a generator version marker (bumping it
+    // invalidates stubs synthesized by an older bake).
+    std::string abi_hash = SHA256::hex(*content).substr(0, 12) +
+                           "+stubgen2";
+    Path hash_file = stub_dir / ".abilists-hash";
+    Path sentinel = stub_dir / ".done";
+
+    bool complete = true;
+    if (!sentinel.is_regular_file()) complete = false;
+    else if (auto h = read_file(hash_file); !h || *h != abi_hash) complete = false;
+    if (complete) {
+        for (auto& l : table.libs) {
+            if (l.removed && !(target_ver < l.removed_in)) continue;
+            Path so = stub_dir / ("lib" + l.name + ".so." +
+                                  std::to_string(l.sover));
+            if (!so.is_regular_file()) { complete = false; break; }
+        }
+    }
+    if (complete) return stub_dir;
+
+    stub_dir.mkdir_recursive();
+    std::println("   Synthesizing glibc stubs for {} (glibc {}.{}), cached",
+                 triple, target_ver.maj, target_ver.min);
+
+    bool ptr64 = tc.target.arch() == "x86_64" || tc.target.arch() == "aarch64";
+    std::string word = ptr64 ? ".quad" : ".long";
+    int psize = ptr64 ? 8 : 4;
+    std::string ld_soname = (tc.target.arch() == "x86_64")
+        ? "ld-linux-x86-64.so.2" : "ld-linux-aarch64.so.1";
+
+    for (auto& l : table.libs) {
+        if (l.removed && !(target_ver < l.removed_in)) continue;
+
+        std::string asm_text = ".text\n";
+        std::vector<GlibcVer> used_vers;
+
+        for (auto& s : table.syms[triple]) {
+            if (s.lib >= static_cast<int>(table.libs.size())) continue;
+            if (table.libs[s.lib].name != l.name) continue;
+
+            // Versions eligible at this target; default = greatest.
+            std::vector<const GlibcVer*> elig;
+            for (auto& v : s.vers)
+                if (v <= target_ver) elig.push_back(&v);
+            if (elig.empty()) continue;
+            const GlibcVer* def = elig[0];
+            for (auto* v : elig) if (*def < *v) def = v;
+
+            for (auto* vp : elig) {
+                auto& v = *vp;
+                std::string mangled = s.name + "_" +
+                    std::to_string(v.maj) + "_" + std::to_string(v.min);
+                if (v.pat != 0)
+                    mangled += "_" + std::to_string(v.pat);
+                std::string at = (vp == def) ? "@@" : "@";
+                asm_text += ".balign " + std::to_string(psize) + "\n";
+                asm_text += ".globl " + mangled + "\n";
+                if (s.is_obj) {
+                    asm_text += ".type " + mangled + ", %object\n";
+                    asm_text += ".size " + mangled + ", " +
+                                std::to_string(s.size) + "\n";
+                } else {
+                    asm_text += ".type " + mangled + ", %function\n";
+                }
+                asm_text += ".symver " + mangled + ", " + s.name + at +
+                            "GLIBC_" + std::to_string(v.maj) + "." +
+                            std::to_string(v.min);
+                if (v.pat != 0)
+                    asm_text += "." + std::to_string(v.pat);
+                asm_text += ", remove\n";
+                if (s.is_obj)
+                    asm_text += mangled + ": .fill " +
+                                std::to_string(s.size) + ", 1, 0\n";
+                else
+                    asm_text += mangled + ": " + word + " 0\n";
+                bool known = false;
+                for (auto& u : used_vers) if (!(u < v) && !(v < u)) known = true;
+                if (!known) used_vers.push_back(v);
+            }
+        }
+
+        // A lib with no eligible symbols at this target version (empty
+        // stubs, missing ld.so in the seed build) gets no stub at all —
+        // prepare_runtime only links stubs that exist on disk.
+        if (used_vers.empty()) continue;
+
+        // libc only: carry a weak reference to _IO_stdin_used, exactly as
+        // the real libc.so.6 does. The executable always defines the symbol
+        // (csu/init.c inside Scrt1.o); a reference from a linked DSO makes
+        // the linker export that definition into the executable's dynamic
+        // symbol table, where glibc's runtime probe looks for it (its
+        // absence marks a pre-2.1 program and selects the legacy FILE
+        // compatibility path). The pointer must live in .data.rel.ro: a
+        // data relocation against a preemptible symbol is only valid in a
+        // writable section, and .rodata is not one.
+        if (l.name == "c") {
+            asm_text += ".weak _IO_stdin_used\n";
+            asm_text += ".section .data.rel.ro\n";
+            asm_text += ".balign " + std::to_string(psize) + "\n";
+            asm_text += word + " _IO_stdin_used\n";
+        }
+
+        asm_text += ".data\n";
+
+        // Version script: empty nodes for every version we reference.
+        std::string map_text;
+        std::sort(used_vers.begin(), used_vers.end(),
+                  [](auto& a, auto& b) { return a < b; });
+        for (auto& v : used_vers) {
+            map_text += "GLIBC_" + std::to_string(v.maj) + "." +
+                        std::to_string(v.min);
+            if (v.pat != 0) map_text += "." + std::to_string(v.pat);
+            map_text += " { };\n";
+        }
+
+        std::string stem = "lib" + l.name + ".so." + std::to_string(l.sover);
+        Path asm_file = stub_dir / (stem + ".s");
+        Path map_file = stub_dir / (stem + ".map");
+        Path obj_file = stub_dir / (stem + ".o");
+        Path out_file = stub_dir / stem;
+        write_file(asm_file, asm_text);
+        write_file(map_file, map_text);
+
+        std::vector<std::string> cc = {tc.exe_path, "cc",
+            "-target", triple, "-c", "-w", asm_file.string(),
+            "-o", obj_file.string()};
+        auto r = run_process(cc, Path(), true);
+        if (!r.success()) {
+            std::print(std::cerr, "{}", r.stderr_output);
+            std::println(std::cerr, "bake: failed to assemble {} stub",
+                         l.name);
+            return Path();
+        }
+
+        std::string soname = (l.name == "ld") ? ld_soname : stem;
+        // Keep the strings alive: c_str() on temporaries would dangle
+        // before bake_lld_link consumes argv.
+        std::string obj_path = obj_file.string();
+        std::string map_path = map_file.string();
+        std::string out_path = out_file.string();
+        std::vector<const char*> argv;
+        argv.push_back("ld.lld");
+        argv.push_back("-shared");
+        argv.push_back(obj_path.c_str());
+        argv.push_back("-soname");
+        argv.push_back(soname.c_str());
+        argv.push_back("-version-script");
+        argv.push_back(map_path.c_str());
+        argv.push_back("-o");
+        argv.push_back(out_path.c_str());
+        if (bake_lld_link(LldFlavor::ELF,
+                          static_cast<int>(argv.size()),
+                          argv.data()) != 0) {
+            std::println(std::cerr, "bake: failed to link {} stub", stem);
+            return Path();
+        }
+    }
+
+    write_file(hash_file, abi_hash);
+    write_file(sentinel, "");
+    return stub_dir;
+}
 // ── Unified runtime preparation ──
 //
 // Called once per link job from bake_clang_driver.cpp. Dispatches to the
@@ -2205,6 +2918,58 @@ export RuntimeArtifacts prepare_runtime(
         // Always-link system libraries.
         for (auto* lib : mingw_always_link_libs)
             rt.always_link_libs.push_back(lib);
+        break;
+    }
+    case LibcFamily::Gnu: {
+        // gnu: dynamic-only. Static/static-pie on glibc is rejected with
+        // guidance toward musl (bakeExecuteJob checks before dispatch).
+        if (link_mode != LinkMode::Dynamic) {
+            std::println(std::cerr,
+                "bake: static linking is not supported for glibc targets\n"
+                "  (glibc's static mode has broken dlopen/NSS semantics);\n"
+                "  use a linux-musl target for static builds.");
+            break;
+        }
+        // Native gnu keeps the vendored crt + synthesized stubs (they link
+        // against libc.so.6 by soname; the runtime libc is the system one),
+        // but unknown -l<name> must resolve against the system lib dirs.
+        if (resolve_gnu_sdk(tc.target) == GnuSdkLayout::SystemGnu) {
+            std::string multi = tc.target.arch() == "x86_64"
+                ? "/usr/lib/x86_64-linux-gnu" : "/usr/lib/aarch64-linux-gnu";
+            rt.link_dirs.push_back(multi);
+            rt.link_dirs.push_back("/usr/lib64");
+            rt.link_dirs.push_back("/usr/lib");
+        }
+        auto gnu = ensure_glibc_objects(tc, link_mode);
+        rt.crt_entry = gnu.crt_entry;
+        rt.libc = gnu.libc_nonshared_a;
+        rt.dynamic_linker = gnu.dynamic_linker;
+        Path stubs = ensure_glibc_stubs(tc);
+        if (!stubs.string().empty()) {
+            rt.link_dirs.push_back(stubs.string());
+            // Fixed set, link order; merged-into-libc libs stop at 2.34.
+            static const struct {
+                const char* name; int sover; const char* removed_in;
+            } gnu_libs[] = {
+                {"m", 6, nullptr}, {"c", 6, nullptr},
+                {"ld", 2, nullptr}, {"resolv", 2, nullptr},
+                {"pthread", 0, "2.34"}, {"dl", 2, "2.34"},
+                {"rt", 1, "2.34"}, {"util", 1, "2.34"},
+            };
+            for (auto& gl : gnu_libs) {
+                if (gl.removed_in) {
+                    GlibcVer floor;
+                    glibc_parse_version(gl.removed_in, floor);
+                    GlibcVer tv{tc.target.glibc_major(),
+                                tc.target.glibc_minor(), 0};
+                    if (!(tv < floor)) continue;
+                }
+                Path so = stubs / ("lib" + std::string(gl.name) + ".so." +
+                                   std::to_string(gl.sover));
+                if (so.is_regular_file())
+                    rt.gnu_stub_libs.push_back(so.string());
+            }
+        }
         break;
     }
     case LibcFamily::None:

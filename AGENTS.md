@@ -24,19 +24,23 @@ rm -rf out/
 
 ## Cross-Platform Compilation
 
-bake cross-compiles to three libc families, all from any host:
+bake cross-compiles to four libc families, all from any host:
 
 | Target triple | libc | Arch |
 |---|---|---|
 | `*-darwin` | host libSystem (macOS) | aarch64, x86_64 |
 | `*-linux-musl` | musl (vendored source) | aarch64, x86_64 |
+| `*-linux-gnu` | glibc (vendored subset + synthesized stubs) | x86_64, aarch64 |
 | `*-windows-gnu` | MinGW-w64 (vendored source) | x86_64, aarch64 |
 
-Use `-t <triple>` to cross-compile (e.g. `bake build -t x86_64-windows-gnu`).
+Use `-t <triple>` to cross-compile (e.g. `bake build -t x86_64-linux-gnu`).
+glibc targets default to version 2.28; pick another with a triple suffix
+(`-t x86_64-linux-gnu.2.31`). gnu is dynamic-only — static builds are
+rejected with musl guidance.
 
 The dispatch chain in `bake.compiler.cppm`:
 
-1. `resolve_libc_family(target)` → `LibcFamily` (`Darwin`, `Musl`, `Windows`, `None`)
+1. `resolve_libc_family(target)` → `LibcFamily` (`Darwin`, `Musl`, `Windows`, `Gnu`, `None`)
 2. `prepare_runtime(tc)` → calls the right `ensure_*_objects()` builder
 3. `make_compile_command()` / `make_link_command()` → target-specific flags
 4. LLD flavor selected in `bake_clang_driver.cpp` (`Darwin`, `COFF/MinGW`, `GNU`)
@@ -44,9 +48,10 @@ The dispatch chain in `bake.compiler.cppm`:
 Each libc family is self-contained:
 - **Darwin**: SDK stubs (`libSystem.tbd`) shipped in `lib/libc/darwin/`. No Xcode needed.
 - **Musl**: full musl source in `lib/libc/musl/`, built from source → static CRT.
+- **Gnu**: crt + `libc_nonshared.a` compiled in-process from the vendored glibc source subset (`lib/libc/glibc/`); libc itself is never built — link-time stub `.so` files are synthesized per target version from the vendored `abilists` symbol/version table (`ensure_glibc_stubs`). Headers: `lib/libc/include/generic-glibc/` + per-triple dirs + kernel UAPI shared with musl. `scripts/fetch-glibc.sh` regenerates everything from upstream tarballs (patches in `scripts/glibc-patches/`).
 - **Windows**: MinGW-w64 v14 in `lib/libc/mingw/`, CRT + winpthreads from source. Import libraries generated on-demand from `.def` files (only libraries referenced by `-l` flags). LLD MinGW driver. UCRT default via `_mingw.h`.
 
-libc++ config site varies per target (`lib/libcxx/cross-config/` for musl, `lib/libcxx/mingw-config/` for windows).
+libc++ config site varies per target (`lib/libcxx/cross-config/` for musl, `lib/libcxx/gnu-config/` for gnu, `lib/libcxx/mingw-config/` for windows).
 
 compiler-rt `chkstk.S` patched with `__chkstk`/`_alloca`/`__alloca` aliases — normally provided by `libgcc.a`, bake provides them since it doesn't use GCC runtime.
 
@@ -123,6 +128,7 @@ bake/
 │   ├── libc/
 │   │   ├── darwin/              macOS SDK stubs
 │   │   ├── musl/                musl source
+│   │   ├── glibc/               glibc source subset + abilists (linux-gnu)
 │   │   ├── mingw/               MinGW-w64 headers + CRT sources
 │   │   └── include/             multi-platform headers (linux, generic)
 │   └── include/                 vendored Clang/LLVM headers
@@ -134,11 +140,14 @@ bake/
 │   ├── fetch-darwin-headers.sh  extract macOS SDK stubs
 │   ├── fetch-mingw.sh           download MinGW-w64 v14 from GitHub
 │   ├── fetch-musl.sh            download musl source
+│   ├── fetch-linux-headers.sh   kernel UAPI headers (shared musl+gnu)
+│   ├── fetch-glibc.sh           vendor glibc subset + abilists from upstream
+│   ├── glibc-abi-gen.py         readelf → abilists (runs inside Docker)
 │   └── update-runtime.sh        update vendored libc++/libcxxabi/libunwind/compiler-rt
 ├── tests/
 │   ├── test_runner.cpp          custom test framework, spawns bake binary
 │   ├── graph_test.cpp           unit tests for graph/moid logic
-│   └── projects/                fixture projects (62 test cases)
+│   └── projects/                fixture projects (64 test cases)
 └── external/              LLVM source + prebuilt install (git submodule)
 ```
 

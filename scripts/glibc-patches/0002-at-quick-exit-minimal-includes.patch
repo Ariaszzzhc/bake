@@ -1,0 +1,21 @@
+From: bake
+Subject: [PATCH 2/3] at_quick_exit: minimal includes
+
+Same rationale as 0001: keep the libc_nonshared member off the internal
+header graph. Bodies are unchanged.
+
+--- a/stdlib/at_quick_exit.c
++++ b/stdlib/at_quick_exit.c
+@@ -35,9 +35,9 @@
+
+    <http://www.gnu.org/licenses/>.  */
+
+-#include <stdlib.h>
+-#include <dso_handle.h>
+-#include "exit.h"
++#include <stddef.h>
++extern void *__dso_handle __attribute__ ((__visibility__ ("hidden")));
++extern int __cxa_at_quick_exit (void (*func) (void *), void *d);
+
+ /* Register FUNC to be executed by `quick_exit'.  */
+ int

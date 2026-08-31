@@ -311,6 +311,10 @@ static void bakeGetLLDInfo(const llvm::Triple &Triple,
   }
 }
 
+// Explicit -target spec from the current invocation, preserving bake's
+// glibc version suffix (LLVM triples cannot encode it). Set during
+// argument preprocessing, consumed by the link interception.
+static bake::TargetSpec g_explicit_target;
 /// Execute a single job from the compilation.
 ///
 /// Link jobs are intercepted and dispatched to the in-process LLD driver
@@ -332,10 +336,13 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     bake::Toolchain tc;
     tc.exe_path = bake::get_self_exe_path();
     if (tc.exe_path.empty()) tc.exe_path = "bake";
-    tc.target = bake::parse_target(Triple.getTriple());
+    tc.target = !g_explicit_target.triple_.empty()
+        ? g_explicit_target
+        : bake::parse_target(Triple.getTriple());
 
     bool is_darwin = Flavor == LldFlavor::MACHO;
     bool is_mingw = Flavor == LldFlavor::MinGW;
+    bool is_gnu = !is_darwin && !is_mingw && tc.target.is_linux_gnu();
 
     // Parse link mode from user args.
     std::vector<std::string> user_args;
@@ -343,8 +350,25 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       if (Arg) user_args.push_back(Arg);
     bake::LinkMode link_mode = bake::parse_link_mode(user_args);
 
+    // glibc is dynamic-only (broken dlopen/NSS when static). Reject before
+    if (is_gnu && link_mode != bake::LinkMode::Dynamic) {
+      llvm::errs() << "bake: static linking is not supported for glibc targets\n"
+                      "  (glibc's static mode has broken dlopen/NSS "
+                      "semantics); use a linux-musl target for static builds.\n";
+      FailingCommands.push_back({1, Cmd});
+      if (!Res) Res = 1;
+      return;
+    }
+
     // One call — prepares ALL runtime artifacts for this target.
     bake::RuntimeArtifacts rt = bake::prepare_runtime(tc, IsCxx, link_mode);
+
+    bool is_shared_lib = false;
+    bool has_no_pie = false;
+    for (auto& A : user_args) {
+      if (A == "-shared" || A == "-Bshareable") is_shared_lib = true;
+      if (A == "-no-pie") has_no_pie = true;
+    }
 
     std::vector<std::string> Prefix;  // before user args
     std::vector<std::string> Suffix;  // after user args
@@ -375,6 +399,19 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       Prefix.push_back("-lSystem");
     }
 
+
+    if (is_gnu) {
+      for (auto& dir : rt.link_dirs)
+        Prefix.push_back("-L" + dir);
+      if (!is_shared_lib) {
+        // Executable: interpreter path. Scrt1.o serves both PIE and
+        // non-PIE; bake does not force PIE (user objects may be non-PIC).
+        if (!rt.dynamic_linker.empty()) {
+          Prefix.push_back("-dynamic-linker");
+          Prefix.push_back(rt.dynamic_linker);
+        }
+      }
+    }
     if (is_mingw) {
       // Import library search paths for the MinGW driver.
       for (auto& dir : rt.link_dirs)
@@ -406,9 +443,28 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       }
     }
 
+    // Known glibc library names whose -l references are replaced by the
+    // synthesized stub set (stub files are lib<name>.so.<sover> — plain
+    // -l<name> could not resolve them anyway).
+    auto is_glibc_lib_name = [](StringRef n) {
+      return n == "c" || n == "m" || n == "pthread" || n == "dl" ||
+             n == "rt" || n == "resolv" || n == "util" || n == "ld" ||
+             n == "anl" || n == "nsl" || n == "crypt" || n == "nss_db" ||
+             n == "nss_dns" || n == "nss_files";
+    };
+
+    bool skip_next_dynamic_linker = false;
     for (const char *Arg : Cmd->getArguments()) {
       if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
         continue;
+      if (skip_next_dynamic_linker) {
+        skip_next_dynamic_linker = false;
+        continue;
+      }
+      if (Arg && StringRef(Arg) == "-dynamic-linker") {
+        skip_next_dynamic_linker = true;
+        continue;
+      }
       if (is_mingw && Arg) {
         StringRef A(Arg);
         // GCC-specific libs not needed with Clang/LLD.
@@ -423,10 +479,32 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
             A == "crtbeginS.o" || A == "crtendS.o")
           continue;
       }
+      if (is_gnu && Arg) {
+        StringRef A(Arg);
+        // GCC unwinder/builtins: replaced by compiler-rt + libunwind.
+        if (A == "-lgcc" || A == "-lgcc_s" || A == "-lgcc_eh" ||
+            A == "-lstdc++")
+          continue;
+        // glibc libs: replaced by the synthesized stub set.
+        if (A.starts_with("-l") && is_glibc_lib_name(A.substr(2)))
+          continue;
+        // CRT startup files — bake provides Scrt1.o + libc_nonshared.a.
+        if (A == "crt1.o" || A == "Scrt1.o" || A == "crti.o" ||
+            A == "crtn.o" || A == "crtbegin.o" || A == "crtend.o" ||
+            A == "crtbeginS.o" || A == "crtendS.o" || A == "crtbeginT.o")
+          continue;
+      }
       LldArgs.push_back(Arg);
     }
 
     // ── Suffix: runtime archives (target-agnostic) ──
+    // gnu: stubs first, under --as-needed so only used libs become
+    // DT_NEEDED entries (a hello-world ends up with just libc.so.6).
+    if (is_gnu) {
+      Suffix.push_back("--as-needed");
+      for (auto& stub : rt.gnu_stub_libs)
+        Suffix.push_back(stub);
+    }
     if (!rt.libcxxabi.string().empty())
       Suffix.push_back(rt.libcxxabi.string());
     if (!rt.libcxx.string().empty())
@@ -443,7 +521,6 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       for (auto& lib : rt.always_link_libs)
         Suffix.push_back(rt.mingw_import_dir + "/" + lib + ".lib");
     }
-
     for (auto &S : Suffix)
       LldArgs.push_back(S.c_str());
 
@@ -584,6 +661,50 @@ static void inject_vendored_headers(
       add(lib + "/libc/include/generic-musl");
       add(lib + "/libc/include/" + arch_os_dir + "-linux-any");
       add(lib + "/libc/include/any-linux-any");
+    }
+
+  }
+  // linux-gnu (glibc). Vendored layout: -nostdinc + layered chain
+  // (per-triple bits → generic-glibc → kernel UAPI shared with musl).
+  // SystemGnu (native glibc host, same arch): system /usr/include stays;
+  // libc++ headers are always vendored regardless of layout.
+  {
+    bake::TargetSpec gnu_ts = !target_triple.empty()
+        ? bake::parse_target(target_triple)
+        : bake::detect_host_target();
+
+    if (gnu_ts.is_linux_gnu()) {
+      auto layout = bake::resolve_gnu_sdk(gnu_ts);
+
+      if (IsCxx)
+        Args.push_back(Saver.save("-nostdinc++").data());
+      if (layout == bake::GnuSdkLayout::Vendored)
+        Args.push_back(Saver.save("-nostdinc").data());
+
+      auto add = [&](const std::string &path) {
+        Args.push_back(Saver.save("-isystem").data());
+        Args.push_back(Saver.save(path.c_str()).data());
+      };
+
+      // C++ headers (always vendored).
+      if (IsCxx && !lib.empty()) {
+        add(lib + "/libcxx/gnu-config");
+        add(lib + "/libcxx/include");
+        add(lib + "/libcxxabi/include");
+      }
+
+      if (!lib.empty()) {
+        add(lib + "/include");
+        if (layout == bake::GnuSdkLayout::Vendored) {
+          StringRef arch = gnu_ts.triple_.c_str();
+          arch = arch.split('-').first;
+          std::string arch_os_dir = (arch == "x86_64") ? "x86" : arch.str();
+          add(lib + "/libc/include/" + gnu_ts.triple_);
+          add(lib + "/libc/include/generic-glibc");
+          add(lib + "/libc/include/" + arch_os_dir + "-linux-any");
+          add(lib + "/libc/include/any-linux-any");
+        }
+      }
     }
   }
 
@@ -835,9 +956,25 @@ static int clang_main(int Argc, const char **Argv,
 
   // Detect target triple from -target flag, falling back to the driver's
   // default triple (baked into LLVM at build time) when not specified.
+  // The raw spec (with bake's glibc version suffix, e.g.
+  // "x86_64-linux-gnu.2.31") is kept for the link interception — LLVM's
+  // normalized Triple cannot carry the version.
   std::string target_triple;
+  bool has_explicit_target = false;
   for (size_t i = 0; i + 1 < Args.size(); ++i) {
     if (StringRef(Args[i]) == "-target") {
+      StringRef Spec(Args[i + 1]);
+      g_explicit_target = bake::parse_target(Spec.str());
+      has_explicit_target = true;
+      // Strip the version suffix before the driver parses the triple —
+      // ".2.31" is not a valid LLVM environment component.
+      StringRef Abi = Spec;
+      auto Dash = Spec.rfind('-');
+      if (Dash != StringRef::npos) Abi = Spec.substr(Dash + 1);
+      if (Spec.contains("linux") && Abi.starts_with("gnu.")) {
+        std::string Clean = (Spec.substr(0, Dash + 1) + "gnu").str();
+        Args[i + 1] = Saver.save(Clean).data();
+      }
       target_triple = Args[i + 1];
       break;
     }

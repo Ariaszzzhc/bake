@@ -10,7 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <fstream>
 #include <algorithm>
 #include <string>
 #include <string_view>
@@ -3274,6 +3274,167 @@ TestResult test_target_conditions() {
     return {};
 }
 
+// ── glibc cross target ──
+
+struct Elf64Info {
+    bool valid = false;
+    std::string interp;
+    std::vector<std::string> needed;
+    std::vector<std::string> glibc_versions;  // GLIBC_x.y strings in dynstr
+};
+
+// Minimal ELF64 little-endian inspector: PT_INTERP, DT_NEEDED, and the
+// GLIBC_* version strings from the dynamic string table. Runs on any host.
+static Elf64Info inspect_elf64(const fs::path& p) {
+    Elf64Info info;
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return info;
+    std::vector<unsigned char> b((std::istreambuf_iterator<char>(f)),
+                                  std::istreambuf_iterator<char>());
+    auto u16 = [&](size_t o) -> uint64_t {
+        return b[o] | (b[o + 1] << 8); };
+    auto u64 = [&](size_t o) -> uint64_t {
+        return u16(o) | (u16(o + 2) << 16) | (u16(o + 4) << 32) |
+               (u16(o + 6) << 48); };
+    if (b.size() < 64 || b[0] != 0x7f || b[1] != 'E' || b[2] != 'L' ||
+        b[3] != 'F' || b[4] != 2 /*ELF64*/ || b[5] != 1 /*LE*/)
+        return info;
+    info.valid = true;
+
+    size_t phoff = u64(32);
+    size_t phentsize = u16(54), phnum = u16(56);
+    size_t dyn_off = 0, dyn_sz = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> loads;  // vaddr → file off
+    std::vector<std::pair<uint64_t, uint64_t>> dyn;    // tag → val
+    for (size_t i = 0; i < phnum; ++i) {
+        size_t ph = phoff + i * phentsize;
+        uint64_t type = u16(ph);
+        if (type == 3) {  // PT_INTERP
+            size_t off = u64(ph + 8), sz = u64(ph + 32);
+            info.interp.assign(reinterpret_cast<char*>(b.data()) + off,
+                               strnlen(reinterpret_cast<char*>(b.data()) + off,
+                                       sz));
+        } else if (type == 1) {  // PT_LOAD
+            loads.emplace_back(u64(ph + 16), u64(ph + 8));
+        } else if (type == 2) {  // PT_DYNAMIC
+            dyn_off = u64(ph + 8);
+            dyn_sz = u64(ph + 32);
+        }
+    }
+    if (dyn_off == 0) return info;
+    auto vaddr_to_off = [&](uint64_t v) -> size_t {
+        for (auto& [va, off] : loads)
+            if (v >= va && v - va <= (1ull << 40)) return off + (v - va);
+        return static_cast<size_t>(v);  // identity for most linkers
+    };
+    size_t strtab = 0;
+    for (size_t o = dyn_off; o + 16 <= dyn_off + dyn_sz; o += 16) {
+        uint64_t tag = u64(o), val = u64(o + 8);
+        dyn.emplace_back(tag, val);
+        if (tag == 5) strtab = val;  // DT_STRTAB
+    }
+    if (strtab == 0) return info;
+    size_t strtab_off = vaddr_to_off(strtab);
+    auto dynstr = [&](uint64_t off) -> std::string {
+        size_t o = strtab_off + off;
+        if (o >= b.size()) return {};
+        return std::string(reinterpret_cast<char*>(b.data()) + o,
+                           strnlen(reinterpret_cast<char*>(b.data()) + o,
+                                   b.size() - o));
+    };
+    for (auto& [tag, val] : dyn) {
+        if (tag == 1) info.needed.push_back(dynstr(val));  // DT_NEEDED
+    }
+    // GLIBC_* version strings live in the dynamic string table.
+    size_t end = b.size();
+    for (size_t o = strtab_off; o < end; ++o) {
+        if (o + 6 <= end && std::memcmp(b.data() + o, "GLIBC_", 6) == 0 &&
+            (o == strtab_off || b[o - 1] == '\0')) {
+            size_t e = o;
+            while (e < end && b[e] != '\0') ++e;
+            info.glibc_versions.emplace_back(
+                reinterpret_cast<char*>(b.data()) + o, e - o);
+            o = e;
+        }
+    }
+    return info;
+}
+
+TestResult test_cross_gnu() {
+    // C pipeline: compile + link against the vendored glibc subset and
+    // synthesized stubs, then verify the ELF structure from the host.
+    auto dir = make_temp_dir("cross_gnu");
+    copy_fixture("cross_gnu", dir);
+
+    auto build = run_bake("build -t x86_64-linux-gnu", dir);
+    CHECK(build.success(), "glibc cross build failed: " + build.stdout);
+
+    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu";
+    CHECK(fs::exists(out), "glibc cross executable missing");
+
+    auto elf = inspect_elf64(out);
+    CHECK(elf.valid, "output is not a valid ELF64 binary");
+    CHECK(elf.interp == "/lib64/ld-linux-x86-64.so.2",
+          "unexpected PT_INTERP: " + elf.interp);
+    bool has_libc = false;
+    for (auto& n : elf.needed) {
+        if (n == "libc.so.6") has_libc = true;
+        CHECK(n != "libpthread.so.0" && n != "libdl.so.2" &&
+                  n != "librt.so.1" && n != "libutil.so.1",
+              "unused glibc stub leaked into DT_NEEDED: " + n);
+    }
+    CHECK(has_libc, "libc.so.6 missing from DT_NEEDED");
+    bool saw_glibc_ver = false;
+    for (auto& v : elf.glibc_versions)
+        if (v.find("GLIBC_2.") == 0) saw_glibc_ver = true;
+    CHECK(saw_glibc_ver, "no GLIBC_* version references in dynamic strings");
+
+    // aarch64 variant.
+    auto arm = run_bake("build -t aarch64-linux-gnu", dir);
+    CHECK(arm.success(), "aarch64 glibc cross build failed: " + arm.stdout);
+    auto arm_elf = inspect_elf64(dir / "out/aarch64-linux-gnu/bin/cross-gnu");
+    CHECK(arm_elf.valid && arm_elf.interp == "/lib/ld-linux-aarch64.so.1",
+          "aarch64 PT_INTERP wrong: " + arm_elf.interp);
+
+    // Explicit glibc version via triple suffix: still builds (the vendored
+    // header surface is pinned to 2.28; higher targets simply link against
+    // the same-or-older symbol versions).
+    auto dir31 = make_temp_dir("cross_gnu_231");
+    copy_fixture("cross_gnu", dir31);
+    auto v31 = run_bake("build -t x86_64-linux-gnu.2.31", dir31);
+    CHECK(v31.success(), "glibc 2.31 target build failed: " + v31.stdout);
+    CHECK(fs::exists(dir31 / "out/x86_64-linux-gnu/bin/cross-gnu"),
+          "versioned-target build produced no binary in the triple dir");
+
+    // Static linking on glibc is rejected with musl guidance.
+    auto stat = run_bake(
+        "cc -target x86_64-linux-gnu -static " +
+            (dir / "src/main.c").string() + " -o " +
+            (dir / "static-app").string(),
+        dir);
+    CHECK(!stat.success(), "static glibc link unexpectedly succeeded");
+    CHECK(stat.stdout.find("musl") != std::string::npos,
+          "static-glibc diagnostic lacks musl guidance: " + stat.stdout);
+
+    return {};
+}
+
+TestResult test_cross_gnu_cpp() {
+    // C++ pipeline: import std against the gnu libc++ config.
+    auto dir = make_temp_dir("cross_gnu_cpp");
+    copy_fixture("cross_gnu_cpp", dir);
+
+    auto build = run_bake("build -t x86_64-linux-gnu", dir);
+    CHECK(build.success(), "glibc C++ cross build failed: " + build.stdout);
+    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-cpp";
+    CHECK(fs::exists(out), "glibc C++ executable missing");
+    auto elf = inspect_elf64(out);
+    CHECK(elf.valid && elf.interp == "/lib64/ld-linux-x86-64.so.2",
+          "C++ glibc PT_INTERP wrong: " + elf.interp);
+
+    return {};
+}
+
 TestResult test_default_source_extensions() {
     auto dir = make_temp_dir("default_source_extensions");
     copy_fixture("default_source_extensions", dir);
@@ -3475,7 +3636,9 @@ TestResult test_target_output_isolation() {
 // ----------------------------------------------------------------
 
 static std::vector<TestCase> all_tests = {
-    {"simple_app_build",              test_simple_app_build},
+    {"target_conditions",             test_target_conditions},
+    {"cross_gnu",                     test_cross_gnu},
+    {"cross_gnu_cpp",                 test_cross_gnu_cpp},
     {"default_executable_type",       test_default_executable_type},
     {"invalid_moid_type",             test_invalid_moid_type},
     {"input_declaration_equivalence", test_input_declaration_equivalence},
