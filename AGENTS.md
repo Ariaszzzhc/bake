@@ -215,3 +215,5 @@ out/
 - **`bake build` never moves a locked tag** — only `bake update` re-resolves tags to commits.
 - **`--locked`** fails if lock is missing/stale; **`--offline`** bans network; **`--frozen`** = both.
 - **Static by default** — link actions prefer static archives over shared libraries.
+- **Keep `docs/` in sync** — any content or API change must be reflected in the
+  bilingual usage book under `docs/`.
