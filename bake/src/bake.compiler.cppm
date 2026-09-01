@@ -740,7 +740,7 @@ void collect_input_files(const Path& p, std::vector<Path>& out) {
 
 struct FileStamp {
     std::uintmax_t size = 0;
-    int64_t mtime = 0;
+    std::int64_t mtime = 0;
     bool valid = false;
 };
 
@@ -750,8 +750,8 @@ FileStamp stat_stamp(const Path& p) {
     FileStamp s;
     if (auto st = fs::status(p.fs(), ec); fs::exists(st)) {
         s.size = fs::file_size(p.fs(), ec);
-        s.mtime = int64_t(fs::last_write_time(p.fs(), ec).time_since_epoch()
-                              .count());
+        s.mtime = std::int64_t(
+            fs::last_write_time(p.fs(), ec).time_since_epoch().count());
         s.valid = !ec;
     }
     return s;
