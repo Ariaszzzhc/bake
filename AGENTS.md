@@ -12,7 +12,7 @@ APIs are not frozen — make changes clean, not backward-compatible.
 # Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 19 + libc++)
 cmake -G Ninja -B build && cmake --build build
 
-# Run the test suite (66 end-to-end tests)
+# Run the test suite (67 end-to-end tests)
 ctest --test-dir build --output-on-failure
 
 # Self-host: stage 0 bake builds itself → out/bin/bake
@@ -232,13 +232,20 @@ no manual bump markers. Managed by `toolchain_cache_lookup`/`finish`.
 
 ## Sanitizers
 
-- Supported: `-fsanitize=undefined` (ubsan standalone) and
-  `-fsanitize=thread` — runtimes built from the vendored compiler-rt
-  sources (`lib/compiler-rt/lib/{sanitizer_common,interception,ubsan,tsan}`)
+- Supported: `-fsanitize=address` (static asan, whole-archive'd),
+  `-fsanitize=undefined` (ubsan standalone) and `-fsanitize=thread` —
+  runtimes built from the vendored compiler-rt sources
+  (`lib/compiler-rt/lib/{sanitizer_common,interception,ubsan,tsan,asan,lsan}`)
   per ELF target (linux-gnu, linux-musl) at first link, cached like any
-  runtime product. The tsan archive embeds the ubsan reporting core.
-- `-fsanitize=address` is not vendored: compile-only invocations still
-  instrument; the link is rejected with a clear message.
+  runtime product. The asan archive embeds lsan_common (leak detection),
+  the ubsan reporting core and operator new/delete; the tsan archive
+  embeds the ubsan core. Runtime compile flags include `-fno-builtin`
+  (loop-idiom recognition would otherwise route internal_* loops through
+  the interceptors and deadlock init) and every flag is part of the
+  cache config key.
+- Other sanitizers (msan, lsan, ...) are not vendored: compile-only
+  invocations still instrument; the link is rejected with a clear
+  message.
 - Non-ELF targets reject sanitize links with "not supported on this
   target yet".
 

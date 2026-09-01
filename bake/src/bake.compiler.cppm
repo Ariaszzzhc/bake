@@ -1893,6 +1893,7 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
 export enum class SanitizerKind {
     Ubsan,
     Tsan,
+    Asan,
 };
 
 namespace {
@@ -1971,6 +1972,31 @@ const char* ubsan_standalone_sources[] = {
     "ubsan_value.cpp",
 };
 
+// asan core (upstream ASAN_SOURCES) plus the leak-detection common core it
+// always embeds (RTLSanCommon) and the ubsan reporting core (RTUbsan,
+// non-apple set).
+const char* asan_core_sources[] = {
+    "asan_allocator.cpp", "asan_activation.cpp", "asan_debugging.cpp",
+    "asan_descriptions.cpp", "asan_errors.cpp", "asan_fake_stack.cpp",
+    "asan_flags.cpp", "asan_globals.cpp", "asan_interceptors.cpp",
+    "asan_interceptors_memintrinsics.cpp", "asan_linux.cpp",
+    "asan_malloc_linux.cpp", "asan_memory_profile.cpp",
+    "asan_new_delete.cpp", "asan_poisoning.cpp", "asan_posix.cpp",
+    "asan_premap_shadow.cpp", "asan_report.cpp", "asan_rtl.cpp",
+    "asan_shadow_setup.cpp", "asan_stack.cpp", "asan_stats.cpp",
+    "asan_suppressions.cpp", "asan_thread.cpp",
+};
+const char* lsan_common_sources[] = {
+    "lsan_common.cpp", "lsan_common_fuchsia.cpp",
+    "lsan_common_linux.cpp", "lsan_common_mac.cpp",
+};
+// The ubsan reporting core shared by tsan and asan (upstream UBSAN_SOURCES;
+// the standalone/cxx/type-hash units are runtime-specific).
+const char* ubsan_core_sources[] = {
+    "ubsan_diag.cpp", "ubsan_flags.cpp", "ubsan_handlers.cpp",
+    "ubsan_init.cpp", "ubsan_monitor.cpp", "ubsan_value.cpp",
+};
+
 } // namespace
 
 export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
@@ -1986,10 +2012,14 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     Path common_dir = rt_root / "sanitizer_common";
     if (!common_dir.is_directory()) return Path();
 
-    const char* label = kind == SanitizerKind::Ubsan ? "san-ubsan" : "san-tsan";
+    const char* label = kind == SanitizerKind::Ubsan ? "san-ubsan"
+                      : kind == SanitizerKind::Tsan  ? "san-tsan"
+                                                     : "san-asan";
     std::string product = kind == SanitizerKind::Ubsan
         ? "libclang_rt.ubsan_standalone.a"
-        : "libclang_rt.tsan.a";
+        : kind == SanitizerKind::Tsan
+        ? "libclang_rt.tsan.a"
+        : "libclang_rt.asan.a";
 
     // (source directory, file) pairs to compile — assembled BEFORE the
     // cache lookup so the unit list itself is a config input: changing
@@ -2013,15 +2043,27 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         add(rt_root / "interception", interception_sources,
             std::size(interception_sources));
         // The tsan runtime embeds the ubsan reporting core (its rtl
-        // references __ubsan::* directly), minus the type-hash units,
-        // which need RTTI and are not used from tsan.
-        static const char* tsan_ubsan_subset[] = {
-            "ubsan_diag.cpp", "ubsan_flags.cpp",
-            "ubsan_handlers.cpp", "ubsan_init.cpp",
-            "ubsan_monitor.cpp", "ubsan_value.cpp",
-        };
-        add(rt_root / "ubsan", tsan_ubsan_subset,
-            std::size(tsan_ubsan_subset));
+        // references __ubsan::* directly).
+        add(rt_root / "ubsan", ubsan_core_sources,
+            std::size(ubsan_core_sources));
+        units.emplace_back(common_dir, "sanitizer_coverage_libcdep_new.cpp");
+        units.emplace_back(common_dir, "sancov_flags.cpp");
+    } else if (kind == SanitizerKind::Asan) {
+        add(rt_root / "asan", asan_core_sources,
+            std::size(asan_core_sources));
+        // Leak detection is built into the asan runtime (RTLSanCommon).
+        add(rt_root / "lsan", lsan_common_sources,
+            std::size(lsan_common_sources));
+        // The ubsan reporting core (RTUbsan, non-apple set) — asan
+        // reports undefined-behavior-shaped errors through it.
+        add(rt_root / "ubsan", ubsan_core_sources,
+            std::size(ubsan_core_sources));
+        add(rt_root / "interception", interception_sources,
+            std::size(interception_sources));
+        // Early __asan_init via .preinit_array, plus the vfork
+        // interceptor assembly upstream appends to ASAN_SOURCES on ELF.
+        units.emplace_back(rt_root / "asan", "asan_preinit.cpp");
+        units.emplace_back(rt_root / "asan", "asan_interceptors_vfork.S");
         units.emplace_back(common_dir, "sanitizer_coverage_libcdep_new.cpp");
         units.emplace_back(common_dir, "sancov_flags.cpp");
     } else {
@@ -2039,37 +2081,10 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         units.emplace_back(tsan_rtl, arch_s.c_str());
     }
 
-    std::vector<std::string> config;
-    config.push_back(kind == SanitizerKind::Ubsan ? "san-ubsan-v3"
-                                                  : "san-tsan-v3");
-    config.push_back(compiler_identity_block(tc));
-    for (auto& l : target_surface_lines(tc)) config.push_back(l);
-    std::string unit_list;
-    for (auto& [dir, file] : units)
-        unit_list += std::string(file) + " ";
-    config.push_back("units:" + unit_list);
-
-    std::vector<Path> inputs{common_dir, rt_root / "interception"};
-    if (kind == SanitizerKind::Ubsan)
-        inputs.push_back(rt_root / "ubsan");
-    else
-        inputs.push_back(rt_root / "tsan");
-
-    auto entry = toolchain_cache_lookup(tc, label, config, inputs);
-    Path cache_dir = entry.output_dir;
-    Path result_a = cache_dir / product;
-
-    if (entry.hit && result_a.is_regular_file()) return result_a;
-    if (result_a.is_regular_file()) {
-        toolchain_cache_finish(entry);
-        return result_a;
-    }
-
-    std::println("   Compiling {} runtime for {} (cached)",
-                 kind == SanitizerKind::Ubsan ? "ubsan" : "tsan",
-                 tc.target.triple_with_version());
-
     // Flags shared by every unit (self-contained C++; no standard headers).
+    // Built before the cache lookup: every compile flag is a config input,
+    // so a flag change re-keys the products (a stale archive with the old
+    // flags can never be picked up).
     auto make_flags = [&]() {
         std::vector<std::string> flags;
         flags.push_back(tc.exe_path);
@@ -2079,8 +2094,14 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         flags.push_back("-c");
         flags.push_back("-std=c++17");
         flags.push_back("-nostdinc++");
+        // Loop-idiom recognition at -O2 would rewrite hand-rolled
+        // internal_strlen/internal_memcpy loops into PLT calls to the
+        // intercepted libc names — inside the runtime that re-enters
+        // the interceptors before init completes and deadlocks.
+        // Upstream compiler-rt compiles runtimes with -fno-builtin.
+        flags.push_back("-fno-builtin");
         // ubsan's itanium type-hash unit uses dynamic_cast and needs
-        // RTTI; tsan is compiled without.
+        // RTTI; every other runtime is compiled without.
         if (kind == SanitizerKind::Ubsan)
             flags.push_back("-frtti");
         else
@@ -2096,11 +2117,49 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         flags.push_back("-I" + (rt_root / "interception").string());
         if (kind == SanitizerKind::Tsan)
             flags.push_back("-I" + (rt_root / "tsan" / "rtl").string());
+        else if (kind == SanitizerKind::Asan)
+            flags.push_back("-I" + (rt_root / "asan").string());
         else
             flags.push_back("-I" + (rt_root / "ubsan").string());
         return flags;
     };
     auto base_flags = make_flags();
+
+    std::vector<std::string> config;
+    config.push_back(kind == SanitizerKind::Ubsan ? "san-ubsan-v3"
+                      : kind == SanitizerKind::Tsan ? "san-tsan-v3"
+                                                    : "san-asan-v3");
+    config.push_back(compiler_identity_block(tc));
+    for (auto& l : target_surface_lines(tc)) config.push_back(l);
+    std::string unit_list;
+    for (auto& [dir, file] : units)
+        unit_list += std::string(file) + " ";
+    config.push_back("units:" + unit_list);
+    for (auto& f : base_flags) config.push_back("flag:" + f);
+
+    std::vector<Path> inputs{common_dir, rt_root / "interception"};
+    if (kind == SanitizerKind::Ubsan)
+        inputs.push_back(rt_root / "ubsan");
+    else if (kind == SanitizerKind::Tsan)
+        inputs.push_back(rt_root / "tsan");
+    else
+        inputs.push_back(rt_root / "asan"), inputs.push_back(rt_root / "lsan");
+
+    auto entry = toolchain_cache_lookup(tc, label, config, inputs);
+    Path cache_dir = entry.output_dir;
+    Path result_a = cache_dir / product;
+
+    if (entry.hit && result_a.is_regular_file()) return result_a;
+    if (result_a.is_regular_file()) {
+        toolchain_cache_finish(entry);
+        return result_a;
+    }
+
+    std::println("   Compiling {} runtime for {} (cached)",
+                 kind == SanitizerKind::Ubsan ? "ubsan"
+                 : kind == SanitizerKind::Tsan ? "tsan" : "asan",
+                 tc.target.triple_with_version());
+
 
     std::vector<Path> obj_files;
     int compiled = 0;

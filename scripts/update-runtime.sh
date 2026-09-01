@@ -195,13 +195,13 @@ done
 #    bases sanitizer_common and interception. Compiled per-target from
 #    these sources by ensure_sanitizer_objects at link time. ──
 echo "==> Updating compiler-rt sanitizers"
-for d in sanitizer_common interception ubsan tsan; do
+for d in sanitizer_common interception ubsan tsan asan lsan; do
   rm -rf "$ROOT/lib/compiler-rt/lib/$d"
   mkdir -p "$ROOT/lib/compiler-rt/lib/$d"
   cp -R "$LLVM_SRC/compiler-rt/lib/$d/." "$ROOT/lib/compiler-rt/lib/$d/"
 done
 # Trim test/script/build scaffolding in the sanitizer dirs only.
-for d in sanitizer_common interception ubsan tsan; do
+for d in sanitizer_common interception ubsan tsan asan lsan; do
   find "$ROOT/lib/compiler-rt/lib/$d" -type d \
        \( -name tests -o -name test -o -name scripts -o -name gn \) -exec rm -rf {} +
   find "$ROOT/lib/compiler-rt/lib/$d" -type f \

@@ -3479,23 +3479,24 @@ TestResult test_cross_gnu_ubsan() {
     CHECK(bytes.find("UndefinedBehaviorSanitizer") != std::string::npos,
           "ubsan runtime not statically linked into the binary");
 
-    // -fsanitize=address is rejected at link with a clear message.
-    auto asan = run_bake("cc -target x86_64-linux-gnu -fsanitize=address "
-                         "src/main.c -o asan-rejected",
+    // Runtimes without a vendored counterpart (msan, lsan, ...) are
+    // rejected at link with a clear message.
+    auto msan = run_bake("cc -target x86_64-linux-gnu -fsanitize=memory "
+                         "src/main.c -o msan-rejected",
                          dir);
-    CHECK(!asan.success() &&
-              asan.stdout.find("not vendored") != std::string::npos,
-          "asan link should be rejected with a clear message");
+    CHECK(!msan.success() &&
+              msan.stdout.find("not vendored") != std::string::npos,
+          "msan link should be rejected with a clear message");
 
     return {};
 }
 
 TestResult test_cross_gnu_tsan() {
     // The TSan runtime links from vendored sources (build + symbol
-    // surface + reporter strings). Running it needs an environment
-    // without the sandbox restrictions that hang shadow-memory setup
-    // inside this host's containers, so the runtime report is not
-    // asserted here.
+    // surface + reporter strings). Running the report needs either a
+    // native-arch container or relaxed sandboxing (ASLR/layout): on
+    // this host only emulated amd64 containers exist, so the runtime
+    // report is not asserted here.
     auto dir = make_temp_dir("cross_gnu_tsan");
     copy_fixture("cross_gnu_tsan", dir);
 
@@ -3514,6 +3515,37 @@ TestResult test_cross_gnu_tsan() {
     }
     CHECK(tsan_bytes.find("ThreadSanitizer") != std::string::npos,
           "tsan runtime not statically linked into the binary");
+
+    return {};
+}
+
+TestResult test_cross_gnu_asan() {
+    // The ASan runtime is built from vendored compiler-rt sources
+    // (asan + lsan_common + ubsan core) at link time and statically
+    // linked in via --whole-archive; its reporter strings and
+    // interface symbols are present in the binary. The runtime report
+    // itself is verified ad hoc in a container; the suite does not
+    // depend on docker.
+    auto dir = make_temp_dir("cross_gnu_asan");
+    copy_fixture("cross_gnu_asan", dir);
+
+    auto build = run_bake("build -t x86_64-linux-gnu.2.36", dir);
+    CHECK(build.success(), "asan cross build failed: " + build.stdout);
+    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-asan";
+    CHECK(fs::exists(out), "asan binary missing");
+    auto elf = inspect_elf64(out);
+    CHECK(elf.valid && elf.interp == "/lib64/ld-linux-x86-64.so.2",
+          "asan output is not a dynamic gnu executable");
+
+    std::string bytes;
+    {
+        std::ifstream f(out, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(f), {});
+    }
+    CHECK(bytes.find("AddressSanitizer") != std::string::npos,
+          "asan runtime not statically linked into the binary");
+    CHECK(bytes.find("__asan_report_store1") != std::string::npos,
+          "asan report interface missing from the binary");
 
     return {};
 }
@@ -3737,6 +3769,7 @@ TestResult test_target_output_isolation() {
 static std::vector<TestCase> all_tests = {
     {"cross_gnu_ubsan",              test_cross_gnu_ubsan},
     {"cross_gnu_tsan",               test_cross_gnu_tsan},
+    {"cross_gnu_asan",               test_cross_gnu_asan},
     {"target_conditions",             test_target_conditions},
     {"cross_gnu",                     test_cross_gnu},
     {"cross_gnu_cpp",                 test_cross_gnu_cpp},
