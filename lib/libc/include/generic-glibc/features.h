@@ -250,17 +250,26 @@
 # define _DEFAULT_SOURCE	1
 #endif
 
-/* This is to enable the ISO C2Y extension.  */
-#if (defined _ISOC2Y_SOURCE \
-     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 202311L))
+/* This is to enable the ISO C2Y extension.  bake pins the header
+   surface to the target version; the __isoc23_* symbols this enables
+   arrived in glibc 2.38, so gate on the pinned version (inline compare:
+   __GLIBC_PREREQ is not yet defined this early in the file).  */
+#if (defined __GLIBC__ && defined __GLIBC_MINOR__ \
+     && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 38)) \
+     && (defined _ISOC2Y_SOURCE \
+     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 202311L)))
 # define __GLIBC_USE_ISOC2Y	1
 #else
 # define __GLIBC_USE_ISOC2Y	0
 #endif
 
-/* This is to enable the ISO C23 extension.  */
-#if (defined _ISOC23_SOURCE || defined _ISOC2Y_SOURCE \
-     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L))
+/* This is to enable the ISO C23 extension.  Same 2.38 gate: without it,
+   a C++23 or C23 TU pinned to an older target would get its strtol
+   family redirected to __isoc23_* symbols that do not exist there.  */
+#if (defined __GLIBC__ && defined __GLIBC_MINOR__ \
+     && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 38)) \
+     && (defined _ISOC23_SOURCE || defined _ISOC2Y_SOURCE \
+     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L)))
 # define __GLIBC_USE_ISOC23	1
 #else
 # define __GLIBC_USE_ISOC23	0

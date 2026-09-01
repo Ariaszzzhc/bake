@@ -159,8 +159,17 @@ EOF
     # the TARGET version via -D__GLIBC__/__GLIBC_MINOR__, so headers from
     # the newest release present the surface of the requested one (every
     # version-sensitive declaration in glibc headers gates on
-    # __GLIBC_PREREQ). Guard the defines so a -D wins without a
-    # redefinition diagnostic; defaults describe the vendored headers.
+    # __GLIBC_PREREQ). Two patches:
+    #   1. Guard the __GLIBC__/__GLIBC_MINOR__ defines so a -D wins
+    #      without a redefinition diagnostic; defaults describe the
+    #      vendored headers.
+    #   2. Version-gate __GLIBC_USE_ISOC23/__GLIBC_USE_ISOC2Y at 2.38:
+    #      upstream gates them only on the language mode (C++23 or
+    #      -std=c2x), but the __isoc23_* symbols they redirect strtol
+    #      (and friends) to only exist from glibc 2.38 — without the
+    #      gate, a C23 TU pinned to an older target redirects calls to
+    #      symbols the target does not have. Inline comparison because
+    #      __GLIBC_PREREQ is not yet defined that early in features.h.
     local seed_minor="${ABI_SEED_VERSION#*.}"
     python3 - "$any/features.h" "$seed_minor" <<'PYEOF'
 import re, sys
@@ -172,9 +181,26 @@ s2 = re.sub(r"^#define\s+__GLIBC_MINOR__\s+(\d+)",
             rf"#ifndef __GLIBC_MINOR__\n#define __GLIBC_MINOR__ {minor}\n#endif", s2, count=1, flags=re.M)
 if s2 == s:
     sys.exit("features.h patch failed to match")
+gate2y_old = """#if (defined _ISOC2Y_SOURCE \\
+     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 202311L))"""
+gate2y_new = """#if (defined __GLIBC__ && defined __GLIBC_MINOR__ \\
+     && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 38)) \\
+     && (defined _ISOC2Y_SOURCE \\
+     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 202311L)))"""
+gate23_old = """#if (defined _ISOC23_SOURCE || defined _ISOC2Y_SOURCE \\
+     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L))"""
+gate23_new = """#if (defined __GLIBC__ && defined __GLIBC_MINOR__ \\
+     && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 38)) \\
+     && (defined _ISOC23_SOURCE || defined _ISOC2Y_SOURCE \\
+     || (defined __STDC_VERSION__ && __STDC_VERSION__ > 201710L)))"""
+for old, new, what in ((gate2y_old, gate2y_new, "__GLIBC_USE_ISOC2Y"),
+                       (gate23_old, gate23_new, "__GLIBC_USE_ISOC23")):
+    if old not in s2:
+        sys.exit(f"{what} gate patch failed to match")
+    s2 = s2.replace(old, new, 1)
 open(p, "w").write(s2)
 PYEOF
-    echo "  → features.h version-override patched (defaults: $ABI_SEED_VERSION)"
+    echo "  → features.h patched (version override + C23 gates, defaults: $ABI_SEED_VERSION)"
 
     echo "  → generic-glibc/       ($(find "$any" -name '*.h' | wc -l | tr -d ' ') headers)"
     for arch in x86_64 aarch64; do
