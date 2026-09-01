@@ -59,7 +59,7 @@ module;
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 
-module bake.toolchain.llvm;
+export module bake.toolchain.cc1as;
 
 import std;
 
@@ -67,6 +67,11 @@ using namespace clang;
 using namespace clang::options;
 using namespace llvm;
 using namespace llvm::opt;
+
+// Exported entry point; the stock cc1as_main definition below is kept
+// byte-identical to upstream Clang's cc1as_main.cpp.
+export int cc1as_main(ArrayRef<const char *> Argv, const char *Argv0,
+                      void *MainAddr);
 
 namespace {
 

@@ -59,14 +59,15 @@ module;
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 
-#include <lld/Common/Driver.h>
-
-module bake.toolchain.llvm;
+export module bake.toolchain.driver;
 
 import std;
 import bake.util;
 import bake.toolchain.target;
 import bake.toolchain.runtime;
+import bake.toolchain.lld;
+import bake.toolchain.cc1;
+import bake.toolchain.cc1as;
 
 using namespace clang;
 using namespace clang::driver;
@@ -92,13 +93,6 @@ std::string GetExecutablePath(const char *Argv0, bool CanonicalPrefixes) {
 static const char *GetStableCStr(llvm::StringSet<> &SavedStrings, StringRef S) {
   return SavedStrings.insert(S).first->getKeyData();
 }
-
-extern int cc1_main(ArrayRef<const char *> Argv, const char *Argv0,
-                    void *MainAddr);
-
-// cc1as_main is compiled from Clang's cc1as_main.cpp (as bake_clang_cc1as_main.cpp).
-int cc1as_main(ArrayRef<const char *> Argv, const char *Argv0,
-               void *MainAddr);
 
 static void insertTargetAndModeArgs(const ParsedClangName &NameParts,
                                     SmallVectorImpl<const char *> &ArgVector,
@@ -1316,6 +1310,6 @@ static int clang_main(int Argc, const char **Argv,
   return Res;
 }
 
-int bake_clang_main(int argc, const char **argv) {
+export int bake_clang_main(int argc, const char **argv) {
   return clang_main(argc, argv, {argv[0], nullptr, false});
 }

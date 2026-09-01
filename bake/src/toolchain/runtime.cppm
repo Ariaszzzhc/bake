@@ -11,7 +11,7 @@ export module bake.toolchain.runtime;
 import std;
 import bake.util;
 import bake.toolchain.target;
-import bake.toolchain.llvm;
+import bake.toolchain.lld;
 
 // ============================================================
 // bake.toolchain.runtime — vendored runtime provisioning

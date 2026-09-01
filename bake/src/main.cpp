@@ -4,7 +4,8 @@
 import std;
 import bake.util;
 import bake.toolchain.target;
-import bake.toolchain.llvm;
+import bake.toolchain.lld;
+import bake.toolchain.driver;
 import bake.toolchain.runtime;
 import bake.buildsystem.project;
 import bake.buildsystem.moid;

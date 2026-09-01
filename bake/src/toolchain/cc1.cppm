@@ -3,9 +3,9 @@
 // bake — in-process cc1 entry point for the bake compiler driver.
 //
 // This is stock Clang `cc1_main.cpp`, kept as-is. The bake clang driver
-// (bake_clang_driver.cpp) dispatches -cc1 invocations to cc1_main() via the
-// Driver::CC1Main callback, keeping compilation fully in-process (no
-// subprocess).
+// (driver.cppm, bake.toolchain.driver) dispatches -cc1 invocations to
+// cc1_main() via the Driver::CC1Main callback, keeping compilation fully
+// in-process (no subprocess).
 //
 // Originally part of the LLVM Project, under the Apache License v2.0 with
 // LLVM Exceptions.
@@ -65,12 +65,17 @@ module;
 #include <sys/resource.h>
 #endif
 
-module bake.toolchain.llvm;
+export module bake.toolchain.cc1;
 
 import std;
 
 using namespace clang;
 using namespace llvm::opt;
+
+// Exported entry point; the stock cc1_main definition below is kept
+// byte-identical to upstream Clang's cc1_main.cpp.
+export int cc1_main(ArrayRef<const char *> Argv, const char *Argv0,
+                    void *MainAddr);
 
 //===----------------------------------------------------------------------===//
 // Main driver

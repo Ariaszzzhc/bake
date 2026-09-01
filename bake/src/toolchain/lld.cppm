@@ -1,8 +1,9 @@
 /*
- * bake_llvm.cpp — LLVM/LLD/AR bridge: module implementation unit.
+ * lld.cppm — bake.toolchain.lld: in-process LLD link + archive write.
  *
- * LLVM headers go in the global module fragment (before `module bake.toolchain.llvm;`)
- * — same pattern every bake module uses for non-modular headers.
+ * LLVM/LLD headers go in the global module fragment. LLD_HAS_DRIVER
+ * entries must stay there so they get global mangling (matching the
+ * LLD library definitions).
  */
 
 module;
@@ -20,11 +21,21 @@ LLD_HAS_DRIVER(macho)
 LLD_HAS_DRIVER(mingw)
 LLD_HAS_DRIVER(wasm)
 
-module bake.toolchain.llvm;
+export module bake.toolchain.lld;
 
 import std;
 
-int bake_lld_link(LldFlavor flavor, int argc, const char **argv) {
+// LLD linker flavor.
+export enum class LldFlavor : int {
+    ELF   = 0,
+    COFF  = 1,
+    MACHO = 2,
+    WASM  = 3,
+    MinGW = 4,  // GNU-style args → translated to COFF internally
+};
+
+// In-process LLD link. argv[0] should be the linker name.
+export int bake_lld_link(LldFlavor flavor, int argc, const char **argv) {
     std::vector<const char *> args(argv, argv + argc);
 
     bool ok = false;
@@ -55,9 +66,11 @@ int bake_lld_link(LldFlavor flavor, int argc, const char **argv) {
     return ok ? 0 : 1;
 }
 
-int bake_ar_write(const char *archive_name,
-                  const char **members, std::size_t member_count,
-                  int archive_kind) {
+// In-process archive write (replaces `ar rcs`).
+// archive_kind: 0=GNU, 1=BSD, 2=DARWIN, 3=COFF
+export int bake_ar_write(const char *archive_name,
+                         const char **members, std::size_t member_count,
+                         int archive_kind) {
     llvm::object::Archive::Kind kind;
     switch (archive_kind) {
     case 0: kind = llvm::object::Archive::K_GNU;    break;

@@ -45,21 +45,20 @@ int main() {
     auto llvm_libs  = glob_static_libs(llvm_lib, "libLLVM");
 
     b.sources({
-        "src/bake.util.cppm",
+        "src/util.cppm",
         "src/buildsystem/project.cppm",
         "src/buildsystem/moid.cppm",
         "src/buildsystem/graph.cppm",
-        "src/toolchain/llvm.cppm",
+        "src/toolchain/lld.cppm",
+        "src/toolchain/cc1.cppm",
+        "src/toolchain/cc1as.cppm",
         "src/toolchain/target.cppm",
         "src/buildsystem/cmdgen.cppm",
         "src/toolchain/runtime.cppm",
+        "src/toolchain/driver.cppm",
         "src/buildsystem/engine.cppm",
         "src/buildsystem/package.cppm",
     });
-    b.sources("src/toolchain/bake_llvm.cpp");
-    b.sources("src/toolchain/bake_clang_cc1_main.cpp");
-    b.sources("src/toolchain/bake_clang_cc1as_main.cpp");
-    b.sources("src/toolchain/bake_clang_driver.cpp");
     b.sources("src/main.cpp");
     b.include_dirs({
         llvm_include,
