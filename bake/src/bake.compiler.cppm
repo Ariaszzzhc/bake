@@ -39,8 +39,18 @@ export struct TargetSpec {
     int glibc_major_ = 0;
     int glibc_minor_ = 0;
 
+    // macOS deployment minimum ("aarch64-macos.12" / "aarch64-macos.12.0"
+    // → {12,0}). The deployment target is a property of the target query,
+    // not a free-form flag: an explicit -mmacosx-version-min on the
+    // command line is forwarded to clang but overridden by the injected
+    // value. Defaults to default_macos_min.
+    int macos_min_major_ = 0;
+    int macos_min_minor_ = 0;
+
     static constexpr int default_glibc_major = 2;
     static constexpr int default_glibc_minor = 28;
+    static constexpr int default_macos_min_major = 14;
+    static constexpr int default_macos_min_minor = 0;
 
     bool is_native() const { return native_; }
 
@@ -80,18 +90,36 @@ export struct TargetSpec {
     }
 
     // Returns the triple string for the -target flag, or "" for native.
-    // Never carries the glibc version suffix — LLVM triples can't encode it.
+    // Never carries the glibc/darwin version suffix — LLVM triples can't
+    // reliably encode it.
     std::string triple() const { return native_ ? "" : triple_; }
 
-    // Triple WITH the glibc version suffix ("x86_64-linux-gnu.2.36"), for
-    // argv consumed by bake's own driver shim: its preprocessing strips
-    // the suffix back off before LLVM parses the triple and records the
-    // version for the header pinning and link interception. Only meaningful
-    // when a version was explicitly requested.
+    // Triple WITH the target version suffix ("x86_64-linux-gnu.2.36",
+    // "aarch64-macos.12"), for argv consumed by bake's own driver shim:
+    // its preprocessing strips the suffix back off before LLVM parses the
+    // triple and records the version for header pinning / deployment-min
+    // injection / link interception. Only meaningful when a version was
+    // explicitly requested.
     std::string triple_with_version() const {
-        if (native_ || !glibc_major_ && !glibc_minor_) return triple_;
-        return triple_ + "." + std::to_string(glibc_major()) + "." +
-               std::to_string(glibc_minor());
+        if (native_) return triple_;
+        if (glibc_major_ || glibc_minor_)
+            return triple_ + "." + std::to_string(glibc_major()) + "." +
+                   std::to_string(glibc_minor());
+        if (macos_min_major_)
+            return triple_ + "." + std::to_string(macos_min_major_) +
+                   (macos_min_minor_
+                        ? "." + std::to_string(macos_min_minor_) : "");
+        return triple_;
+    }
+
+    // Deployment minimum for darwin targets, as "MAJOR.MINOR". Explicit
+    // -target suffix wins; otherwise the built-in default.
+    std::string macos_deployment_min() const {
+        if (macos_min_major_)
+            return std::to_string(macos_min_major_) + "." +
+                   std::to_string(macos_min_minor_);
+        return std::to_string(default_macos_min_major) + "." +
+               std::to_string(default_macos_min_minor);
     }
 
     int glibc_major() const {
@@ -103,14 +131,43 @@ export struct TargetSpec {
     }
 };
 
+// Host macOS deployment minimum, from SystemVersion.plist
+// ("ProductVersion" → "26.5"). The single detection point for native
+// darwin deployment targets — the target spec carries it so that compile
+// injection, link platform_version and cache keys all read one value.
+// Falls back to the built-in default when detection fails.
+static void detect_host_macos_min(TargetSpec& t) {
+#if defined(__APPLE__)
+    if (auto content = read_file(
+            Path("/System/Library/CoreServices/SystemVersion.plist"))) {
+        auto key_pos = content->find("ProductVersion");
+        if (key_pos == std::string::npos) return;
+        auto open = content->find("<string>", key_pos);
+        if (open == std::string::npos) return;
+        auto start = open + 8;
+        auto end = content->find("</string>", start);
+        if (end == std::string::npos) return;
+        std::string ver = content->substr(start, end - start);
+        int major = 0, minor = 0;
+        if (std::sscanf(ver.c_str(), "%d.%d", &major, &minor) == 2 &&
+            major > 0) {
+            t.macos_min_major_ = major;
+            t.macos_min_minor_ = minor;
+        }
+    }
+#endif
+}
+
 // Detect host platform. This is the ONLY place with #ifdef for host detection.
 export TargetSpec detect_host_target() {
     TargetSpec t;
     t.native_ = true;
 #if defined(__APPLE__) && defined(__aarch64__)
     t.triple_ = "aarch64-apple-darwin";
+    detect_host_macos_min(t);
 #elif defined(__APPLE__) && defined(__x86_64__)
     t.triple_ = "x86_64-apple-darwin";
+    detect_host_macos_min(t);
 #elif defined(__linux__) && defined(__GLIBC__) && defined(__aarch64__)
     // Linked against the host's glibc (stage-0 build on a glibc distro):
     // native gnu — may use the system libc directly (SystemGnu layout).
@@ -198,6 +255,52 @@ export TargetSpec parse_target(std::string_view spec) {
             t.glibc_major_ = major;
             t.glibc_minor_ = minor;
         }
+    }
+
+    // darwin deployment-version suffix. Two shapes:
+    //   query style: "macos.12" / "darwin.14.1"   (bake target queries)
+    //   LLVM style:  "darwin24" / "macosx14.0.0"  (clang -target form)
+    // → triple keeps "macos"/"darwin", {major,minor} stored on the spec.
+    // One to three numeric components; the patch level is ignored.
+    for (auto& seg : segments) {
+        std::string os;
+        std::string_view suffix;
+        if (seg.starts_with("macos.")) {
+            os = "macos";
+            suffix = std::string_view(seg.data() + 6, seg.size() - 6);
+        } else if (seg.starts_with("darwin.")) {
+            os = "darwin";
+            suffix = std::string_view(seg.data() + 7, seg.size() - 7);
+        } else if (seg.starts_with("macosx") && seg.size() > 6 &&
+                   seg[6] >= '0' && seg[6] <= '9') {
+            os = "macos";
+            suffix = std::string_view(seg.data() + 6, seg.size() - 6);
+        } else if (seg.starts_with("darwin") && seg.size() > 6 &&
+                   seg[6] >= '0' && seg[6] <= '9') {
+            os = "darwin";
+            suffix = std::string_view(seg.data() + 6, seg.size() - 6);
+        } else {
+            continue;
+        }
+        int comps[3] = {0, 0, 0};
+        int ci = 0;
+        bool ok = !suffix.empty();
+        for (size_t k = 0; ok && k < suffix.size(); ++k) {
+            char c = suffix[k];
+            if (c == '.') {
+                if (++ci >= 3) ok = false;
+            } else if (c >= '0' && c <= '9') {
+                comps[ci] = comps[ci] * 10 + (c - '0');
+            } else {
+                ok = false;
+            }
+        }
+        if (ok && comps[0] > 0) {
+            seg = os;
+            t.macos_min_major_ = comps[0];
+            t.macos_min_minor_ = comps[1];
+        }
+        break;
     }
 
     // Bare "arch-linux" defaults to gnu (the default Linux ELF ABI).
@@ -593,6 +696,172 @@ static Path generate_standard_module_source(
     return result;
 }
 
+// ===== Manifest-based toolchain cache (per-triple, content-addressed) =====
+//
+// Layout under the toolchain cache root:
+//
+//   <triple-with-version>/
+//     h/<config-hash>.txt   manifest: final digest + per-input-file
+//                           size/mtime/digest lines
+//     o/<final-hash>/       products (one directory per distinct
+//                           configuration+input combination)
+//
+// Two-stage hashing: the CONFIG hash (label + config lines, e.g. compiler
+// identity, target versions, flag synopsis) names the manifest; the FINAL
+// digest (config hash + every input file's content digest) names the
+// product directory. Any change to configuration or input file contents
+// produces a new final digest and a plain miss — stale products never
+// collide, and no bump markers are needed (vendored-header edits are
+// caught by the file digests).
+
+export struct ToolchainCacheEntry {
+    Path output_dir;   // o/<final>; created on miss, valid when hit
+    bool hit = false;  // manifest matches and output dir exists
+
+    Path manifest_path;                    // h/<config-hash>.txt
+    std::vector<std::string> lines;        // manifest content for finish()
+};
+
+namespace {
+
+// Expand directories recursively into their regular files.
+void collect_input_files(const Path& p, std::vector<Path>& out) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    if (fs::is_regular_file(p.fs(), ec)) {
+        out.push_back(p);
+        return;
+    }
+    if (!fs::is_directory(p.fs(), ec)) return;
+    for (auto& e : fs::recursive_directory_iterator(p.fs(), ec))
+        if (e.is_regular_file(ec))
+            out.emplace_back(e.path());
+}
+
+struct FileStamp {
+    std::uintmax_t size = 0;
+    int64_t mtime = 0;
+    bool valid = false;
+};
+
+FileStamp stat_stamp(const Path& p) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    FileStamp s;
+    if (auto st = fs::status(p.fs(), ec); fs::exists(st)) {
+        s.size = fs::file_size(p.fs(), ec);
+        s.mtime = int64_t(fs::last_write_time(p.fs(), ec).time_since_epoch()
+                              .count());
+        s.valid = !ec;
+    }
+    return s;
+}
+
+} // namespace
+
+export ToolchainCacheEntry toolchain_cache_lookup(
+        const Toolchain& tc, std::string_view label,
+        const std::vector<std::string>& config,
+        const std::vector<Path>& inputs) {
+    ToolchainCacheEntry entry;
+
+    // Directories: <triple>/h, <triple>/o.
+    Path triple_dir =
+        get_toolchain_cache_root() / tc.target.triple_with_version();
+    Path h_dir = triple_dir / "h";
+    Path o_dir = triple_dir / "o";
+
+    std::string config_data(label);
+    for (auto& line : config)
+        config_data += "\n" + line;
+    std::string config_hash = SHA256::hex(config_data).substr(0, 16);
+
+    entry.manifest_path = h_dir / (config_hash + ".txt");
+
+    // Expand inputs (directories → recursive file lists) in stable order.
+    std::vector<Path> files;
+    for (auto& p : inputs) collect_input_files(p, files);
+    std::sort(files.begin(), files.end(),
+              [](const Path& a, const Path& b) {
+                  return a.string() < b.string();
+              });
+
+    // Collect stamps + digests. When a manifest exists, files whose
+    // size+mtime match the recorded line are trusted (digest reused,
+    // no re-hash) — same trust model as mtime-based manifests.
+    std::vector<std::string> new_lines;
+    std::string digests;
+    bool manifest_exists = entry.manifest_path.is_regular_file();
+    std::optional<std::string> existing =
+        manifest_exists ? read_file(entry.manifest_path) : std::nullopt;
+    std::istringstream in(existing ? *existing : std::string());
+    std::string first;
+    bool ok = false;
+    if (existing) {
+        std::getline(in, first);
+        ok = !first.empty();
+    }
+
+    for (const auto& f : files) {
+        FileStamp st = stat_stamp(f);
+        std::string size_mtime = st.valid
+            ? std::to_string(st.size) + " " + std::to_string(st.mtime)
+            : "- -";
+
+        std::string line;
+        std::string digest;
+        if (ok) {
+            if (!std::getline(in, line)) {
+                ok = false;                       // manifest shorter
+            } else if (line.compare(0, size_mtime.size(), size_mtime) == 0) {
+                // size+mtime match → trust the recorded digest.
+                auto d1 = line.find(' ', size_mtime.size() + 1);
+                auto d2 = line.find(' ', d1 + 1);
+                if (d1 != std::string::npos && d2 != std::string::npos)
+                    digest = line.substr(d1 + 1, d2 - d1 - 1);
+                else
+                    ok = false;
+            }
+        }
+        if (digest.empty()) {
+            ok = false;                           // stale or missing record
+            digest = st.valid ? SHA256::hex_file(f) : std::string("-");
+        }
+        digests += digest;
+        new_lines.push_back(size_mtime + " " + digest + " " + f.string());
+    }
+    if (ok && in.peek() != std::char_traits<char>::eof())
+        ok = false;  // manifest longer than inputs
+
+    if (ok) {
+        Path candidate = o_dir / first;
+        if (candidate.is_directory()) {
+            entry.output_dir = candidate;
+            entry.hit = true;
+            return entry;
+        }
+    }
+
+    // Miss: final digest names the product directory; stage it.
+    std::string final_hash =
+        SHA256::hex(config_hash + "\n" + digests).substr(0, 16);
+
+    entry.lines.push_back(final_hash);
+    for (auto& l : new_lines) entry.lines.push_back(l);
+    entry.output_dir = o_dir / final_hash;
+    entry.output_dir.mkdir_recursive();
+    h_dir.mkdir_recursive();
+    return entry;
+}
+
+export void toolchain_cache_finish(ToolchainCacheEntry& entry) {
+    if (entry.hit || entry.manifest_path.string().empty()) return;
+    std::string content;
+    for (auto& l : entry.lines)
+        content += l + "\n";
+    write_file(entry.manifest_path, content);
+}
+
 // Capture compiler identity + version + target triple as a stable string.
 // Cached to a file so we avoid spawning the compiler on every invocation.
 static std::string compiler_identity_block(const Toolchain& tc) {
@@ -601,12 +870,16 @@ static std::string compiler_identity_block(const Toolchain& tc) {
     // Include target triple in cache identity so cross-compile keys differ.
     std::string target_suffix = tc.target.is_native() ? "" : "\n" + tc.target.triple();
 
-    // Per-target cache file to avoid native/cross thrashing.
+    // Per-target cache file to avoid native/cross thrashing. Lives under
+    // .identity/ (not the triple tree): identity content is identical for
+    // every version suffix of a triple, so it must not fan out per-version.
     std::string id_name = ".compiler-identity";
     if (!tc.target.is_native())
         id_name += "-" + tc.target.triple();
 
-    Path identity_cache = get_toolchain_cache_root() / id_name;
+    Path identity_dir = get_toolchain_cache_root() / ".identity";
+    identity_dir.mkdir_recursive();
+    Path identity_cache = identity_dir / id_name;
     Path compiler_bin(tc.exe_path);
     if (identity_cache.is_regular_file() && compiler_bin.is_regular_file()) {
         if (fs::last_write_time(compiler_bin.fs()) <=
@@ -641,7 +914,21 @@ struct ToolchainCacheInfo {
     Path dir;
 };
 
-static ToolchainCacheInfo std_module_cache_info(const Toolchain& tc) {
+// Target-version lines that shape the compiled std module surface: the
+// glibc header-gate version for gnu targets, the deployment minimum for
+// darwin. They are config inputs (not file inputs) because they arrive
+// via -D injection / the target triple.
+static std::vector<std::string> target_surface_lines(const Toolchain& tc) {
+    std::vector<std::string> lines;
+    if (tc.target.is_linux_gnu())
+        lines.push_back("glibc:" + std::to_string(tc.target.glibc_major()) +
+                        "." + std::to_string(tc.target.glibc_minor()));
+    if (tc.target.is_darwin())
+        lines.push_back("macos-min:" + tc.target.macos_deployment_min());
+    return lines;
+}
+
+static ToolchainCacheEntry std_module_cache_entry(const Toolchain& tc) {
     Path gen_dir = get_toolchain_cache_root() / ".gen";
     gen_dir.mkdir_recursive();
 
@@ -657,20 +944,29 @@ static ToolchainCacheInfo std_module_cache_info(const Toolchain& tc) {
     if (!compat_cppm.string().empty())
         compat_hash = SHA256::hex_file(compat_cppm);
 
-    Path rev_file = find_lib_dir() / "libcxx" / "LLVM_REVISION";
     std::string revision;
-    if (auto rev_content = read_file(rev_file))
+    if (auto rev_content = read_file(find_lib_dir() / "libcxx" / "LLVM_REVISION"))
         revision = *rev_content;
 
-    std::string key_data = "std-modules-v3\n" +
-        compiler_identity_block(tc) +
-        std_hash + "\n" +
-        compat_hash + "\n" +
-        revision;
+    std::vector<std::string> config;
+    config.push_back("std-modules-v4");
+    config.push_back(compiler_identity_block(tc));
+    config.push_back(std_hash);
+    config.push_back(compat_hash);
+    config.push_back(revision);
+    for (auto& l : target_surface_lines(tc)) config.push_back(l);
 
-    std::string key = SHA256::hex(key_data).substr(0, 16);
-    Path dir = get_toolchain_cache_root() / key;
-    return {key, dir};
+    // The precompiled module compiles against the libc++ headers and the
+    // target's config-site directory — both tracked by content digest.
+    std::vector<Path> inputs;
+    Path lib = find_lib_dir();
+    inputs.push_back(lib / "libcxx" / "include");
+    std::string config_subdir = tc.target.is_windows_gnu()
+        ? "mingw-config"
+        : tc.target.is_linux_gnu() ? "gnu-config" : "cross-config";
+    inputs.push_back(lib / "libcxx" / config_subdir);
+
+    return toolchain_cache_lookup(tc, "std-modules", config, inputs);
 }
 
 static bool atomic_compile_pcm(
@@ -715,12 +1011,10 @@ export ModuleFileMap ensure_std_modules(
         const Toolchain& tc, const Path& /*project_out*/) {
     ModuleFileMap result;
 
-    auto info = std_module_cache_info(tc);
-    if (info.key.empty()) return result;
+    auto entry = std_module_cache_entry(tc);
 
-    Path std_dir = info.dir / "std";
-    Path std_pcm = std_dir / "std.pcm";
-    Path compat_pcm = std_dir / "std.compat.pcm";
+    Path std_pcm = entry.output_dir / "std.pcm";
+    Path compat_pcm = entry.output_dir / "std.compat.pcm";
 
     Path gen_dir = get_toolchain_cache_root() / ".gen";
     Path std_src = gen_dir / "std.cppm";
@@ -801,6 +1095,7 @@ export ModuleFileMap ensure_std_modules(
         }
     }
 
+    toolchain_cache_finish(entry);
     result["std"] = std_pcm;
     result["std.compat"] = compat_pcm;
     return result;
@@ -808,18 +1103,21 @@ export ModuleFileMap ensure_std_modules(
 
 export ToolchainCacheInfo bake_build_cache_info(
         const Toolchain& tc, const Path& wrapper_source) {
-    auto base = std_module_cache_info(tc);
+    auto base = std_module_cache_entry(tc);
 
-    std::string wrapper_hash;
-    if (!wrapper_source.string().empty() && wrapper_source.is_regular_file())
-        wrapper_hash = SHA256::hex_file(wrapper_source);
+    std::vector<std::string> config;
+    config.push_back("bake.build-v2");
+    // The module compiles against the std module's exact surface: chaining
+    // its final digest re-keys bake.build whenever std's inputs change.
+    config.push_back("std-final:" + base.output_dir.filename().string());
+    if (wrapper_source.string().empty() || !wrapper_source.is_regular_file())
+        return {"", Path()};
 
-    std::string key_data = "bake.build-v1\n" +
-        base.key + "\n" +
-        wrapper_hash;
-    std::string key = SHA256::hex(key_data).substr(0, 16);
-    Path dir = get_toolchain_cache_root() / key;
-    return {key, dir};
+    std::vector<Path> inputs{wrapper_source};
+    auto entry = toolchain_cache_lookup(tc, "bake.build", config, inputs);
+    // The pcm build in cli is existence-checked there; the manifest only
+    // provides the isolated directory, so no finish() is needed.
+    return {entry.output_dir.filename().string(), entry.output_dir};
 }
 
 export std::string library_name(std::string_view base_name, MoidType type,
@@ -929,6 +1227,7 @@ export struct RuntimeArtifacts {
     std::vector<std::string> link_dirs;        // -L paths (SDK or vendored)
     std::vector<std::string> framework_dirs;   // -F paths
     std::string macos_deployment_target;       // -mmacosx-version-min value
+    std::string macos_sdk_version;             // SDK version (platform_version 4th arg)
 
     // windows (mingw) link helpers
     std::vector<std::string> always_link_libs; // system libs to inject
@@ -1044,31 +1343,50 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
     Path lib = find_lib_dir();
     if (lib.string().empty()) return result;
 
-    // Cache per target triple (same result regardless of host).
-    std::string key = tc.target.is_native() ? "host" : tc.target.triple();
-    Path cache_dir = get_cache_dir().parent() / "cxx-runtime" / key;
+    // Manifest-isolated product directory: keyed by compiler identity +
+    // target surface lines + the content of every runtime source/header
+    // input. Version changes (glibc gate version, darwin min) and vendored
+    // header edits automatically produce a fresh directory.
+    std::vector<std::string> config;
+    config.push_back("cxx-runtime-v2");
+    config.push_back(compiler_identity_block(tc));
+    for (auto& l : target_surface_lines(tc)) config.push_back(l);
 
-    result.libcxx_a    = cache_dir / "libc++.a";
-    result.libcxxabi_a = cache_dir / "libc++abi.a";
+    std::vector<Path> inputs;
+    for (const char* d : {"libcxx/src", "libcxxabi/src", "libunwind/src",
+                          "libcxx/include", "libcxxabi/include",
+                          "libunwind/include", "libcxx/libc",
+                          "libcxx/cross-config", "libcxx/gnu-config",
+                          "libcxx/mingw-config"})
+        inputs.push_back(lib / std::string(d));
+
+    auto entry = toolchain_cache_lookup(tc, "cxx-runtime", config, inputs);
+
+    result.libcxx_a    = entry.output_dir / "libc++.a";
+    result.libcxxabi_a = entry.output_dir / "libc++abi.a";
 
     bool needs_libunwind = tc.target.is_linux_musl() ||
                            tc.target.is_linux_gnu() ||
                            tc.target.is_windows();
     if (needs_libunwind)
-        result.libunwind_a = cache_dir / "libunwind.a";
+        result.libunwind_a = entry.output_dir / "libunwind.a";
 
-    Path sentinel = cache_dir / ".done";
-    auto cached = [&]() {
-        if (!sentinel.is_regular_file()) return false;
+    auto products_ok = [&]() {
         if (!result.libcxx_a.is_regular_file()) return false;
         if (!result.libcxxabi_a.is_regular_file()) return false;
-        if (needs_libunwind && !result.libunwind_a.is_regular_file()) return false;
+        if (needs_libunwind && !result.libunwind_a.is_regular_file())
+            return false;
         return true;
     };
-    if (cached()) return result;
+    if (entry.hit && products_ok()) return result;
+    if (products_ok()) {  // interrupted after build, before manifest write
+        toolchain_cache_finish(entry);
+        return result;
+    }
 
-    cache_dir.mkdir_recursive();
-    std::println("   Compiling C++ runtime for {} (cached)", key);
+    Path cache_dir = entry.output_dir;
+    std::println("   Compiling C++ runtime for {} (cached)",
+                 tc.target.triple_with_version());
 
     auto libcxxabi_inc = lib.string() + "/libcxxabi/include";
     auto libcxx_src    = lib.string() + "/libcxx/src";
@@ -1251,7 +1569,7 @@ export CxxRuntime ensure_cxx_runtime(const Toolchain& tc) {
     }
 
     std::println("   Compiled {} sources", total);
-    write_file(sentinel, "");
+    toolchain_cache_finish(entry);
     return result;
 }
 
@@ -1311,21 +1629,30 @@ export MuslObjects ensure_musl_objects(const Toolchain& tc) {
     Path musl_src = lib / "libc" / "musl";
     std::string arch = tc.target.arch();
 
-    Path cache_root = get_cache_dir().parent() / "musl-objects";
-    Path cache_dir = cache_root / tc.target.triple();
+    std::vector<std::string> config;
+    config.push_back("musl-v2");
+    config.push_back(compiler_identity_block(tc));
 
-    Path sentinel = cache_dir / ".done";
-    if (sentinel.is_regular_file()) {
-        result.crt1_o  = cache_dir / "crt1.o";
-        result.rcrt1_o = cache_dir / "rcrt1.o";
-        result.Scrt1_o = cache_dir / "Scrt1.o";
-        result.libc_a  = cache_dir / "libc.a";
-        if (result.crt1_o.is_regular_file() && result.libc_a.is_regular_file())
-            return result;
+    auto entry = toolchain_cache_lookup(tc, "musl", config, {musl_src});
+    Path cache_dir = entry.output_dir;
+
+    result.crt1_o  = cache_dir / "crt1.o";
+    result.rcrt1_o = cache_dir / "rcrt1.o";
+    result.Scrt1_o = cache_dir / "Scrt1.o";
+    result.libc_a  = cache_dir / "libc.a";
+
+    auto products_ok = [&]() {
+        return result.crt1_o.is_regular_file() &&
+               result.libc_a.is_regular_file();
+    };
+    if (entry.hit && products_ok()) return result;
+    if (products_ok()) {
+        toolchain_cache_finish(entry);
+        return result;
     }
 
-    cache_dir.mkdir_recursive();
-    std::println("   Compiling musl for {} (cached)", tc.target.triple());
+    std::println("   Compiling musl for {} (cached)",
+                 tc.target.triple_with_version());
 
     write_file(cache_dir / "version.h",
                "#define VERSION \"" + std::string("1.2.5") + "\"\n");
@@ -1448,7 +1775,7 @@ export MuslObjects ensure_musl_objects(const Toolchain& tc) {
     }
 
     std::println("   Compiled {} musl sources", compiled);
-    write_file(sentinel, "");
+    toolchain_cache_finish(entry);
 
     return result;
 }
@@ -1470,17 +1797,25 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     if (lib.string().empty()) return Path();
 
     Path builtins_dir = lib / "compiler-rt" / "lib" / "builtins";
-    Path cache_dir = get_cache_dir().parent() / "compiler-rt" / tc.target.triple();
-    Path result_a = cache_dir / "libcompiler_rt.a";
-    Path sentinel = cache_dir / ".compiler-rt-done";
 
-    if (sentinel.is_regular_file() && result_a.is_regular_file())
+    std::vector<std::string> config;
+    config.push_back("compiler-rt-v2");
+    config.push_back(compiler_identity_block(tc));
+
+    auto entry = toolchain_cache_lookup(tc, "compiler-rt", config,
+                                        {builtins_dir});
+    Path cache_dir = entry.output_dir;
+    Path result_a = cache_dir / "libcompiler_rt.a";
+
+    if (entry.hit && result_a.is_regular_file())
         return result_a;
+    if (result_a.is_regular_file()) {
+        toolchain_cache_finish(entry);
+        return result_a;
+    }
 
     bool is_darwin = tc.target.is_darwin();
     std::string arch = tc.target.arch();
-
-    cache_dir.mkdir_recursive();
 
     auto make_flags = [&]() {
         std::vector<std::string> flags;
@@ -1548,7 +1883,7 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
         write_archive(result_a, obj_files, is_darwin, tc.target.is_windows());
     }
 
-    write_file(sentinel, "");
+    toolchain_cache_finish(entry);
     return result_a;
 }
 
@@ -1565,8 +1900,7 @@ export struct MingwObjects {
     Path import_lib_dir;  // generated import libraries (.lib from .def)
 };
 
-// Source file lists — curated from MinGW-w64, matching Zig's selection.
-// See https://github.com/ziglang/zig/blob/master/src/libs/mingw.zig
+// Source file lists — curated from MinGW-w64 (minimal CRT set).
 
 static const char* mingw32_crt_src[] = {
     "crt/crtexewin.c", "crt/dll_argv.c", "crt/gccmain.c",
@@ -1819,6 +2153,17 @@ static const char* mingw_always_link_libs[] = {
     "advapi32", "kernel32", "ntdll", "shell32", "user32",
 };
 
+// Shared lookup for the mingw product directory (CRT + libmingw32.a +
+// lazily generated import libraries). Both ensure_mingw_objects and
+// ensure_mingw_import_lib resolve to the same directory.
+static ToolchainCacheEntry mingw_cache_entry(const Toolchain& tc,
+                                             const Path& mingw_src) {
+    std::vector<std::string> config;
+    config.push_back("mingw-v2");
+    config.push_back(compiler_identity_block(tc));
+    return toolchain_cache_lookup(tc, "mingw", config, {mingw_src});
+}
+
 export MingwObjects ensure_mingw_objects(const Toolchain& tc) {
     MingwObjects result;
     if (!tc.target.is_windows_gnu()) return result;
@@ -1835,23 +2180,27 @@ export MingwObjects ensure_mingw_objects(const Toolchain& tc) {
         return result;
     }
 
-    Path cache_dir = get_cache_dir().parent() / "mingw-objects" / tc.target.triple();
-    Path sentinel = cache_dir / ".done";
+    auto entry = mingw_cache_entry(tc, mingw_src);
+    Path cache_dir = entry.output_dir;
 
     result.import_lib_dir = cache_dir / "implib";
+    result.crt2_o       = cache_dir / "crt2.o";
+    result.dllcrt2_o    = cache_dir / "dllcrt2.o";
+    result.libmingw32_a = cache_dir / "libmingw32.a";
 
-    if (sentinel.is_regular_file()) {
-        result.crt2_o       = cache_dir / "crt2.o";
-        result.dllcrt2_o    = cache_dir / "dllcrt2.o";
-        result.libmingw32_a = cache_dir / "libmingw32.a";
-        if (result.crt2_o.is_regular_file() &&
-            result.libmingw32_a.is_regular_file())
-            return result;
+    auto products_ok = [&]() {
+        return result.crt2_o.is_regular_file() &&
+               result.libmingw32_a.is_regular_file();
+    };
+    if (entry.hit && products_ok()) return result;
+    if (products_ok()) {
+        toolchain_cache_finish(entry);
+        return result;
     }
 
-    cache_dir.mkdir_recursive();
     result.import_lib_dir.mkdir_recursive();
-    std::println("   Compiling mingw-w64 for {} (cached)", tc.target.triple());
+    std::println("   Compiling mingw-w64 for {} (cached)",
+                 tc.target.triple_with_version());
 
     std::string arch = tc.target.arch();
     std::string machine = (arch == "x86_64") ? "X64" : "ARM64";
@@ -2050,7 +2399,7 @@ export MingwObjects ensure_mingw_objects(const Toolchain& tc) {
     }
 
     std::println("   Compiled {} mingw-w64 artifacts", total);
-    write_file(sentinel, "");
+    toolchain_cache_finish(entry);
     return result;
 }
 
@@ -2072,9 +2421,7 @@ export Path ensure_mingw_import_lib(const Toolchain& tc,
     if (lib_dir.string().empty()) return Path();
 
     Path mingw_src = lib_dir / "libc" / "mingw";
-    Path cache_dir = get_cache_dir().parent() / "mingw-objects" /
-                     tc.target.triple();
-    Path import_dir = cache_dir / "implib";
+    Path import_dir = mingw_cache_entry(tc, mingw_src).output_dir / "implib";
 
     Path final_lib = import_dir / (lib_name + ".lib");
     if (final_lib.is_regular_file()) return final_lib;
@@ -2122,7 +2469,7 @@ export Path ensure_mingw_import_lib(const Toolchain& tc,
             std::string fname = std::filesystem::path(src).filename().string();
             std::string obj_name = "uuid__" + fname;
             obj_name.replace(obj_name.size() - 2, 2, ".o");
-            Path obj = cache_dir / obj_name;
+            Path obj = import_dir / obj_name;
             if (!obj.is_regular_file()) {
                 std::vector<std::string> f = flags;
                 f.push_back(src);
@@ -2297,15 +2644,36 @@ static std::vector<std::string> glibc_internal_include_chain(
     return dirs;
 }
 
-static Path glibc_objects_cache_dir(const Toolchain& tc) {
-    std::string ver = std::to_string(tc.target.glibc_major()) + "." +
-                      std::to_string(tc.target.glibc_minor());
-    // "+h2": key marker for the vendored-headers switch to the newest
-    // glibc's install-headers (features.h override era) — bumps existing
-    // user caches.
-    return get_cache_dir().parent() / "glibc-objects" /
-           (tc.target.triple() + "-v" + ver + "+h2");
+// glibc crt/libc_nonshared inputs: the vendored source subset EXCLUDING
+// abilists (stub synthesis reads abilists and must not re-key the crt
+// build when it changes).
+static ToolchainCacheEntry glibc_objects_entry(const Toolchain& tc,
+                                               const Path& glibc) {
+    std::vector<std::string> config;
+    config.push_back("glibc-objects-v3");
+    config.push_back(compiler_identity_block(tc));
+    config.push_back("glibc:" + std::to_string(tc.target.glibc_major()) +
+                     "." + std::to_string(tc.target.glibc_minor()));
+
+    std::vector<Path> inputs;
+    for (const char* d : {"csu", "include", "nptl", "stdlib", "io",
+                          "debug", "sysdeps"})
+        inputs.push_back(glibc / d);
+    return toolchain_cache_lookup(tc, "glibc-objects", config, inputs);
 }
+
+// Stub synthesis inputs: abilists + the target version + a generator
+// revision marker.
+static ToolchainCacheEntry glibc_stubs_entry(const Toolchain& tc,
+                                             const Path& glibc) {
+    std::vector<std::string> config;
+    config.push_back("glibc-stubs-v4");
+    config.push_back("glibc:" + std::to_string(tc.target.glibc_major()) +
+                     "." + std::to_string(tc.target.glibc_minor()));
+    return toolchain_cache_lookup(tc, "glibc-stubs", config,
+                                  {glibc / "abilists"});
+}
+
 
 export GlibcObjects ensure_glibc_objects(const Toolchain& tc, LinkMode) {
     GlibcObjects result;
@@ -2335,27 +2703,30 @@ export GlibcObjects ensure_glibc_objects(const Toolchain& tc, LinkMode) {
     std::string arch = tc.target.arch();
     std::string ver = std::to_string(tc.target.glibc_major()) + "." +
                       std::to_string(tc.target.glibc_minor());
-    Path cache_dir = glibc_objects_cache_dir(tc);
-    Path sentinel = cache_dir / ".done";
+    auto entry = glibc_objects_entry(tc, glibc);
+    Path cache_dir = entry.output_dir;
 
     result.crt_entry = cache_dir / "Scrt1.o";
     result.libc_nonshared_a = cache_dir / "libc_nonshared.a";
-    result.stub_dir = cache_dir / "stubs";
+    result.stub_dir = glibc_stubs_entry(tc, glibc).output_dir;
     result.dynamic_linker = (arch == "x86_64")
         ? "/lib64/ld-linux-x86-64.so.2"
         : "/lib/ld-linux-aarch64.so.1";
 
-    if (sentinel.is_regular_file() &&
-        result.crt_entry.is_regular_file() &&
-        result.libc_nonshared_a.is_regular_file())
+    auto products_ok = [&]() {
+        return result.crt_entry.is_regular_file() &&
+               result.libc_nonshared_a.is_regular_file();
+    };
+    if (entry.hit && products_ok()) return result;
+    if (products_ok()) {
+        toolchain_cache_finish(entry);
         return result;
+    }
 
-    cache_dir.mkdir_recursive();
     std::println("   Compiling glibc crt for {} (glibc {}, cached)",
                  tc.target.triple(), ver);
 
-    // ── Flags (ported from upstream build; see csu/Makefile + zig's
-    //    glibc.zig buildCrtFile for the reference selection) ──
+    // ── Flags (ported from the upstream csu/Makefile build) ──
     std::vector<std::string> base;
     base.push_back(tc.exe_path);
     base.push_back("cc");
@@ -2377,24 +2748,10 @@ export GlibcObjects ensure_glibc_objects(const Toolchain& tc, LinkMode) {
 
     for (auto& d : glibc_internal_include_chain(glibc, arch))
         base.push_back("-I" + d);
-    // Public vendored headers complete the chain (gnu/stubs.h etc.).
-    base.push_back("-I" + (lib / "libc" / "include" /
-                           tc.target.triple()).string());
-    base.push_back("-I" + (lib / "libc" / "include" / "generic-glibc").string());
-    std::string arch_os = (arch == "x86_64") ? "x86" : arch;
-    base.push_back("-I" + (lib / "libc" / "include" /
-                           (arch_os + "-linux-any")).string());
-    base.push_back("-I" + (lib / "libc" / "include" / "any-linux-any").string());
-
     auto compile_one = [&](const char* src_rel, const char* obj_name,
                            bool is_asm, bool is_c) -> bool {
         Path src = glibc / src_rel;
         Path obj = cache_dir / obj_name;
-        if (obj.is_regular_file()) return true;
-        if (!src.is_regular_file()) {
-            std::println(std::cerr, "bake: glibc source missing: {}", src_rel);
-            return false;
-        }
         std::vector<std::string> cmd = base;
         if (is_asm) {
             cmd.push_back("-DASSEMBLER");
@@ -2479,7 +2836,7 @@ export GlibcObjects ensure_glibc_objects(const Toolchain& tc, LinkMode) {
     if (!write_archive(result.libc_nonshared_a, members, false))
         return GlibcObjects{};
 
-    write_file(sentinel, "");
+    toolchain_cache_finish(entry);
     return result;
 }
 
@@ -2678,17 +3035,11 @@ export Path ensure_glibc_stubs(const Toolchain& tc) {
     }
 
     GlibcVer target_ver{tc.target.glibc_major(), tc.target.glibc_minor(), 0};
-    Path stub_dir = glibc_objects_cache_dir(tc) / "stubs";
-    // Cache key: abilists content + a generator version marker (bumping it
-    // invalidates stubs synthesized by an older bake).
-    std::string abi_hash = SHA256::hex(*content).substr(0, 12) +
-                           "+stubgen2";
-    Path hash_file = stub_dir / ".abilists-hash";
-    Path sentinel = stub_dir / ".done";
+    Path glibc = find_lib_dir() / "libc" / "glibc";
+    auto entry = glibc_stubs_entry(tc, glibc);
+    Path stub_dir = entry.output_dir;
 
-    bool complete = true;
-    if (!sentinel.is_regular_file()) complete = false;
-    else if (auto h = read_file(hash_file); !h || *h != abi_hash) complete = false;
+    bool complete = entry.hit;
     if (complete) {
         for (auto& l : table.libs) {
             if (l.removed && !(target_ver < l.removed_in)) continue;
@@ -2698,6 +3049,23 @@ export Path ensure_glibc_stubs(const Toolchain& tc) {
         }
     }
     if (complete) return stub_dir;
+    // Products exist but the manifest was never written (interrupted
+    // build): finish it instead of resynthesizing.
+    {
+        bool all = true;
+        for (auto& l : table.libs) {
+            if (l.removed && !(target_ver < l.removed_in)) continue;
+            if (!(stub_dir / ("lib" + l.name + ".so." +
+                              std::to_string(l.sover))).is_regular_file()) {
+                all = false;
+                break;
+            }
+        }
+        if (all) {
+            toolchain_cache_finish(entry);
+            return stub_dir;
+        }
+    }
 
     stub_dir.mkdir_recursive();
     std::println("   Synthesizing glibc stubs for {} (glibc {}.{}), cached",
@@ -2837,8 +3205,7 @@ export Path ensure_glibc_stubs(const Toolchain& tc) {
         }
     }
 
-    write_file(hash_file, abi_hash);
-    write_file(sentinel, "");
+    toolchain_cache_finish(entry);
     return stub_dir;
 }
 // ── Unified runtime preparation ──
@@ -2879,9 +3246,16 @@ export RuntimeArtifacts prepare_runtime(
         auto sdk_layout = resolve_darwin_sdk(tc.target);
         Path lib = find_lib_dir();
 
-        // macOS deployment target from vendored SDKSettings.json
+        // Deployment minimum from the target spec (explicit -target
+        // suffix or the built-in default) — the target
+        // query is authoritative for compile and link alike. The
+        // vendored SDKSettings.json only carries the SDK version.
+        rt.macos_deployment_target = tc.target.macos_deployment_min();
+
+        // SDK version (platform_version's 4th argument): from the
+        // vendored SDKSettings.json; falls back to the deployment min.
         Path settings = lib / "libc" / "darwin" / "SDKSettings.json";
-        rt.macos_deployment_target = "15.0";
+        rt.macos_sdk_version = rt.macos_deployment_target;
         if (auto content = read_file(settings)) {
             auto key = std::string("\"MinimalDisplayName\":\"");
             auto pos = content->find(key);
@@ -2889,7 +3263,7 @@ export RuntimeArtifacts prepare_runtime(
                 auto start = pos + key.size();
                 auto end = content->find('"', start);
                 if (end != std::string::npos)
-                    rt.macos_deployment_target = content->substr(start, end - start);
+                    rt.macos_sdk_version = content->substr(start, end - start);
             }
         }
 

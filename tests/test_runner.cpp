@@ -2759,14 +2759,21 @@ TestResult test_cache_sharing() {
     fs::path exe_a = out_a / "bin" / "std-compat-default-discovery";
     CHECK(fs::exists(exe_a), "project A executable was not produced");
 
-    // Cache must contain std.pcm and std.compat.pcm under <key>/std/.
+    // Cache must contain std.pcm/std.compat.pcm (manifest layout:
+    // <triple>/o/<hash>/std.pcm) — scan triple dirs generically.
     bool found_std = false, found_compat = false;
     if (fs::exists(cache_dir)) {
-        for (auto& key_entry : fs::directory_iterator(cache_dir)) {
-            if (!key_entry.is_directory()) continue;
-            fs::path std_sub = key_entry.path() / "std";
-            if (fs::exists(std_sub / "std.pcm")) found_std = true;
-            if (fs::exists(std_sub / "std.compat.pcm")) found_compat = true;
+        std::error_code ec;
+        for (auto& triple_entry : fs::directory_iterator(cache_dir, ec)) {
+            if (!triple_entry.is_directory()) continue;
+            fs::path o_dir = triple_entry.path() / "o";
+            if (!fs::exists(o_dir)) continue;
+            for (auto& hash_entry : fs::directory_iterator(o_dir, ec)) {
+                if (!hash_entry.is_directory()) continue;
+                if (fs::exists(hash_entry.path() / "std.pcm")) found_std = true;
+                if (fs::exists(hash_entry.path() / "std.compat.pcm"))
+                    found_compat = true;
+            }
         }
     }
     CHECK(found_std, "std.pcm not found in global cache after project A build");

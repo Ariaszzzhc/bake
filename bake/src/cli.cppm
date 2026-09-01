@@ -592,7 +592,7 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
 
   // build.cpp runs on the host — always use a native toolchain.
   Toolchain native_tc = tc;
-  native_tc.target = {};
+  native_tc.target = detect_host_target();
 
   // Native std modules (cached separately from cross-target modules).
   ModuleFileMap prebuilt_modules = ensure_std_modules(native_tc, out_dir);
