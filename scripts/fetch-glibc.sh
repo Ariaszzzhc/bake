@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 # fetch-glibc.sh — Vendor glibc for linux-gnu targets, from upstream only.
 #
-# Produces (all under lib/libc/):
 #   glibc/                    source subset: crt + libc_nonshared members,
 #                             internal include tree, sysdeps subset (2 arches)
 #   glibc/abilists            symbol/version table (bake text format)
 #   glibc/VERSION, REVISION   provenance
-#   include/generic-glibc/    arch-independent public headers (split)
+#   include/generic-glibc/    arch-independent public headers (split), from
+#                             the NEWEST glibc, features.h patched so
+#                             __GLIBC__/__GLIBC_MINOR__ are -D-overridable
+#                             (bake pins them to the target version)
 #   include/x86_64-linux-gnu/, aarch64-linux-gnu/   per-arch bits
 #
 # Stages (STAGE=headers|source|abi|all):
-#   headers  install-headers of $GLIBC_VERSION per arch (Docker), split
-#            generic vs per-arch by content comparison
-#   source   copy source subset from the tarball, generate libc-modules.h
-#            via the tarball's own gen-libc-modules.awk, empty config.h
-#   abi      full build of $ABI_SEED_VERSION per arch (Docker), readelf →
-#            abilists via scripts/glibc-abi-gen.py
+#   headers  install-headers of $ABI_SEED_VERSION per arch (Docker), split
+#            generic vs per-arch by content comparison, patch features.h
+#   source   copy source subset from the $GLIBC_VERSION tarball, generate
+#            libc-modules.h, empty config.h
+#   abi      read $ABI_SEED_VERSION tarball abilist files → abilists
+#            via scripts/glibc-abi-gen.py (host-side, no build)
+#
+# Header/source split: headers come from the newest glibc so post-2.28
+# declarations exist at all; the crt/nonshared SOURCE stays at $GLIBC_VERSION
+# (the last release whose nonshared-era forms Scrt1/libc_nonshared use).
+# At compile time bake pins __GLIBC_MINOR__ to the target version, so an
+# older target closes exactly the gates __GLIBC_PREREQ governs.
 #
 # Kernel UAPI headers (any-linux-any/, *-linux-any/) are NOT produced here —
 # they are shared infrastructure owned by fetch-linux-headers.sh.
@@ -27,8 +35,8 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LIBC="$ROOT/lib/libc"
 SCRIPTS="$ROOT/scripts"
 
-GLIBC_VERSION="2.28"      # headers + source subset (nonshared-era forms)
-ABI_SEED_VERSION="2.42"   # full builds seeding the symbol/version table
+GLIBC_VERSION="2.28"      # source subset (nonshared-era forms)
+ABI_SEED_VERSION="2.42"   # headers + abilist files (newest release)
 SHA256_2_28="b1900051afad76f7a4f73e71413df4826dce085ef8ddb785a945b66d7d513082"
 SHA256_2_42="d1775e32e4628e64ef930f435b67bb63af7599acb6be2b335b9f19f16509f17f"
 MIRROR="${GLIBC_MIRROR:-https://ftp.jaist.ac.jp/pub/GNU/glibc}"
@@ -65,7 +73,7 @@ fetch_tarball() {
 # ════════════════════════════════════════════════════════════════════════
 install_headers_arch() {
     local arch="$1" platform="$2"
-    echo "==> install-headers glibc $GLIBC_VERSION ($arch, Docker $platform)"
+    echo "==> install-headers glibc $ABI_SEED_VERSION ($arch, Docker $platform)"
     rm -rf "$WORK/hdr-$arch"
     docker run --rm --platform "$platform" \
         -v "$WORK:/work" \
@@ -73,9 +81,9 @@ install_headers_arch() {
             apt-get update -qq && apt-get install -y -qq \
                 gcc gawk bison make python3 texinfo xz-utils >/dev/null
             cd /work
-            [ -d "glibc-'"$GLIBC_VERSION"'" ] || tar xf "glibc-'"$GLIBC_VERSION"'.tar.xz"
+            [ -d "glibc-'"$ABI_SEED_VERSION"'" ] || tar xf "glibc-'"$ABI_SEED_VERSION"'.tar.xz"
             rm -rf bh && mkdir bh && cd bh
-            ../"glibc-'"$GLIBC_VERSION"'"/configure --prefix=/usr \
+            ../"glibc-'"$ABI_SEED_VERSION"'"/configure --prefix=/usr \
                 --disable-werror --without-selinux --disable-crypt \
                 MAKEINFO=true
             make install-headers install_root="/work/hdr-'"$arch"'"
@@ -146,6 +154,27 @@ split_headers() {
 #endif /* _GNU_LIBC_STUBS_H */
 EOF
     done
+
+    # features.h override patch: bake pins the reported glibc version to
+    # the TARGET version via -D__GLIBC__/__GLIBC_MINOR__, so headers from
+    # the newest release present the surface of the requested one (every
+    # version-sensitive declaration in glibc headers gates on
+    # __GLIBC_PREREQ). Guard the defines so a -D wins without a
+    # redefinition diagnostic; defaults describe the vendored headers.
+    local seed_minor="${ABI_SEED_VERSION#*.}"
+    python3 - "$any/features.h" "$seed_minor" <<'PYEOF'
+import re, sys
+p, minor = sys.argv[1], sys.argv[2]
+s = open(p).read()
+s2 = re.sub(r"^#define\s+__GLIBC__\s+(\d+)",
+            r"#ifndef __GLIBC__\n#define __GLIBC__ \1\n#endif", s, count=1, flags=re.M)
+s2 = re.sub(r"^#define\s+__GLIBC_MINOR__\s+(\d+)",
+            rf"#ifndef __GLIBC_MINOR__\n#define __GLIBC_MINOR__ {minor}\n#endif", s2, count=1, flags=re.M)
+if s2 == s:
+    sys.exit("features.h patch failed to match")
+open(p, "w").write(s2)
+PYEOF
+    echo "  → features.h version-override patched (defaults: $ABI_SEED_VERSION)"
 
     echo "  → generic-glibc/       ($(find "$any" -name '*.h' | wc -l | tr -d ' ') headers)"
     for arch in x86_64 aarch64; do
@@ -267,7 +296,8 @@ EOF
     echo "$GLIBC_VERSION" > "$DST/VERSION"
     cat > "$DST/REVISION" <<EOF
 source:   glibc $GLIBC_VERSION (GNU release tarball, sha256 $SHA256_2_28)
-headers:  glibc $GLIBC_VERSION install-headers (generic-glibc + per-triple)
+headers:  glibc $ABI_SEED_VERSION install-headers + features.h version
+          override patch (generic-glibc + per-triple)
 abilists: glibc $ABI_SEED_VERSION full builds (scripts/glibc-abi-gen.py)
 kernel:   see lib/libc/include/linux-uapi-VERSION (fetch-linux-headers.sh)
 EOF
@@ -335,6 +365,8 @@ assert_vendor() {
         check "$LIBC/include/$t/gnu/stubs.h"
         check "$LIBC/include/generic-glibc/bits/stdio_lim.h"
     done
+    grep -q '#ifndef __GLIBC_MINOR__' "$LIBC/include/generic-glibc/features.h" \
+        || die "features.h version-override patch missing (re-run STAGE=headers)"
 
     # shared kernel UAPI (owned by fetch-linux-headers.sh)
     check "$LIBC/include/any-linux-any/linux/version.h"
@@ -349,7 +381,7 @@ assert_vendor() {
 # ════════════════════════════════════════════════════════════════════════
 case "$STAGE" in
   headers)
-    fetch_tarball "$GLIBC_VERSION" "$SHA256_2_28"
+    fetch_tarball "$ABI_SEED_VERSION" "$SHA256_2_42"
     install_headers_arch x86_64 linux/amd64
     install_headers_arch aarch64 linux/arm64
     split_headers

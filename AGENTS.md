@@ -12,7 +12,7 @@ APIs are not frozen — make changes clean, not backward-compatible.
 # Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 19 + libc++)
 cmake -G Ninja -B build && cmake --build build
 
-# Run the test suite (62 end-to-end tests)
+# Run the test suite (64 end-to-end tests)
 ctest --test-dir build --output-on-failure
 
 # Self-host: stage 0 bake builds itself → out/bin/bake
@@ -35,8 +35,11 @@ bake cross-compiles to four libc families, all from any host:
 
 Use `-t <triple>` to cross-compile (e.g. `bake build -t x86_64-linux-gnu`).
 glibc targets default to version 2.28; pick another with a triple suffix
-(`-t x86_64-linux-gnu.2.31`). gnu is dynamic-only — static builds are
-rejected with musl guidance.
+(`-t x86_64-linux-gnu.2.36`). The suffix governs both the link surface
+(per-version stub libraries) and the header surface (`__GLIBC__`/
+`__GLIBC_MINOR__` pinned to the target — headers are vendored from the
+newest glibc). gnu is dynamic-only — static builds are rejected with musl
+guidance.
 
 The dispatch chain in `bake.compiler.cppm`:
 
@@ -48,7 +51,7 @@ The dispatch chain in `bake.compiler.cppm`:
 Each libc family is self-contained:
 - **Darwin**: SDK stubs (`libSystem.tbd`) shipped in `lib/libc/darwin/`. No Xcode needed.
 - **Musl**: full musl source in `lib/libc/musl/`, built from source → static CRT.
-- **Gnu**: crt + `libc_nonshared.a` compiled in-process from the vendored glibc source subset (`lib/libc/glibc/`); libc itself is never built — link-time stub `.so` files are synthesized per target version from the vendored `abilists` symbol/version table (`ensure_glibc_stubs`). Headers: `lib/libc/include/generic-glibc/` + per-triple dirs + kernel UAPI shared with musl. `scripts/fetch-glibc.sh` regenerates everything from upstream tarballs (patches in `scripts/glibc-patches/`).
+- **Gnu**: crt + `libc_nonshared.a` compiled in-process from the vendored glibc 2.28 source subset (`lib/libc/glibc/`); libc itself is never built — link-time stub `.so` files are synthesized per target version from the vendored `abilists` symbol/version table (`ensure_glibc_stubs`). Headers are the newest glibc's install-headers (`lib/libc/include/generic-glibc/` + per-triple dirs), with `features.h` patched so `-D__GLIBC__`/`-D__GLIBC_MINOR__` pin the target version. `scripts/fetch-glibc.sh` regenerates everything from upstream tarballs (patches in `scripts/glibc-patches/`).
 - **Windows**: MinGW-w64 v14 in `lib/libc/mingw/`, CRT + winpthreads from source. Import libraries generated on-demand from `.def` files (only libraries referenced by `-l` flags). LLD MinGW driver. UCRT default via `_mingw.h`.
 
 libc++ config site varies per target (`lib/libcxx/cross-config/` for musl, `lib/libcxx/gnu-config/` for gnu, `lib/libcxx/mingw-config/` for windows).
@@ -142,7 +145,7 @@ bake/
 │   ├── fetch-musl.sh            download musl source
 │   ├── fetch-linux-headers.sh   kernel UAPI headers (shared musl+gnu)
 │   ├── fetch-glibc.sh           vendor glibc subset + abilists from upstream
-│   ├── glibc-abi-gen.py         readelf → abilists (runs inside Docker)
+│   ├── glibc-abi-gen.py         tarball .abilist files → abilists (host-side)
 │   └── update-runtime.sh        update vendored libc++/libcxxabi/libunwind/compiler-rt
 ├── tests/
 │   ├── test_runner.cpp          custom test framework, spawns bake binary

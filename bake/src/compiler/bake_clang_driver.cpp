@@ -703,6 +703,31 @@ static void inject_vendored_headers(
           add(lib + "/libc/include/generic-glibc");
           add(lib + "/libc/include/" + arch_os_dir + "-linux-any");
           add(lib + "/libc/include/any-linux-any");
+
+          // Pin the header-reported glibc version to the TARGET version.
+          // Headers are vendored from the newest release with features.h
+          // patched to honor -D__GLIBC__/__GLIBC_MINOR__, so every
+          // __GLIBC_PREREQ gate presents the requested surface. The
+          // triple seen here is version-stripped; recover the explicit
+          // target recorded during preprocessing. bake's own
+          // glibc-internal compiles are exempt: they must see the
+          // vendored source version, not the target's.
+          bool internal = false;
+          for (const char *a : Args)
+            if (StringRef(a).contains("MODULE_NAME=libc"))
+              internal = true;
+          if (!internal) {
+            bake::TargetSpec eff = gnu_ts;
+            if (!g_explicit_target.triple_.empty() &&
+                g_explicit_target.triple_ == gnu_ts.triple_)
+              eff = g_explicit_target;
+            Args.push_back(Saver.save(
+                ("-D__GLIBC__=" + std::to_string(eff.glibc_major()))
+                    .c_str()).data());
+            Args.push_back(Saver.save(
+                ("-D__GLIBC_MINOR__=" + std::to_string(eff.glibc_minor()))
+                    .c_str()).data());
+          }
         }
       }
     }

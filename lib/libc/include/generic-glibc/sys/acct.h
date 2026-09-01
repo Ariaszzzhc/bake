@@ -1,4 +1,4 @@
-/* Copyright (C) 1996-2018 Free Software Foundation, Inc.
+/* Copyright (C) 1996-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -13,14 +13,14 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _SYS_ACCT_H
 #define _SYS_ACCT_H	1
 
 #include <sys/types.h>
 #include <stdint.h>
-#include <endian.h>
+#include <bits/endian.h>
 #include <bits/types/time_t.h>
 
 __BEGIN_DECLS
@@ -86,7 +86,9 @@ enum
     AFORK = 0x01,		/* Has executed fork, but no exec.  */
     ASU = 0x02,			/* Used super-user privileges.  */
     ACORE = 0x08,		/* Dumped core.  */
-    AXSIG = 0x10		/* Killed by a signal.  */
+    AXSIG = 0x10,		/* Killed by a signal.  */
+    AGROUP = 0x20		/* Was the last task of the process
+				   (task group).  */
   };
 
 #if __BYTE_ORDER == __BIG_ENDIAN

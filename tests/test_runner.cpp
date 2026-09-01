@@ -3396,9 +3396,9 @@ TestResult test_cross_gnu() {
     CHECK(arm_elf.valid && arm_elf.interp == "/lib/ld-linux-aarch64.so.1",
           "aarch64 PT_INTERP wrong: " + arm_elf.interp);
 
-    // Explicit glibc version via triple suffix: still builds (the vendored
-    // header surface is pinned to 2.28; higher targets simply link against
-    // the same-or-older symbol versions).
+    // Explicit glibc version via triple suffix: still builds — the
+    // header surface follows the target version (see cross_gnu_prereq),
+    // and symbol versions resolve from the per-version stubs.
     auto dir31 = make_temp_dir("cross_gnu_231");
     copy_fixture("cross_gnu", dir31);
     auto v31 = run_bake("build -t x86_64-linux-gnu.2.31", dir31);
@@ -3415,6 +3415,35 @@ TestResult test_cross_gnu() {
     CHECK(!stat.success(), "static glibc link unexpectedly succeeded");
     CHECK(stat.stdout.find("musl") != std::string::npos,
           "static-glibc diagnostic lacks musl guidance: " + stat.stdout);
+
+    return {};
+}
+
+TestResult test_cross_gnu_prereq() {
+    // features.h version pinning: headers are vendored from the newest
+    // glibc, and __GLIBC_MINOR__ is pinned to the target version, so
+    // __GLIBC_PREREQ gates present the requested surface.
+    auto dir = make_temp_dir("cross_gnu_prereq");
+    copy_fixture("cross_gnu_prereq", dir);
+
+    // 2.36 target: the post-2.28 API (gettid, glibc 2.30) is visible,
+    // links, and carries the GLIBC_2.30 version reference.
+    auto v36 = run_bake("build -t x86_64-linux-gnu.2.36", dir);
+    CHECK(v36.success(), "glibc 2.36 prereq build failed: " + v36.stdout);
+    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-prereq";
+    CHECK(fs::exists(out), "2.36 target binary missing");
+    auto elf = inspect_elf64(out);
+    CHECK(elf.valid, "2.36 output is not a valid ELF64 binary");
+    bool has_2_30 = false;
+    for (auto& v : elf.glibc_versions)
+        if (v == "GLIBC_2.30") has_2_30 = true;
+    CHECK(has_2_30, "gettid reference missing its GLIBC_2.30 version");
+
+    // Default (2.28) target: the same source must be rejected at
+    // compile time — the declaration is version-gated away.
+    auto base = run_bake("build -t x86_64-linux-gnu", dir);
+    CHECK(!base.success(),
+          "2.28 target unexpectedly accepted a 2.30-gated API");
 
     return {};
 }
@@ -3639,7 +3668,7 @@ static std::vector<TestCase> all_tests = {
     {"target_conditions",             test_target_conditions},
     {"cross_gnu",                     test_cross_gnu},
     {"cross_gnu_cpp",                 test_cross_gnu_cpp},
-    {"default_executable_type",       test_default_executable_type},
+    {"cross_gnu_prereq",              test_cross_gnu_prereq},
     {"invalid_moid_type",             test_invalid_moid_type},
     {"input_declaration_equivalence", test_input_declaration_equivalence},
     {"declaration_json_escape",       test_declaration_json_escape},

@@ -1,4 +1,4 @@
-/* Copyright (C) 1991-2018 Free Software Foundation, Inc.
+/* Copyright (C) 1991-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _NETINET_ICMP6_H
 #define _NETINET_ICMP6_H 1
@@ -69,6 +69,8 @@ struct icmp6_hdr
 #define MLD_LISTENER_QUERY          130
 #define MLD_LISTENER_REPORT         131
 #define MLD_LISTENER_REDUCTION      132
+#define ICMPV6_EXT_ECHO_REQUEST	    160
+#define ICMPV6_EXT_ECHO_REPLY	    161
 
 #define ICMP6_DST_UNREACH_NOROUTE     0 /* no route to destination */
 #define ICMP6_DST_UNREACH_ADMIN       1 /* communication with destination */
@@ -85,16 +87,16 @@ struct icmp6_hdr
 #define ICMP6_PARAMPROB_OPTION        2 /* unrecognized IPv6 option */
 
 #define ICMP6_FILTER_WILLPASS(type, filterp) \
-	((((filterp)->icmp6_filt[(type) >> 5]) & (1 << ((type) & 31))) == 0)
+	((((filterp)->icmp6_filt[(type) >> 5]) & (1U << ((type) & 31))) == 0)
 
 #define ICMP6_FILTER_WILLBLOCK(type, filterp) \
-	((((filterp)->icmp6_filt[(type) >> 5]) & (1 << ((type) & 31))) != 0)
+	((((filterp)->icmp6_filt[(type) >> 5]) & (1U << ((type) & 31))) != 0)
 
 #define ICMP6_FILTER_SETPASS(type, filterp) \
-	((((filterp)->icmp6_filt[(type) >> 5]) &= ~(1 << ((type) & 31))))
+	((((filterp)->icmp6_filt[(type) >> 5]) &= ~(1U << ((type) & 31))))
 
 #define ICMP6_FILTER_SETBLOCK(type, filterp) \
-	((((filterp)->icmp6_filt[(type) >> 5]) |=  (1 << ((type) & 31))))
+	((((filterp)->icmp6_filt[(type) >> 5]) |=  (1U << ((type) & 31))))
 
 #define ICMP6_FILTER_SETPASSALL(filterp) \
 	memset (filterp, 0, sizeof (struct icmp6_filter));

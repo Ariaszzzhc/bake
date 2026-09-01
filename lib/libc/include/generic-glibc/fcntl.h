@@ -1,4 +1,4 @@
-/* Copyright (C) 1991-2018 Free Software Foundation, Inc.
+/* Copyright (C) 1991-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 /*
  *	POSIX Standard: 6.5 File Control Operations	<fcntl.h>
@@ -161,6 +161,7 @@ typedef __pid_t pid_t;
 #  define AT_STATX_SYNC_AS_STAT	0x0000
 #  define AT_STATX_FORCE_SYNC	0x2000
 #  define AT_STATX_DONT_SYNC	0x4000
+#  define AT_RECURSIVE		0x8000	/* Apply to the entire subtree.  */
 # endif
 # define AT_EACCESS		0x200	/* Test access permitted for
 					   effective IDs, not real IDs.  */
@@ -171,17 +172,30 @@ typedef __pid_t pid_t;
 
    This function is a cancellation point and therefore not marked with
    __THROW.  */
-#ifndef __USE_FILE_OFFSET64
+#ifndef __USE_TIME64_REDIRECTS
+# ifndef __USE_FILE_OFFSET64
 extern int fcntl (int __fd, int __cmd, ...);
-#else
-# ifdef __REDIRECT
-extern int __REDIRECT (fcntl, (int __fd, int __cmd, ...), fcntl64);
 # else
-#  define fcntl fcntl64
+#  ifdef __REDIRECT
+extern int __REDIRECT (fcntl, (int __fd, int __cmd, ...), fcntl64);
+#  else
+#   define fcntl fcntl64
+#  endif
 # endif
-#endif
-#ifdef __USE_LARGEFILE64
+# ifdef __USE_LARGEFILE64
 extern int fcntl64 (int __fd, int __cmd, ...);
+# endif
+#else /* __USE_TIME64_REDIRECTS */
+# ifdef __REDIRECT
+extern int __REDIRECT_NTH (fcntl, (int __fd, int __request, ...),
+			   __fcntl_time64);
+extern int __REDIRECT_NTH (fcntl64, (int __fd, int __request, ...),
+			   __fcntl_time64);
+# else
+extern int __fcntl_time64 (int __fd, int __request, ...) __THROW;
+#  define fcntl64 __fcntl_time64
+#  define fcntl __fcntl_time64
+# endif
 #endif
 
 /* Open FILE and return a new file descriptor for it, or -1 on error.
@@ -267,16 +281,17 @@ extern int creat64 (const char *__file, mode_t __mode) __nonnull ((1));
 # define F_TEST  3	/* Test a region for other processes locks.  */
 
 # ifndef __USE_FILE_OFFSET64
-extern int lockf (int __fd, int __cmd, off_t __len);
+extern int lockf (int __fd, int __cmd, off_t __len) __wur;
 # else
 #  ifdef __REDIRECT
-extern int __REDIRECT (lockf, (int __fd, int __cmd, __off64_t __len), lockf64);
+extern int __REDIRECT (lockf, (int __fd, int __cmd, __off64_t __len),
+                       lockf64) __wur;
 #  else
 #   define lockf lockf64
 #  endif
 # endif
 # ifdef __USE_LARGEFILE64
-extern int lockf64 (int __fd, int __cmd, off64_t __len);
+extern int lockf64 (int __fd, int __cmd, off64_t __len) __wur;
 # endif
 #endif
 
@@ -323,8 +338,7 @@ extern int posix_fallocate64 (int __fd, off64_t __offset, off64_t __len);
 
 
 /* Define some inlines helping to catch common problems.  */
-#if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function \
-    && defined __va_arg_pack_len
+#if __USE_FORTIFY_LEVEL > 0 && defined __fortify_function
 # include <bits/fcntl2.h>
 #endif
 

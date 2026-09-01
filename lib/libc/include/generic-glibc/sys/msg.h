@@ -1,4 +1,4 @@
-/* Copyright (C) 1995-2018 Free Software Foundation, Inc.
+/* Copyright (C) 1995-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _SYS_MSG_H
 #define _SYS_MSG_H
@@ -58,7 +58,17 @@ struct msgbuf
 __BEGIN_DECLS
 
 /* Message queue control operation.  */
+#ifndef __USE_TIME64_REDIRECTS
 extern int msgctl (int __msqid, int __cmd, struct msqid_ds *__buf) __THROW;
+#else
+# ifdef __REDIRECT_NTH
+extern int __REDIRECT_NTH (msgctl,
+                           (int __msqid, int __cmd, struct msqid_ds *__buf),
+                           __msgctl64);
+# else
+#  define msgctl __msgctl64
+# endif
+#endif
 
 /* Get messages queue.  */
 extern int msgget (key_t __key, int __msgflg) __THROW;

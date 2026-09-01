@@ -83,6 +83,17 @@ export struct TargetSpec {
     // Never carries the glibc version suffix — LLVM triples can't encode it.
     std::string triple() const { return native_ ? "" : triple_; }
 
+    // Triple WITH the glibc version suffix ("x86_64-linux-gnu.2.36"), for
+    // argv consumed by bake's own driver shim: its preprocessing strips
+    // the suffix back off before LLVM parses the triple and records the
+    // version for the header pinning and link interception. Only meaningful
+    // when a version was explicitly requested.
+    std::string triple_with_version() const {
+        if (native_ || !glibc_major_ && !glibc_minor_) return triple_;
+        return triple_ + "." + std::to_string(glibc_major()) + "." +
+               std::to_string(glibc_minor());
+    }
+
     int glibc_major() const {
         return glibc_major_ ? glibc_major_ : default_glibc_major;
     }
@@ -276,7 +287,7 @@ export std::vector<std::string> make_compile_command(const Toolchain& tc,
     // Cross-compile target
     if (!tc.target.is_native()) {
         cmd.push_back("-target");
-        cmd.push_back(tc.target.triple());
+        cmd.push_back(tc.target.triple_with_version());
     }
 
     // libc++ for import std; / import std.compat;
@@ -329,7 +340,7 @@ export std::vector<std::string> make_link_command(const Toolchain& tc,
     // Cross-compile target
     if (!tc.target.is_native()) {
         cmd.push_back("-target");
-        cmd.push_back(tc.target.triple());
+        cmd.push_back(tc.target.triple_with_version());
     }
 
     if (lc.type == MoidType::Dylib) {
@@ -734,7 +745,7 @@ export ModuleFileMap ensure_std_modules(
         // Cross-compile: -target + cross __config_site before libc++ headers.
         if (!tc.target.is_native()) {
             cmd.push_back("-target");
-            cmd.push_back(tc.target.triple());
+            cmd.push_back(tc.target.triple_with_version());
             cmd.push_back("-isystem");
             cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
         }
@@ -765,7 +776,7 @@ export ModuleFileMap ensure_std_modules(
 
         if (!tc.target.is_native()) {
             cmd.push_back("-target");
-            cmd.push_back(tc.target.triple());
+            cmd.push_back(tc.target.triple_with_version());
             cmd.push_back("-isystem");
             cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
         }
@@ -2286,6 +2297,16 @@ static std::vector<std::string> glibc_internal_include_chain(
     return dirs;
 }
 
+static Path glibc_objects_cache_dir(const Toolchain& tc) {
+    std::string ver = std::to_string(tc.target.glibc_major()) + "." +
+                      std::to_string(tc.target.glibc_minor());
+    // "+h2": key marker for the vendored-headers switch to the newest
+    // glibc's install-headers (features.h override era) — bumps existing
+    // user caches.
+    return get_cache_dir().parent() / "glibc-objects" /
+           (tc.target.triple() + "-v" + ver + "+h2");
+}
+
 export GlibcObjects ensure_glibc_objects(const Toolchain& tc, LinkMode) {
     GlibcObjects result;
     if (!tc.target.is_linux_gnu()) return result;
@@ -2314,8 +2335,7 @@ export GlibcObjects ensure_glibc_objects(const Toolchain& tc, LinkMode) {
     std::string arch = tc.target.arch();
     std::string ver = std::to_string(tc.target.glibc_major()) + "." +
                       std::to_string(tc.target.glibc_minor());
-    Path cache_dir = get_cache_dir().parent() / "glibc-objects" /
-                     (tc.target.triple() + "-v" + ver);
+    Path cache_dir = glibc_objects_cache_dir(tc);
     Path sentinel = cache_dir / ".done";
 
     result.crt_entry = cache_dir / "Scrt1.o";
@@ -2618,12 +2638,6 @@ static bool glibc_parse_abilists(std::string_view text, GlibcAbiTable& t) {
     return !t.libs.empty() && !t.syms.empty();
 }
 
-static Path glibc_objects_cache_dir(const Toolchain& tc) {
-    std::string ver = std::to_string(tc.target.glibc_major()) + "." +
-                      std::to_string(tc.target.glibc_minor());
-    return get_cache_dir().parent() / "glibc-objects" /
-           (tc.target.triple() + "-v" + ver);
-}
 
 export Path ensure_glibc_stubs(const Toolchain& tc) {
     if (!tc.target.is_linux_gnu()) return Path();

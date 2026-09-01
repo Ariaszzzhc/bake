@@ -1,6 +1,6 @@
-/* Copyright (C) 2002-2018 Free Software Foundation, Inc.
+/* Generic POSIX semaphore type layout
+   Copyright (C) 1995-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
-   Contributed by Ulrich Drepper <drepper@redhat.com>, 2002.
 
    The GNU C Library is free software; you can redistribute it and/or
    modify it under the terms of the GNU Lesser General Public
@@ -14,7 +14,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _SEMAPHORE_H
 # error "Never use <bits/semaphore.h> directly; include <semaphore.h> instead."
@@ -27,7 +27,6 @@
 #else
 # define __SIZEOF_SEM_T	16
 #endif
-
 
 /* Value returned if `sem_open' failed.  */
 #define SEM_FAILED      ((sem_t *) 0)

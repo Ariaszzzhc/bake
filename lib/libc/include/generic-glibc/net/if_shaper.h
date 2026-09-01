@@ -1,4 +1,4 @@
-/* Copyright (C) 1998-2018 Free Software Foundation, Inc.
+/* Copyright (C) 1998-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _NET_IF_SHAPER_H
 #define _NET_IF_SHAPER_H 1
@@ -27,7 +27,7 @@ __BEGIN_DECLS
 
 #define SHAPER_QLEN	10
 /*
- *	This is a bit speed dependant (read it shouldnt be a constant!)
+ *	This is a bit speed dependent (read it shouldn't be a constant!)
  *
  *	5 is about right for 28.8 upwards. Below that double for every
  *	halving of speed or so. - ie about 20 for 9600 baud.

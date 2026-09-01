@@ -1,4 +1,4 @@
-/* Copyright (C) 1997-2018 Free Software Foundation, Inc.
+/* Copyright (C) 1997-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -13,7 +13,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _NETAX25_AX25_H
 #define _NETAX25_AX25_H	1
@@ -62,7 +62,7 @@
 #define AX25_DIGI_INBAND	0x01	/* Allow digipeating within port */
 #define AX25_DIGI_XBAND		0x02	/* Allow digipeating across ports */
 
-/* Maximim number of digipeaters: */
+/* Maximum number of digipeaters: */
 #define AX25_MAX_DIGIS 8
 
 
@@ -80,7 +80,7 @@ struct sockaddr_ax25
   };
 
 /*
- * The sockaddr struct with the digipeater adresses:
+ * The sockaddr struct with the digipeater addresses:
  */
 struct full_sockaddr_ax25
   {

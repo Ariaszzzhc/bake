@@ -1,5 +1,5 @@
 /* Define __GLIBC_FLT_EVAL_METHOD.
-   Copyright (C) 2016-2018 Free Software Foundation, Inc.
+   Copyright (C) 2016-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -14,7 +14,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _MATH_H
 # error "Never use <bits/flt-eval-method.h> directly; include <math.h> instead."
@@ -26,14 +26,12 @@
    -1.  */
 
 /* In the default version of this header, follow __FLT_EVAL_METHOD__.
-   -1 is mapped to 2 (considering evaluation as long double to be a
-   conservatively safe assumption), and if __FLT_EVAL_METHOD__ is not
-   defined then assume there is no excess precision and use the value
-   0.  */
+   If __FLT_EVAL_METHOD__ is not defined or set to -1, assume there is no
+   excess precision and use the value 0 (this is correct for most targets). */
 
 #ifdef __FLT_EVAL_METHOD__
 # if __FLT_EVAL_METHOD__ == -1
-#  define __GLIBC_FLT_EVAL_METHOD	2
+#  define __GLIBC_FLT_EVAL_METHOD	0
 # else
 #  define __GLIBC_FLT_EVAL_METHOD	__FLT_EVAL_METHOD__
 # endif

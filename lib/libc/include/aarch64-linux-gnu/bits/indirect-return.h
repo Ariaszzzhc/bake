@@ -1,5 +1,5 @@
-/* Definition of __INDIRECT_RETURN.  Generic version.
-   Copyright (C) 2018 Free Software Foundation, Inc.
+/* Definition of __INDIRECT_RETURN.  AArch64 version.
+   Copyright (C) 2024-2025 Free Software Foundation, Inc.
    This file is part of the GNU C Library.
 
    The GNU C Library is free software; you can redistribute it and/or
@@ -14,12 +14,23 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _UCONTEXT_H
 # error "Never include <bits/indirect-return.h> directly; use <ucontext.h> instead."
 #endif
 
-/* __INDIRECT_RETURN is used on swapcontext to indicate if it requires
-   special compiler treatment.  */
-#define __INDIRECT_RETURN
+/* __INDIRECT_RETURN indicates that swapcontext may return via
+   an indirect branch.  This happens when GCS is enabled, so
+   add the attribute if available, otherwise returns_twice has
+   a similar effect, but it prevents some code transformations
+   that can cause build failures in some rare cases so it is
+   only used when GCS is enabled.  */
+#if __glibc_has_attribute (__indirect_return__)
+# define __INDIRECT_RETURN __attribute__ ((__indirect_return__))
+#elif __glibc_has_attribute (__returns_twice__) \
+      && defined __ARM_FEATURE_GCS_DEFAULT
+# define __INDIRECT_RETURN __attribute__ ((__returns_twice__))
+#else
+# define __INDIRECT_RETURN
+#endif

@@ -1,5 +1,5 @@
 /* `ptrace' debugger support interface.  Linux/x86 version.
-   Copyright (C) 1996-2018 Free Software Foundation, Inc.
+   Copyright (C) 1996-2025 Free Software Foundation, Inc.
 
    This file is part of the GNU C Library.
 
@@ -15,7 +15,7 @@
 
    You should have received a copy of the GNU Lesser General Public
    License along with the GNU C Library; if not, see
-   <http://www.gnu.org/licenses/>.  */
+   <https://www.gnu.org/licenses/>.  */
 
 #ifndef _SYS_PTRACE_H
 #define _SYS_PTRACE_H	1
@@ -186,8 +186,26 @@ enum __ptrace_request
 #define PTRACE_SECCOMP_GET_FILTER PTRACE_SECCOMP_GET_FILTER
 
   /* Get seccomp BPF filter metadata.  */
-  PTRACE_SECCOMP_GET_METADATA = 0x420d
+  PTRACE_SECCOMP_GET_METADATA = 0x420d,
 #define PTRACE_SECCOMP_GET_METADATA PTRACE_SECCOMP_GET_METADATA
+
+  /* Get information about system call.  */
+  PTRACE_GET_SYSCALL_INFO = 0x420e,
+#define PTRACE_GET_SYSCALL_INFO PTRACE_GET_SYSCALL_INFO
+
+  /* Get rseq configuration information.  */
+  PTRACE_GET_RSEQ_CONFIGURATION = 0x420f,
+#define PTRACE_GET_RSEQ_CONFIGURATION PTRACE_GET_RSEQ_CONFIGURATION
+
+  /* Set configuration for syscall user dispatch.  */
+  PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG = 0x4210,
+#define PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG \
+  PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG
+
+  /* Get configuration for syscall user dispatch.  */
+  PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG = 0x4211
+#define PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG \
+  PTRACE_GET_SYSCALL_USER_DISPATCH_CONFIG
 };
 
 
