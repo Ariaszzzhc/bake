@@ -139,7 +139,7 @@ echo "  → $src_count source files"
 # ════════════════════════════════════════════════════════════════════════
 # 4. Install + preprocess .def files
 #
-# Layout (matching Zig's structure):
+# Layout:
 #   lib-common/  — all .def (preprocessed from .def.in), the fallback set
 #   lib32/       — x86-specific .def files (from upstream lib32/)
 #   lib64/       — x86_64-specific .def files (from upstream lib64/)

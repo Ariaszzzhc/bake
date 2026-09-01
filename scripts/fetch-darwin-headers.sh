@@ -2,7 +2,7 @@
 # fetch-darwin-headers.sh — Extract macOS C library headers + libSystem.tbd
 # from the locally installed SDK into lib/bake/.
 #
-# This mirrors Zig's approach: vendor a curated set of Darwin headers so
+# Vendor a curated set of Darwin headers so
 # bake can compile C/C++ without requiring the system SDK at compile time.
 #
 # Headers are Apple's, redistributed unmodified under APSL-2.0 / OS Reference License.
@@ -46,7 +46,7 @@ echo "    Copied $HEADER_COUNT headers"
 echo "==> Copying libSystem.tbd..."
 cp "$SDK/usr/lib/libSystem.tbd" "$DEST/libSystem.tbd"
 
-# 3. Create SDKSettings.json (matches Zig's format: MinimalDisplayName only)
+# 3. Create SDKSettings.json (MinimalDisplayName only)
 SDK_VERSION=$(plutil -extract DefaultProperties.MACOSX_DEPLOYMENT_TARGET raw \
   "$SDK/SDKSettings.json" 2>/dev/null || echo "13.0")
 SDK_DISPLAY=$(echo "$SDK_VERSION" | cut -d. -f1-2)

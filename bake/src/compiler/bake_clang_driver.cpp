@@ -338,7 +338,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     if (tc.exe_path.empty()) tc.exe_path = "bake";
     tc.target = !g_explicit_target.triple_.empty()
         ? g_explicit_target
-        : bake::parse_target(Triple.getTriple());
+        : bake::detect_host_target();
 
     bool is_darwin = Flavor == LldFlavor::MACHO;
     bool is_mingw = Flavor == LldFlavor::MinGW;
@@ -358,6 +358,25 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       FailingCommands.push_back({1, Cmd});
       if (!Res) Res = 1;
       return;
+    }
+
+    // AddressSanitizer runtime is not vendored.
+    // Compilation/instrumentation still works; only the link is
+    // rejected, with a message pointing at what bake supports.
+    for (const char *Arg : Cmd->getArguments()) {
+      if (!Arg) continue;
+      StringRef A(Arg);
+      auto Pos = A.find("libclang_rt.asan");
+      if (Pos != StringRef::npos) {
+        llvm::errs()
+          << "bake: AddressSanitizer runtime is not vendored; "
+          "supported sanitizers are 'undefined' and 'thread'.\n"
+          "  (-fsanitize=address still instruments compile-only "
+          "invocations; the link step is rejected.)\n";
+        FailingCommands.push_back({1, Cmd});
+        if (!Res) Res = 1;
+        return;
+      }
     }
 
     // One call — prepares ALL runtime artifacts for this target.
@@ -382,16 +401,15 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       Prefix.push_back(rt.crt_entry.string());
 
     if (is_darwin) {
-      // Ensure -platform_version (Clang driver omits it on non-macOS hosts).
-      bool has_pv = false;
-      for (const char *A : Cmd->getArguments())
-        if (A && StringRef(A) == "-platform_version") { has_pv = true; break; }
-      if (!has_pv) {
-        Prefix.push_back("-platform_version");
-        Prefix.push_back("macos");
-        Prefix.push_back(rt.macos_deployment_target);
-        Prefix.push_back(rt.macos_deployment_target);
-      }
+      // Same-source deployment version: bake always owns
+      // -platform_version (min from the target spec — explicit suffix,
+      // built-in default, or detected host minimum; SDK version from the
+      // vendored SDKSettings). Any driver-produced one is stripped in
+      // the user-args loop below, keeping compile and link identical.
+      Prefix.push_back("-platform_version");
+      Prefix.push_back("macos");
+      Prefix.push_back(rt.macos_deployment_target);
+      Prefix.push_back(rt.macos_sdk_version);
       for (auto& dir : rt.link_dirs)
         Prefix.push_back("-L" + dir);
       for (auto& dir : rt.framework_dirs)
@@ -430,7 +448,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     //     -lmsvcrt since we inject api-ms-win-crt-* import libs.
     //
     // For mingw: generate import libraries on-demand for -l<name> flags.
-    // Only libraries that are referenced are generated (like Zig does).
+    // Only libraries that are referenced are generated.
     if (is_mingw) {
       for (const char *Arg : Cmd->getArguments()) {
         if (!Arg) continue;
@@ -454,9 +472,21 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     };
 
     bool skip_next_dynamic_linker = false;
+    int skip_platform_values = 0;  // remaining -platform_version values
+    bool bake_owns_platform_version =
+        is_darwin && !g_explicit_target.triple_.empty();
     for (const char *Arg : Cmd->getArguments()) {
       if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
         continue;
+      if (skip_platform_values > 0) {
+        --skip_platform_values;
+        continue;
+      }
+      if (bake_owns_platform_version && Arg &&
+          StringRef(Arg) == "-platform_version") {
+        skip_platform_values = 3;
+        continue;
+      }
       if (skip_next_dynamic_linker) {
         skip_next_dynamic_linker = false;
         continue;
@@ -516,7 +546,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     if (!rt.compiler_rt.string().empty())
       Suffix.push_back(rt.compiler_rt.string());
 
-    // MinGW: always-link system libraries as full paths (like Zig does).
+    // MinGW: always-link system libraries as full paths.
     if (is_mingw && !rt.mingw_import_dir.empty()) {
       for (auto& lib : rt.always_link_libs)
         Suffix.push_back(rt.mingw_import_dir + "/" + lib + ".lib");
@@ -559,21 +589,6 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
 // Argument preprocessing helpers (used by clang_main)
 //===----------------------------------------------------------------------===//
 
-/// Remove -arch and -isysroot flags — they are host-specific (Apple Clang)
-/// and interfere with bake's target-driven model.
-static void strip_host_flags(SmallVectorImpl<const char *> &Args) {
-  for (size_t i = 0; i < Args.size();) {
-    if (Args[i] && (StringRef(Args[i]) == "-arch" ||
-                    StringRef(Args[i]) == "-isysroot")) {
-      size_t remove_count = (i + 1 < Args.size()) ? 2 : 1;
-      Args.erase(Args.begin() + i, Args.begin() + i + remove_count);
-    } else if (Args[i] && StringRef(Args[i]).starts_with("-isysroot=")) {
-      Args.erase(Args.begin() + i);
-    } else {
-      ++i;
-    }
-  }
-}
 
 /// For musl link jobs: strip default system library references that don't
 /// exist in a static musl environment, then add -nostdlib and -static so
@@ -760,8 +775,12 @@ static void inject_vendored_headers(
   }
 
   if (is_darwin) {
-    // Determine SDK layout: native → use system SDK; cross → vendored.
-    bake::TargetSpec darwin_target = bake::parse_target("aarch64-macos");
+    // Determine SDK layout from the ACTUAL target: native (no -target)
+    // → system SDK; explicit -target darwin → bake's layout resolution
+    // for that target (cross-arch → vendored).
+    bake::TargetSpec darwin_target = g_explicit_target.triple_.empty()
+        ? bake::detect_host_target()
+        : g_explicit_target;
     auto sdk_layout = bake::resolve_darwin_sdk(darwin_target);
 
     if (sdk_layout == bake::DarwinSdkLayout::Vendored) {
@@ -801,21 +820,16 @@ static void inject_vendored_headers(
       }
     }
 
-    // Deployment target from vendored SDKSettings.json.
-    std::string ver = "15.0";
-    bake::Path settings = bake::find_lib_dir() / "libc" / "darwin" / "SDKSettings.json";
-    if (auto content = bake::read_file(settings)) {
-      std::string key = "\"MinimalDisplayName\":\"";
-      auto pos = content->find(key);
-      if (pos != std::string::npos) {
-        auto start = pos + key.size();
-        auto end = content->find('"', start);
-        if (end != std::string::npos)
-          ver = content->substr(start, end - start);
-      }
-    }
+    // Deployment minimum — the target query is authoritative: explicit
+    // -target uses the version suffix or the built-in default; native
+    // (no -target) uses the detected host minimum. Either way it is
+    // injected (overriding any user-passed -mmacosx-version-min,
+    // silencing clang's "overriding option" warning), keeping compile,
+    // link and cache keys on one deterministic value.
+    Args.push_back(Saver.save("-Wno-overriding-option").data());
     Args.push_back(Saver.save(
-        ("-mmacosx-version-min=" + ver).c_str()).data());
+        ("-mmacosx-version-min=" + darwin_target.macos_deployment_min())
+            .c_str()).data());
   }
 }
 
@@ -952,6 +966,12 @@ static int clang_main(int Argc, const char **Argv,
   std::string default_triple = llvm::sys::getDefaultTargetTriple();
   Driver TheDriver(Path, default_triple, Diags,
                    /*Title=*/"clang LLVM compiler", VFS);
+  // Point the resource dir at bake's vendored tree: lib/include IS the
+  // standard resource include layout (clang builtin headers), and runtime
+  // archives (libclang_rt.*) live under lib/lib/<os>/. The exe-derived
+  // default would be a non-existent path.
+  if (std::string bake_lib = bake::find_lib_dir().string(); !bake_lib.empty())
+    TheDriver.ResourceDir = bake_lib;
   auto TargetAndMode = ToolChain::getTargetAndModeFromProgramName(ProgName);
   TheDriver.setTargetAndMode(TargetAndMode);
   // If -canonical-prefixes is set, GetExecutablePath will have resolved Path
@@ -992,13 +1012,28 @@ static int clang_main(int Argc, const char **Argv,
       g_explicit_target = bake::parse_target(Spec.str());
       has_explicit_target = true;
       // Strip the version suffix before the driver parses the triple —
-      // ".2.31" is not a valid LLVM environment component.
+      // ".2.31" (glibc) and ".12" (darwin) are not valid LLVM environment
+      // or OS components.
       StringRef Abi = Spec;
       auto Dash = Spec.rfind('-');
       if (Dash != StringRef::npos) Abi = Spec.substr(Dash + 1);
       if (Spec.contains("linux") && Abi.starts_with("gnu.")) {
         std::string Clean = (Spec.substr(0, Dash + 1) + "gnu").str();
         Args[i + 1] = Saver.save(Clean).data();
+      } else {
+        // darwin deployment-version suffix: os segment "macos.12" /
+        // "darwin.14.1" (target query versions).
+        auto OsDot = Abi.find('.');
+        if (OsDot != StringRef::npos) {
+          StringRef Os = Abi.substr(0, OsDot);
+          StringRef Ver = Abi.substr(OsDot + 1);
+          bool numeric = !Ver.empty() &&
+              Ver.find_first_not_of(".0123456789") == StringRef::npos;
+          if ((Os == "macos" || Os == "darwin") && numeric) {
+            std::string Clean = (Spec.substr(0, Dash + 1) + Os).str();
+            Args[i + 1] = Saver.save(Clean).data();
+          }
+        }
       }
       target_triple = Args[i + 1];
       break;
@@ -1007,7 +1042,6 @@ static int clang_main(int Argc, const char **Argv,
   if (target_triple.empty())
     target_triple = default_triple;
 
-  strip_host_flags(Args);
 
   // String matching on canonical triples is more reliable than llvm::Triple
   // for musl detection (the Triple parser mishandles 3-component triples).
