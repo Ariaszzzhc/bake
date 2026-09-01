@@ -47,6 +47,19 @@ ANY="$LIBC/include/any-linux-any"
 rm -rf "$ANY"
 mkdir -p "$ANY"
 cp -R "$WORK"/linux-uapi/* "$ANY/"
+
+# Two scsi headers live in the libc layer, not the kernel UAPI package
+# (musl ships them under its own include/; glibc distros get them from
+# the C library). The sanitizer runtimes need them, so pull them from a
+# glibc distro's libc6-dev.
+docker run --rm --platform linux/amd64 \
+  -v "$WORK:/out" \
+  debian:bookworm bash -c '
+    set -e
+    apt-get update -qq >/dev/null 2>&1
+    apt-get install -y -qq libc6-dev >/dev/null 2>&1
+    cp /usr/include/scsi/scsi.h /usr/include/scsi/sg.h /out/linux-uapi/scsi/
+  '
 echo "  → any-linux-any/ ($(find "$ANY" -name '*.h' | wc -l | tr -d ' ') headers)"
 
 # ── Per-arch asm/ headers ──

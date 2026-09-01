@@ -1887,6 +1887,255 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     return result_a;
 }
 
+// ── Sanitizer runtimes (ubsan standalone + tsan), built from vendored
+//    compiler-rt sources per ELF target (linux-gnu, linux-musl) ──
+
+export enum class SanitizerKind {
+    Ubsan,
+    Tsan,
+};
+
+namespace {
+
+// sanitizer_common core + libcdep + symbolizer sets shared by every
+// runtime. Files absent from the vendored tree are skipped.
+const char* sanitizer_common_sources[] = {
+    "sanitizer_allocator.cpp", "sanitizer_chained_origin_depot.cpp",
+    "sanitizer_common.cpp", "sanitizer_deadlock_detector1.cpp",
+    "sanitizer_deadlock_detector2.cpp", "sanitizer_errno.cpp",
+    "sanitizer_file.cpp", "sanitizer_flag_parser.cpp",
+    "sanitizer_flags.cpp", "sanitizer_fuchsia.cpp", "sanitizer_haiku.cpp",
+    "sanitizer_libc.cpp", "sanitizer_libignore.cpp", "sanitizer_linux.cpp",
+    "sanitizer_linux_s390.cpp", "sanitizer_mac.cpp", "sanitizer_mutex.cpp",
+    "sanitizer_netbsd.cpp", "sanitizer_platform_limits_freebsd.cpp",
+    "sanitizer_platform_limits_linux.cpp",
+    "sanitizer_platform_limits_netbsd.cpp",
+    "sanitizer_platform_limits_posix.cpp",
+    "sanitizer_platform_limits_solaris.cpp", "sanitizer_posix.cpp",
+    "sanitizer_printf.cpp", "sanitizer_procmaps_bsd.cpp",
+    "sanitizer_procmaps_common.cpp", "sanitizer_procmaps_fuchsia.cpp",
+    "sanitizer_procmaps_haiku.cpp", "sanitizer_procmaps_linux.cpp",
+    "sanitizer_procmaps_mac.cpp", "sanitizer_procmaps_solaris.cpp",
+    "sanitizer_range.cpp", "sanitizer_solaris.cpp",
+    "sanitizer_stoptheworld_fuchsia.cpp", "sanitizer_stoptheworld_mac.cpp",
+    "sanitizer_stoptheworld_win.cpp", "sanitizer_suppressions.cpp",
+    "sanitizer_termination.cpp", "sanitizer_thread_arg_retval.cpp",
+    "sanitizer_thread_registry.cpp", "sanitizer_tls_get_addr.cpp",
+    "sanitizer_type_traits.cpp", "sanitizer_win.cpp",
+    "sanitizer_win_interception.cpp",
+};
+const char* sanitizer_libcdep_sources[] = {
+    "sanitizer_common_libcdep.cpp", "sanitizer_allocator_checks.cpp",
+    "sanitizer_dl.cpp", "sanitizer_linux_libcdep.cpp",
+    "sanitizer_mac_libcdep.cpp", "sanitizer_posix_libcdep.cpp",
+    "sanitizer_stoptheworld_linux_libcdep.cpp",
+    "sanitizer_stoptheworld_netbsd_libcdep.cpp",
+};
+const char* sanitizer_symbolizer_sources[] = {
+    "sanitizer_allocator_report.cpp", "sanitizer_stack_store.cpp",
+    "sanitizer_stackdepot.cpp", "sanitizer_stacktrace.cpp",
+    "sanitizer_stacktrace_libcdep.cpp", "sanitizer_stacktrace_printer.cpp",
+    "sanitizer_stacktrace_sparc.cpp", "sanitizer_symbolizer.cpp",
+    "sanitizer_symbolizer_libbacktrace.cpp", "sanitizer_symbolizer_libcdep.cpp",
+    "sanitizer_symbolizer_mac.cpp", "sanitizer_symbolizer_markup.cpp",
+    "sanitizer_symbolizer_markup_fuchsia.cpp",
+    "sanitizer_symbolizer_posix_libcdep.cpp", "sanitizer_symbolizer_report.cpp",
+    "sanitizer_symbolizer_report_fuchsia.cpp", "sanitizer_symbolizer_win.cpp",
+    "sanitizer_thread_history.cpp", "sanitizer_unwind_linux_libcdep.cpp",
+    "sanitizer_unwind_fuchsia.cpp", "sanitizer_unwind_win.cpp",
+};
+const char* interception_sources[] = {
+    "interception_linux.cpp", "interception_mac.cpp",
+    "interception_win.cpp", "interception_type_test.cpp",
+};
+const char* tsan_core_sources[] = {
+    "tsan_debugging.cpp", "tsan_external.cpp", "tsan_fd.cpp",
+    "tsan_flags.cpp", "tsan_ignoreset.cpp",
+    "tsan_interceptors_memintrinsics.cpp", "tsan_interceptors_posix.cpp",
+    "tsan_interface.cpp", "tsan_interface_ann.cpp",
+    "tsan_interface_atomic.cpp", "tsan_interface_java.cpp",
+    "tsan_malloc_mac.cpp", "tsan_md5.cpp", "tsan_mman.cpp",
+    "tsan_mutexset.cpp", "tsan_new_delete.cpp",
+    "tsan_platform_windows.cpp", "tsan_preinit.cpp", "tsan_report.cpp",
+    "tsan_rtl.cpp", "tsan_rtl_access.cpp", "tsan_rtl_mutex.cpp",
+    "tsan_rtl_proc.cpp", "tsan_rtl_report.cpp", "tsan_rtl_thread.cpp",
+    "tsan_stack_trace.cpp", "tsan_suppressions.cpp", "tsan_symbolize.cpp",
+    "tsan_sync.cpp", "tsan_vector_clock.cpp",
+};
+const char* ubsan_standalone_sources[] = {
+    "ubsan_diag.cpp", "ubsan_diag_standalone.cpp", "ubsan_flags.cpp",
+    "ubsan_handlers.cpp", "ubsan_handlers_cxx.cpp", "ubsan_init.cpp",
+    "ubsan_init_standalone.cpp", "ubsan_init_standalone_preinit.cpp",
+    "ubsan_monitor.cpp", "ubsan_signals_standalone.cpp",
+    "ubsan_type_hash.cpp", "ubsan_type_hash_itanium.cpp",
+    "ubsan_value.cpp",
+};
+
+} // namespace
+
+export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
+    // ELF targets only (linux-gnu, linux-musl) for now; the driver link
+    // interception rejects other targets with a clear message.
+    if (!tc.target.is_linux_gnu() && !tc.target.is_linux_musl())
+        return Path();
+
+    Path lib = find_lib_dir();
+    if (lib.string().empty()) return Path();
+
+    Path rt_root = lib / "compiler-rt" / "lib";
+    Path common_dir = rt_root / "sanitizer_common";
+    if (!common_dir.is_directory()) return Path();
+
+    const char* label = kind == SanitizerKind::Ubsan ? "san-ubsan" : "san-tsan";
+    std::string product = kind == SanitizerKind::Ubsan
+        ? "libclang_rt.ubsan_standalone.a"
+        : "libclang_rt.tsan.a";
+
+    // (source directory, file) pairs to compile — assembled BEFORE the
+    // cache lookup so the unit list itself is a config input: changing
+    // the list re-keys the products automatically.
+    Path tsan_rtl = rt_root / "tsan" / "rtl";
+    std::vector<std::pair<Path, const char*>> units;
+    auto add = [&](const Path& dir, const char* const* files, size_t n) {
+        for (size_t i = 0; i < n; ++i)
+            units.emplace_back(dir, files[i]);
+    };
+    add(common_dir, sanitizer_common_sources,
+        std::size(sanitizer_common_sources));
+    add(common_dir, sanitizer_libcdep_sources,
+        std::size(sanitizer_libcdep_sources));
+    add(common_dir, sanitizer_symbolizer_sources,
+        std::size(sanitizer_symbolizer_sources));
+    if (kind == SanitizerKind::Tsan) {
+        add(tsan_rtl, tsan_core_sources, std::size(tsan_core_sources));
+        units.emplace_back(tsan_rtl, "tsan_platform_linux.cpp");
+        units.emplace_back(tsan_rtl, "tsan_platform_posix.cpp");
+        add(rt_root / "interception", interception_sources,
+            std::size(interception_sources));
+        // The tsan runtime embeds the ubsan reporting core (its rtl
+        // references __ubsan::* directly), minus the type-hash units,
+        // which need RTTI and are not used from tsan.
+        static const char* tsan_ubsan_subset[] = {
+            "ubsan_diag.cpp", "ubsan_flags.cpp",
+            "ubsan_handlers.cpp", "ubsan_init.cpp",
+            "ubsan_monitor.cpp", "ubsan_value.cpp",
+        };
+        add(rt_root / "ubsan", tsan_ubsan_subset,
+            std::size(tsan_ubsan_subset));
+        units.emplace_back(common_dir, "sanitizer_coverage_libcdep_new.cpp");
+        units.emplace_back(common_dir, "sancov_flags.cpp");
+    } else {
+        add(rt_root / "ubsan", ubsan_standalone_sources,
+            std::size(ubsan_standalone_sources));
+        add(rt_root / "interception", interception_sources,
+            std::size(interception_sources));
+        // ubsan_init references the coverage initialization hooks.
+        units.emplace_back(common_dir, "sanitizer_coverage_libcdep_new.cpp");
+        units.emplace_back(common_dir, "sancov_flags.cpp");
+    }
+    if (kind == SanitizerKind::Tsan) {
+        std::string arch_s = tc.target.arch() == "x86_64"
+            ? "tsan_rtl_amd64.S" : "tsan_rtl_aarch64.S";
+        units.emplace_back(tsan_rtl, arch_s.c_str());
+    }
+
+    std::vector<std::string> config;
+    config.push_back(kind == SanitizerKind::Ubsan ? "san-ubsan-v3"
+                                                  : "san-tsan-v3");
+    config.push_back(compiler_identity_block(tc));
+    for (auto& l : target_surface_lines(tc)) config.push_back(l);
+    std::string unit_list;
+    for (auto& [dir, file] : units)
+        unit_list += std::string(file) + " ";
+    config.push_back("units:" + unit_list);
+
+    std::vector<Path> inputs{common_dir, rt_root / "interception"};
+    if (kind == SanitizerKind::Ubsan)
+        inputs.push_back(rt_root / "ubsan");
+    else
+        inputs.push_back(rt_root / "tsan");
+
+    auto entry = toolchain_cache_lookup(tc, label, config, inputs);
+    Path cache_dir = entry.output_dir;
+    Path result_a = cache_dir / product;
+
+    if (entry.hit && result_a.is_regular_file()) return result_a;
+    if (result_a.is_regular_file()) {
+        toolchain_cache_finish(entry);
+        return result_a;
+    }
+
+    std::println("   Compiling {} runtime for {} (cached)",
+                 kind == SanitizerKind::Ubsan ? "ubsan" : "tsan",
+                 tc.target.triple_with_version());
+
+    // Flags shared by every unit (self-contained C++; no standard headers).
+    auto make_flags = [&]() {
+        std::vector<std::string> flags;
+        flags.push_back(tc.exe_path);
+        flags.push_back("c++");
+        flags.push_back("-target");
+        flags.push_back(tc.target.triple_with_version());
+        flags.push_back("-c");
+        flags.push_back("-std=c++17");
+        flags.push_back("-nostdinc++");
+        // ubsan's itanium type-hash unit uses dynamic_cast and needs
+        // RTTI; tsan is compiled without.
+        if (kind == SanitizerKind::Ubsan)
+            flags.push_back("-frtti");
+        else
+            flags.push_back("-fno-rtti");
+        flags.push_back("-fno-exceptions");
+        flags.push_back("-fvisibility=hidden");
+        flags.push_back("-fvisibility-inlines-hidden");
+        flags.push_back("-fPIC");
+        flags.push_back("-O2");
+        flags.push_back("-w");
+        flags.push_back("-I" + rt_root.string());
+        flags.push_back("-I" + common_dir.string());
+        flags.push_back("-I" + (rt_root / "interception").string());
+        if (kind == SanitizerKind::Tsan)
+            flags.push_back("-I" + (rt_root / "tsan" / "rtl").string());
+        else
+            flags.push_back("-I" + (rt_root / "ubsan").string());
+        return flags;
+    };
+    auto base_flags = make_flags();
+
+    std::vector<Path> obj_files;
+    int compiled = 0;
+    for (auto& [dir, file] : units) {
+        Path src = dir / file;
+        if (!src.is_regular_file()) continue;  // tree variation tolerance
+        std::string stem(file);
+        stem = stem.substr(0, stem.rfind('.'));
+        Path obj = cache_dir / (stem + ".o");
+        if (!obj.is_regular_file()) {
+            auto cmd = base_flags;
+            cmd.push_back(src.string());
+            cmd.push_back("-o");
+            cmd.push_back(obj.string());
+            auto r = run_process(cmd, Path(), true);
+            if (!r.success()) {
+                std::print(std::cerr, "{}", r.stderr_output);
+                std::println(std::cerr, "bake: failed to compile {}", file);
+                return Path();
+            }
+            ++compiled;
+        }
+        obj_files.push_back(obj);
+    }
+
+    if (obj_files.empty()) return Path();
+    if (!write_archive(result_a, obj_files, false)) {
+        std::println(std::cerr, "bake: failed to create {}", product);
+        return Path();
+    }
+    std::println("   Compiled {} runtime sources", compiled);
+    toolchain_cache_finish(entry);
+    return result_a;
+}
+
 // ── mingw-w64 (windows-gnu) ──
 //
 // Builds CRT objects + libmingw32.a from vendored MinGW-w64 source, and

@@ -343,6 +343,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     bool is_darwin = Flavor == LldFlavor::MACHO;
     bool is_mingw = Flavor == LldFlavor::MinGW;
     bool is_gnu = !is_darwin && !is_mingw && tc.target.is_linux_gnu();
+    bool is_elf = !is_darwin && !is_mingw;  // linux-gnu + linux-musl
 
     // Parse link mode from user args.
     std::vector<std::string> user_args;
@@ -360,27 +361,77 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       return;
     }
 
-    // AddressSanitizer runtime is not vendored.
-    // Compilation/instrumentation still works; only the link is
-    // rejected, with a message pointing at what bake supports.
+    // Sanitizer runtime dispatch. The driver emits references shaped
+    // libclang_rt.<component>.a; map them onto the runtimes bake builds
+    // from the vendored compiler-rt sources. Components without a vendored
+    // runtime are rejected with a clear message (compilation/instrumenting
+    // still works — only the link is rejected).
+    std::string san_ubsan_a, san_tsan_a;
     for (const char *Arg : Cmd->getArguments()) {
       if (!Arg) continue;
       StringRef A(Arg);
-      auto Pos = A.find("libclang_rt.asan");
-      if (Pos != StringRef::npos) {
+      auto Pos = A.find("libclang_rt.");
+      if (Pos == StringRef::npos) continue;
+      StringRef Base = A.substr(Pos + 12);
+      auto End = Base.find('.');
+      StringRef Component = Base.substr(0, End);
+
+      if (Component.starts_with("ubsan")) {
+        if (!is_elf) {
+          llvm::errs() << "bake: -fsanitize=undefined is not supported on "
+                          "this target yet.\n";
+          FailingCommands.push_back({1, Cmd});
+          if (!Res) Res = 1;
+          return;
+        }
+        if (san_ubsan_a.empty()) {
+          san_ubsan_a = bake::ensure_sanitizer_objects(
+              tc, bake::SanitizerKind::Ubsan).string();
+          if (san_ubsan_a.empty()) {
+            FailingCommands.push_back({1, Cmd});
+            if (!Res) Res = 1;
+            return;
+          }
+        }
+      } else if (Component == "tsan" || Component == "tsan_cxx") {
+        if (!is_elf) {
+          llvm::errs() << "bake: -fsanitize=thread is not supported on "
+                          "this target yet.\n";
+          FailingCommands.push_back({1, Cmd});
+          if (!Res) Res = 1;
+          return;
+        }
+        if (san_tsan_a.empty()) {
+          san_tsan_a = bake::ensure_sanitizer_objects(
+              tc, bake::SanitizerKind::Tsan).string();
+          if (san_tsan_a.empty()) {
+            FailingCommands.push_back({1, Cmd});
+            if (!Res) Res = 1;
+            return;
+          }
+        }
+      } else if (Component != "builtins") {
+        // asan, profile, fuzzer, ... — nothing else is vendored.
         llvm::errs()
-          << "bake: AddressSanitizer runtime is not vendored; "
-          "supported sanitizers are 'undefined' and 'thread'.\n"
-          "  (-fsanitize=address still instruments compile-only "
-          "invocations; the link step is rejected.)\n";
+          << "bake: sanitizer runtime '" << Component
+          << "' is not vendored; supported sanitizers are 'undefined' and "
+             "'thread'.\n"
+          << "  (-fsanitize=" << Component
+          << " still instruments compile-only invocations; the link step "
+             "is rejected.)\n";
         FailingCommands.push_back({1, Cmd});
         if (!Res) Res = 1;
         return;
       }
     }
 
-    // One call — prepares ALL runtime artifacts for this target.
-    bake::RuntimeArtifacts rt = bake::prepare_runtime(tc, IsCxx, link_mode);
+    // One call — prepares ALL runtime artifacts for this target. The C++
+    // runtime is also forced in for sanitize links: the sanitizer runtime
+    // itself uses the C++ ABI (dynamic_cast/typeinfo) and unwinder.
+    bool needs_cxx_runtime =
+        IsCxx || !san_ubsan_a.empty() || !san_tsan_a.empty();
+    bake::RuntimeArtifacts rt =
+        bake::prepare_runtime(tc, needs_cxx_runtime, link_mode);
 
     bool is_shared_lib = false;
     bool has_no_pie = false;
@@ -473,8 +524,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
 
     bool skip_next_dynamic_linker = false;
     int skip_platform_values = 0;  // remaining -platform_version values
-    bool bake_owns_platform_version =
-        is_darwin && !g_explicit_target.triple_.empty();
+    bool bake_owns_platform_version = is_darwin;
     for (const char *Arg : Cmd->getArguments()) {
       if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
         continue;
@@ -494,6 +544,37 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       if (Arg && StringRef(Arg) == "-dynamic-linker") {
         skip_next_dynamic_linker = true;
         continue;
+      }
+      // Sanitizer runtime references: swap the driver-emitted path for
+      // the archive bake built from the vendored sources. (The .c_str()
+      // pointers stay valid: san_*_a and the compiler_rt copy outlive
+      // the bake_lld_link call.)
+      if (Arg) {
+        StringRef A(Arg);
+        auto Pos = A.find("libclang_rt.");
+        if (Pos != StringRef::npos) {
+          StringRef Base = A.substr(Pos + 12);
+          auto End = Base.find('.');
+          StringRef Component = Base.substr(0, End);
+          static std::string compiler_rt_path;
+          if (Component.starts_with("ubsan")) {
+            LldArgs.push_back(san_ubsan_a.c_str());
+            continue;
+          }
+          if (Component == "tsan") {
+            LldArgs.push_back(san_tsan_a.c_str());
+            continue;
+          }
+          if (Component == "tsan_cxx") {
+            // The tsan archive already embeds the C++ reporting core.
+            continue;
+          }
+          if (Component == "builtins" && !rt.compiler_rt.string().empty()) {
+            compiler_rt_path = rt.compiler_rt.string();
+            LldArgs.push_back(compiler_rt_path.c_str());
+            continue;
+          }
+        }
       }
       if (is_mingw && Arg) {
         StringRef A(Arg);

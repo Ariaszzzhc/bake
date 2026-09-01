@@ -191,6 +191,23 @@ for arch in arm avr hexagon i386 loongarch macho_embedded ppc riscv ve wasm x86_
   rm -rf "$ROOT/lib/compiler-rt/lib/builtins/$arch"
 done
 
+# ── Sanitizer runtimes: ubsan (standalone) + tsan, with their shared
+#    bases sanitizer_common and interception. Compiled per-target from
+#    these sources by ensure_sanitizer_objects at link time. ──
+echo "==> Updating compiler-rt sanitizers"
+for d in sanitizer_common interception ubsan tsan; do
+  rm -rf "$ROOT/lib/compiler-rt/lib/$d"
+  mkdir -p "$ROOT/lib/compiler-rt/lib/$d"
+  cp -R "$LLVM_SRC/compiler-rt/lib/$d/." "$ROOT/lib/compiler-rt/lib/$d/"
+done
+# Trim test/script/build scaffolding in the sanitizer dirs only.
+for d in sanitizer_common interception ubsan tsan; do
+  find "$ROOT/lib/compiler-rt/lib/$d" -type d \
+       \( -name tests -o -name test -o -name scripts -o -name gn \) -exec rm -rf {} +
+  find "$ROOT/lib/compiler-rt/lib/$d" -type f \
+       \( -name '*.lit.cfg' -o -name 'CMakeLists.txt' -o -name 'BUILD.gn' \) -delete
+done
+
 # ═══════════════════════════════════════════════════════════════════════
 # Clang builtin headers (stdarg.h, stddef.h, intrinsics, etc.)
 # ═══════════════════════════════════════════════════════════════════════

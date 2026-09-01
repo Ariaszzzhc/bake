@@ -33,6 +33,10 @@ bake build -t x86_64-linux-gnu.2.36     # 显式版本
 
 实现方式：crt 与 `libc_nonshared.a` 从随附的 glibc 源码子集编译；libc 本体从不构建——链接期依据随附的 `abilists` 符号/版本表，为所选版本合成存根 `.so`，靠 `--as-needed` 只保留实际用到的库（hello world 的 `DT_NEEDED` 只有 `libc.so.6`）。静态链接在 gnu 目标上被拒绝（glibc 静态模式 dlopen/NSS 有已知缺陷），静态场景请使用 musl 目标。
 
+## Sanitizer 支持
+
+`bake cc` / `bake c++` 与 `bake build`（`[profile.*] sanitize = [...]`）支持 `-fsanitize=undefined`（UBSan standalone）与 `-fsanitize=thread`（TSan）：runtime 从随附的 compiler-rt 源码按目标现编（首次链接时，进入全局缓存）。目前仅支持 ELF 目标（linux-gnu / linux-musl）。`-fsanitize=address` 未随附：纯编译（`-c`）仍可插桩，链接会被拒绝并给出明确提示。
+
 ## 工作原理
 
 所有所需内容均嵌入 bake binary：

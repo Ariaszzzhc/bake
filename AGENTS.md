@@ -12,7 +12,7 @@ APIs are not frozen — make changes clean, not backward-compatible.
 # Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 19 + libc++)
 cmake -G Ninja -B build && cmake --build build
 
-# Run the test suite (64 end-to-end tests)
+# Run the test suite (66 end-to-end tests)
 ctest --test-dir build --output-on-failure
 
 # Self-host: stage 0 bake builds itself → out/bin/bake
@@ -143,7 +143,7 @@ bake/
 │   ├── fetch-darwin-headers.sh  extract macOS SDK stubs
 │   ├── fetch-mingw.sh           download MinGW-w64 v14 from GitHub
 │   ├── fetch-musl.sh            download musl source
-│   ├── fetch-linux-headers.sh   kernel UAPI headers (shared musl+gnu)
+│   ├── fetch-linux-headers.sh   kernel UAPI headers (shared musl+gnu; scsi.h/sg.h from libc6-dev)
 │   ├── fetch-glibc.sh           vendor glibc subset + abilists from upstream
 │   ├── glibc-abi-gen.py         tarball .abilist files → abilists (host-side)
 │   └── update-runtime.sh        update vendored libc++/libcxxabi/libunwind/compiler-rt
@@ -208,7 +208,39 @@ out/
 │   ├── .bmi/                 module PCMs
 │   └── .bake/                declarations, fingerprints, graph.json
 └── .bake/                    host-level (build.cpp compiled scripts)
+
+## Global Toolchain Cache
+
+Content-addressed, one directory per target triple (with version suffixes:
+`x86_64-linux-gnu.2.36` is separate from `x86_64-linux-gnu`):
+
 ```
+~/.cache/bake/
+├── .identity/                  compiler identity blocks (perf cache)
+├── .gen/                       generated std module sources
+└── <triple>/
+    ├── h/<config-hash>.txt     manifest: final digest + per-input-file
+    │                           size/mtime/digest lines (mtime hit = no rehash)
+    └── o/<final-hash>/         products: std.pcm, libc++.a, libc.a, stubs,
+                                crt, bake.build.pcm, sanitizer runtimes…
+```
+
+Config hash inputs: compiler identity + target surface lines (glibc gate
+version, darwin deployment min) + the unit list. File digests cover the
+vendored sources/headers — any vendor edit re-keys automatically; there are
+no manual bump markers. Managed by `toolchain_cache_lookup`/`finish`.
+
+## Sanitizers
+
+- Supported: `-fsanitize=undefined` (ubsan standalone) and
+  `-fsanitize=thread` — runtimes built from the vendored compiler-rt
+  sources (`lib/compiler-rt/lib/{sanitizer_common,interception,ubsan,tsan}`)
+  per ELF target (linux-gnu, linux-musl) at first link, cached like any
+  runtime product. The tsan archive embeds the ubsan reporting core.
+- `-fsanitize=address` is not vendored: compile-only invocations still
+  instrument; the link is rejected with a clear message.
+- Non-ELF targets reject sanitize links with "not supported on this
+  target yet".
 
 ## Coding Style
 

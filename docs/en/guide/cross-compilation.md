@@ -33,6 +33,10 @@ The version suffix governs both the **link surface** and the **header surface**:
 
 How: the crt objects and `libc_nonshared.a` are compiled from the vendored glibc source subset; the libc itself is never built — link-time stub `.so` files are synthesized per target version from the vendored `abilists` symbol/version table, with `--as-needed` keeping only the libraries actually used (a hello world ends up with `DT_NEEDED: libc.so.6` only). Static linking is rejected on gnu targets (glibc's static mode has known dlopen/NSS defects) — use a musl target for static builds.
 
+## Sanitizers
+
+`bake cc` / `bake c++` and `bake build` (`[profile.*] sanitize = [...]`) support `-fsanitize=undefined` (UBSan standalone) and `-fsanitize=thread` (TSan): the runtimes are compiled from the vendored compiler-rt sources per target on first link and cached globally. ELF targets only (linux-gnu / linux-musl) for now. `-fsanitize=address` is not vendored: compile-only invocations still instrument; the link is rejected with a clear message.
+
 ## How it works
 
 Everything needed is embedded in the bake binary:
