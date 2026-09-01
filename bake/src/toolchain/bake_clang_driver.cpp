@@ -61,11 +61,12 @@ module;
 
 #include <lld/Common/Driver.h>
 
-module bake.llvm;
+module bake.toolchain.llvm;
 
 import std;
 import bake.util;
-import bake.compiler;
+import bake.toolchain.target;
+import bake.toolchain.runtime;
 
 using namespace clang;
 using namespace clang::driver;
@@ -381,17 +382,15 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     LldFlavor Flavor = LldFlavor::ELF;
     bakeGetLLDInfo(Triple, LinkerName, Flavor);
 
-    // Build a bake::Toolchain matching the LLVM Triple.
-    bake::Toolchain tc;
-    tc.exe_path = bake::get_self_exe_path();
-    if (tc.exe_path.empty()) tc.exe_path = "bake";
-    tc.target = !g_explicit_target.triple_.empty()
-        ? g_explicit_target
-        : bake::detect_host_target();
+    // Target for runtime provisioning, matching the LLVM Triple.
+    bake::TargetSpec target = !g_explicit_target.triple_.empty()
+                                  ? g_explicit_target
+                                  : bake::detect_host_target();
+
 
     bool is_darwin = Flavor == LldFlavor::MACHO;
     bool is_mingw = Flavor == LldFlavor::MinGW;
-    bool is_gnu = !is_darwin && !is_mingw && tc.target.is_linux_gnu();
+    bool is_gnu = !is_darwin && !is_mingw && target.is_linux_gnu();
 
     // Parse link mode from user args.
     std::vector<std::string> user_args;
@@ -439,7 +438,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       std::string &Rt = Ref == SanRtRef::Ubsan ? san_ubsan_a : san_asan_a;
       if (Rt.empty()) {
         Rt = bake::ensure_sanitizer_objects(
-                 tc, Ref == SanRtRef::Ubsan ? bake::SanitizerKind::Ubsan
+                 target, Ref == SanRtRef::Ubsan ? bake::SanitizerKind::Ubsan
                                             : bake::SanitizerKind::Asan)
                  .string();
         if (Rt.empty()) {
@@ -456,7 +455,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     bool needs_cxx_runtime =
         IsCxx || !san_ubsan_a.empty() || !san_asan_a.empty();
     bake::RuntimeArtifacts rt =
-        bake::prepare_runtime(tc, needs_cxx_runtime, link_mode);
+        bake::prepare_runtime(target, needs_cxx_runtime, link_mode);
 
     bool is_shared_lib = false;
     bool has_no_pie = false;
@@ -545,7 +544,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
         if (A.starts_with("-l")) {
           std::string name(A.substr(2));
           if (!name.empty())
-            bake::ensure_mingw_import_lib(tc, name);
+            bake::ensure_mingw_import_lib(target, name);
         }
       }
     }

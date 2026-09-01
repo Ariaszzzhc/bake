@@ -1,15 +1,32 @@
-export module bake.engine;
+module;
+
+#include <cstdlib>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <process.h>
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
+export module bake.buildsystem.engine;
 
 import std;
 import bake.util;
-import bake.project;
-import bake.moid;
-import bake.graph;
-import bake.compiler;
+import bake.buildsystem.project;
+import bake.buildsystem.moid;
+import bake.buildsystem.graph;
+import bake.buildsystem.cmdgen;
+import bake.toolchain.target;
+import bake.toolchain.runtime;
 import nlohmann.json;
 
+
 // ============================================================
-// bake.engine — MoidDeclaration, unified DAG, executor
+// bake.buildsystem.engine — MoidDeclaration, unified DAG, executor
 //
 // Two-phase architecture:
 //   Configure: resolve inputs + merge bake.toml config → MoidDeclaration JSON
@@ -570,9 +587,578 @@ ArtifactKind terminal_artifact_kind(MoidType type) {
 
 } // anonymous namespace
 
+// ===== Configure stage: build.cpp + bake.toml → MoidDeclaration =====
+//
+// Step 2 of the pipeline (resolve → configure → build → execute):
+// for each moid, obtain its input description from default discovery
+// or build.cpp, merge the authoritative bake.toml configuration, and
+// persist one MoidDeclaration JSON under out/.bake/.
+
+namespace {
+
+Path find_bake_build_source() {
+  // 1. Source-tree layout (dev builds): <ws>/lib/bake/bake.build.cppm
+  Path ws = find_workspace_root();
+  if (!ws.string().empty()) {
+    Path p = ws / "lib" / "bake" / "bake.build.cppm";
+    if (p.is_regular_file())
+      return p;
+  }
+  // 2. Installed layout: <prefix>/lib/bake/bake.build.cppm
+  Path exe(get_self_exe_path());
+  if (!exe.string().empty()) {
+    Path prefix = exe.parent().parent();
+    Path installed = prefix / "lib" / "bake" / "bake.build.cppm";
+    if (installed.is_regular_file())
+      return installed;
+    // 3. <prefix>/share/bake/bake.build.cppm (legacy)
+    Path shared = prefix / "share" / "bake" / "bake.build.cppm";
+    if (shared.is_regular_file())
+      return shared;
+  }
+  return {};
+}
+
+class ScopedEnv {
+public:
+  ScopedEnv(std::string name, const std::string &value)
+      : name_(std::move(name)) {
+    if (const char *previous = std::getenv(name_.c_str()))
+      previous_ = previous;
+#ifdef _WIN32
+    active_ = _putenv_s(name_.c_str(), value.c_str()) == 0;
+#else
+    active_ = ::setenv(name_.c_str(), value.c_str(), 1) == 0;
+#endif
+  }
+  ScopedEnv(const ScopedEnv &) = delete;
+  ScopedEnv &operator=(const ScopedEnv &) = delete;
+  ~ScopedEnv() {
+    if (!active_)
+      return;
+#ifdef _WIN32
+    (void)_putenv_s(name_.c_str(), previous_ ? previous_->c_str() : "");
+#else
+    if (previous_)
+      (void)::setenv(name_.c_str(), previous_->c_str(), 1);
+    else
+      (void)::unsetenv(name_.c_str());
+#endif
+  }
+
+private:
+  std::string name_;
+  std::optional<std::string> previous_;
+  bool active_ = false;
+};
+
+// Serialise build options as repeated name-length:value-length:name value
+// records. Length prefixes preserve newlines and separators in string values.
+std::string serialize_options(const std::map<std::string, BuildOption> &opts) {
+  std::string out;
+  for (const auto &[name, opt] : opts) {
+    std::string value = opt.value ? "true" : "false";
+    out += std::to_string(name.size()) + ":" + std::to_string(value.size()) +
+           ":" + name + value;
+  }
+  return out;
+}
+
+nlohmann::json
+declaration_options_json(const std::map<std::string, BuildOption> &options) {
+  nlohmann::json document = nlohmann::json::object();
+  for (const auto &[name, option] : options)
+    document[name] = option.value;
+  return document;
+}
+
+std::string
+serialize_declaration_dependencies(const std::vector<MoidEdge> &edges) {
+  nlohmann::json dependencies = nlohmann::json::array();
+  for (const auto &edge : edges) {
+    nlohmann::json dep_options = nlohmann::json::array();
+    for (const auto &opt : edge.options)
+      dep_options.push_back(opt);
+    dependencies.push_back({
+        {"alias", edge.alias},
+        {"id", edge.target.value},
+        {"options", dep_options},
+    });
+  }
+  return dependencies.dump();
+}
+} // namespace
+
+// ===== build.cpp → MoidDeclaration =====
+//
+// Compiles build.cpp + bake.build.cppm into a small executable. The script
+// persists its declaration at BAKE_DECLARATION_PATH, which is then read through
+// the same strict codec used for every input declaration.
+
+MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
+                                          const Manifest &manifest,
+                                          const MoidNode &node,
+                                          const TargetSpec& target,
+                                          const Path &out_dir) {
+
+  const std::string identity_key = SHA256::hex(node.id.value).substr(0, 24);
+
+  // build.cpp runs on the host — always use a native toolchain.
+  TargetSpec native_target = detect_host_target();
+
+  // Native std modules (cached separately from cross-target modules).
+  ModuleFileMap prebuilt_modules = ensure_std_modules(native_target, out_dir);
+
+  // Project-local scripts dir: only build.o and build_app live here.
+  Path scripts_dir = out_dir / ".bake" / "scripts" / identity_key;
+  scripts_dir.mkdir_recursive();
+
+  Path wrapper_src = find_bake_build_source();
+  if (wrapper_src.string().empty()) {
+    std::println(std::cerr, "bake: cannot find bake.build.cppm");
+    std::exit(1);
+  }
+
+  // Global cache dir for bake.build.pcm + bake.build.o.
+  auto cache_info = bake_build_cache_info(native_target, wrapper_src);
+  Path build_cache_dir = cache_info.dir / "bake.build";
+  build_cache_dir.mkdir_recursive();
+
+  // Copy wrapper into the cache dir (so it's self-contained and the
+  // -I flag resolves correctly for the compiler).
+  Path wrapper_dst = build_cache_dir / "bake.build.cppm";
+  if (auto content = read_file(wrapper_src))
+    write_file(wrapper_dst, *content);
+
+  // Helper: append valid std-module file flags.
+  auto append_std_flags = [&](std::vector<std::string> &cmd) {
+    for (auto &[name, pcm] : prebuilt_modules) {
+      if (!pcm.string().empty() && pcm.is_regular_file())
+        cmd.push_back("-fmodule-file=" + name + "=" + pcm.string());
+    }
+  };
+
+  // Step 1: Compile bake.build.cppm → PCM + .o  (global cache)
+  Path pcm = build_cache_dir / "bake.build.pcm";
+  Path wrapper_o = build_cache_dir / "bake.build.o";
+
+  if (!pcm.is_regular_file() || !wrapper_o.is_regular_file()) {
+    // Atomic compile: write to temp names, then rename into place.
+    std::string pid = std::to_string(
+#ifdef _WIN32
+        _getpid()
+#else
+        getpid()
+#endif
+    );
+    Path tmp_pcm = Path(pcm.string() + "." + pid + ".tmp");
+    Path tmp_o = Path(wrapper_o.string() + "." + pid + ".tmp");
+
+    std::vector<std::string> cmd;
+    cmd.push_back(bake_exe_path());
+    cmd.push_back("c++");
+    cmd.push_back("-c");
+    cmd.push_back("-std=c++23");
+    cmd.push_back("-stdlib=libc++");
+    cmd.push_back("-Wno-reserved-module-identifier");
+    cmd.push_back("-x");
+    cmd.push_back("c++-module");
+    cmd.push_back("-I" + build_cache_dir.string());
+    append_std_flags(cmd);
+    cmd.push_back("-fmodule-output=" + tmp_pcm.string());
+    cmd.push_back(wrapper_dst.string());
+    cmd.push_back("-o");
+    cmd.push_back(tmp_o.string());
+
+    auto result = run_process(cmd, moid_dir, true);
+    if (!result.success()) {
+      std::print(std::cerr, "{}", result.stderr_output);
+      std::println(std::cerr, "bake: failed to compile bake.build.cppm");
+      tmp_pcm.remove();
+      tmp_o.remove();
+      std::exit(1);
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_pcm.string(), pcm.string(), ec);
+    std::filesystem::rename(tmp_o.string(), wrapper_o.string(), ec);
+    // If rename failed because another process won the race, the
+    // final files exist and we're fine.
+  }
+
+  // Step 2: Compile build.cpp → .o  (project-local)
+  Path build_cpp = moid_dir / "build.cpp";
+  Path build_o = scripts_dir / "build.o";
+  {
+    std::vector<std::string> cmd;
+    cmd.push_back(bake_exe_path());
+    cmd.push_back("c++");
+    cmd.push_back("-c");
+    cmd.push_back("-std=c++23");
+    cmd.push_back("-stdlib=libc++");
+    cmd.push_back("-Wno-reserved-module-identifier");
+    cmd.push_back("-I" + build_cache_dir.string());
+    append_std_flags(cmd);
+    cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
+    cmd.push_back(build_cpp.string());
+    cmd.push_back("-o");
+    cmd.push_back(build_o.string());
+
+    auto result = run_process(cmd, moid_dir, true);
+    if (!result.success()) {
+      std::print(std::cerr, "{}", result.stderr_output);
+      std::println(std::cerr, "bake: failed to compile build.cpp");
+      std::exit(1);
+    }
+  }
+
+  // Step 3: Link → build_app (project-local; only needs std, no bake library)
+  // libc++ injection is handled by the driver (bakeExecuteJob).
+  Path build_app = scripts_dir / "build_app";
+  {
+    std::vector<std::string> cmd;
+    cmd.push_back(bake_exe_path());
+    cmd.push_back("c++");
+    cmd.push_back(wrapper_o.string());
+    cmd.push_back(build_o.string());
+    cmd.push_back("-o");
+    cmd.push_back(build_app.string());
+
+    auto result = run_process(cmd, moid_dir, true);
+    if (!result.success()) {
+      std::print(std::cerr, "{}", result.stderr_output);
+      std::println(std::cerr, "bake: failed to link build_app");
+      std::exit(1);
+    }
+  }
+
+  // Step 4: Run build_app, then read its persisted declaration.
+  const auto &options = node.declaration.options;
+  std::string opts_str = serialize_options(options);
+  std::string declaration_options = declaration_options_json(options).dump();
+  std::string declaration_dependencies =
+      serialize_declaration_dependencies(node.dependencies);
+  std::string deps_str;
+  for (auto &[dep_name, dep] : manifest.dependencies) {
+    if (dep.is_path_dep) {
+      Path dep_dir = (moid_dir / dep.path).lexically_normal();
+      deps_str += dep_name + "=" + dep_dir.absolute().string() + "\n";
+    }
+  }
+  // Non-moid source deps resolved by the graph (remote archives, raw
+  // path dirs) — their source directories are needed by build.cpp.
+  for (auto &[alias, dir] : node.source_deps) {
+    deps_str += alias + "=" + dir + "\n";
+  }
+
+  Path declaration_path = moid_declaration_path(out_dir, node.id.value);
+  if (declaration_path.exists())
+    declaration_path.remove();
+
+  std::string self = get_self_exe_path();
+  {
+    ScopedEnv source_env("BAKE_SOURCE_DIR", node.declaration.root);
+    ScopedEnv build_env("BAKE_BUILD_DIR", out_dir.absolute().string());
+    ScopedEnv id_env("BAKE_MOID_ID", node.id.value);
+    ScopedEnv name_env("BAKE_MOID_NAME", manifest.moid->name);
+    ScopedEnv version_env("BAKE_MOID_VERSION", manifest.moid->version);
+    ScopedEnv type_env("BAKE_MOID_TYPE",
+                       std::string(moid_type_str(manifest.moid->type)));
+    ScopedEnv cxx_std_env("BAKE_MOID_CXX_STD", manifest.moid->cxx_std);
+    ScopedEnv c_std_env("BAKE_MOID_C_STD", manifest.moid->c_std);
+    ScopedEnv declaration_env("BAKE_DECLARATION_PATH",
+                              declaration_path.string());
+    ScopedEnv options_env("BAKE_OPTIONS", opts_str);
+    ScopedEnv declaration_options_env("BAKE_DECLARATION_OPTIONS",
+                                      declaration_options);
+    ScopedEnv declaration_dependencies_env("BAKE_DECLARATION_DEPENDENCIES",
+                                           declaration_dependencies);
+    ScopedEnv dependencies_env("BAKE_DEPS", deps_str);
+    ScopedEnv executable_env("BAKE_EXE", self);
+    ScopedEnv target_env("BAKE_TARGET",
+                         target.is_native() ? "" : target.triple());
+
+    // Do not capture stdout/stderr: declaration transport uses the file,
+    // so build scripts retain their normal user-facing streams.
+    auto result = run_process({build_app.string()}, moid_dir, false);
+    if (!result.success()) {
+      std::println(std::cerr, "bake: build_app failed");
+      std::exit(1);
+    }
+
+    auto declaration = read_moid_declaration(declaration_path);
+    if (!declaration) {
+      std::println(std::cerr, "bake: {}", declaration.error());
+      std::exit(1);
+    }
+    return std::move(*declaration);
+  }
+}
+
+namespace {
+
+// Merge bake.toml configuration (profile, target conditions, options, link)
+// into a declaration. Called after obtaining the input description from
+// either default discovery or build.cpp.
+void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
+                           const TargetSpec& target,
+                           const std::string &profile_name) {
+  // Language standards — manifest is the sole source of truth.
+  decl.cxx_std = manifest.moid->cxx_std;
+  decl.c_std = manifest.moid->c_std;
+
+  // Profile → flags / link_flags / defines
+  auto profile = manifest.resolve_profile(profile_name);
+  bool is_release = (profile_name == "release");
+  auto resolved = resolve_profile_flags(profile, is_release);
+
+  decl.compile_flags = resolved.compile_flags;
+  decl.link_flags = resolved.link_flags;
+
+  // Target conditions (specificity-sorted: broad first, exact last)
+  std::string current_triple =
+      target.is_native() ? detect_host_target().triple_ : target.triple_;
+
+  struct TargetMatch {
+    const TargetCondition *cond;
+    int wc;
+  };
+  std::vector<TargetMatch> matches;
+  for (const auto &tgt : manifest.targets)
+    if (triple_matches(current_triple, tgt.triple_pattern))
+      matches.push_back(
+          {&tgt, static_cast<int>(std::count(tgt.triple_pattern.begin(),
+                                             tgt.triple_pattern.end(), '*'))});
+
+  std::sort(
+      matches.begin(), matches.end(),
+      [](const TargetMatch &a, const TargetMatch &b) { return a.wc > b.wc; });
+
+  std::vector<std::string> tgt_flags, tgt_libs, tgt_frameworks, tgt_defines,
+      tgt_includes;
+  for (const auto &match : matches) {
+    for (auto &f : match.cond->flags)
+      tgt_flags.push_back(f);
+    for (auto &l : match.cond->libraries)
+      tgt_libs.push_back(l);
+    for (auto &d : match.cond->defines)
+      tgt_defines.push_back(d);
+    for (auto &i : match.cond->include_dirs)
+      tgt_includes.push_back(i);
+    if (target.is_darwin())
+      for (auto &f : match.cond->frameworks)
+        tgt_frameworks.push_back(f);
+  }
+  for (auto &f : tgt_flags)
+    decl.compile_flags.push_back(f);
+
+  // Defines: option macros + package macros + profile defines + target defines
+  decl.compile_defines.clear();
+  for (auto &[k, v] : generate_option_macros(decl.name, decl.options))
+    decl.compile_defines.push_back({k, v});
+  for (auto &[k, v] : generate_package_macros(decl.name, decl.version))
+    decl.compile_defines.push_back({k, v});
+  for (auto &[k, v] : resolved.defines)
+    decl.compile_defines.push_back({k, v});
+  for (auto &d : tgt_defines) {
+    auto eq = d.find('=');
+    decl.compile_defines.push_back(
+        eq != std::string::npos ? std::pair{d.substr(0, eq), d.substr(eq + 1)}
+                                : std::pair{d, std::string{}});
+  }
+
+  for (auto &i : tgt_includes)
+    decl.extra_include_dirs.push_back(i);
+
+  // Libraries + frameworks: [link] + matching [target.*]
+  decl.libraries.clear();
+  decl.frameworks.clear();
+  if (manifest.link) {
+    for (auto &l : manifest.link->libraries)
+      decl.libraries.push_back(l);
+    for (auto &f : manifest.link->frameworks)
+      decl.frameworks.push_back(f);
+  }
+  for (auto &l : tgt_libs)
+    decl.libraries.push_back(l);
+  for (auto &f : tgt_frameworks)
+    decl.frameworks.push_back(f);
+}
+
+std::expected<void, std::string>
+validate_resolved_declaration(const MoidDeclaration &declaration,
+                              const MoidNode &node) {
+  // The manifest is authoritative for type and name.
+  // build.cpp cannot override these.
+  if (declaration.type != node.declaration.type) {
+    return std::unexpected("build.cpp declared type '" +
+                           std::string(moid_type_str(declaration.type)) +
+                           "' but bake.toml declares type '" +
+                           std::string(moid_type_str(node.declaration.type)) +
+                           "' for moid '" + node.declaration.name + "'");
+  }
+  if (declaration.name != node.declaration.name) {
+    return std::unexpected("build.cpp declared name '" + declaration.name +
+                           "' but bake.toml declares name '" +
+                           node.declaration.name + "' for moid '" +
+                           node.declaration.name + "'");
+  }
+  if (declaration.id != node.id.value) {
+    return std::unexpected("moid declaration field 'id' does not match "
+                           "resolved identity for moid '" +
+                           node.declaration.name + "'");
+  }
+  if (declaration.root != node.declaration.root) {
+    return std::unexpected("moid declaration field 'root' does not match "
+                           "resolved root for moid '" +
+                           node.declaration.name + "'");
+  }
+  if (declaration.version != node.declaration.version) {
+    return std::unexpected("moid declaration field 'version' does not match "
+                           "resolved version for moid '" +
+                           node.declaration.name + "'");
+  }
+  if (declaration.options != node.declaration.options) {
+    return std::unexpected("moid declaration field 'options' does not match "
+                           "resolved options for moid '" +
+                           node.declaration.name + "'");
+  }
+  if (declaration.dependencies.size() != node.declaration.dependencies.size()) {
+    return std::unexpected("moid declaration field 'dependencies' does not "
+                           "match resolved dependencies for moid '" +
+                           node.declaration.name + "'");
+  }
+  for (std::size_t i = 0; i < declaration.dependencies.size(); ++i) {
+    const auto &actual = declaration.dependencies[i];
+    const auto &expected = node.declaration.dependencies[i];
+    if (actual.alias != expected.alias || actual.id != expected.id ||
+        actual.options != expected.options) {
+      return std::unexpected("moid declaration field 'dependencies' does not "
+                             "match resolved dependencies for moid '" +
+                             node.declaration.name + "'");
+    }
+  }
+  return {};
+}
+
+} // namespace
+
+export std::expected<void, std::string>
+configure_moid_graph(MoidGraph &graph, const TargetSpec& target, const Path &out_dir,
+                     const Path &project_root,
+                     const std::string &profile_name) {
+
+  auto topology = configuration_topological_moids(graph);
+  if (!topology)
+    return std::unexpected(topology.error());
+
+  (out_dir / ".bake").mkdir_recursive();
+
+  for (const auto &id : *topology) {
+    auto &node = graph.nodes.at(id);
+    const Path moid_dir(node.declaration.root);
+
+    // 1. Load manifest (single source of configuration truth)
+    auto manifest = Manifest::load(moid_dir);
+    if (!manifest || !manifest->has_moid()) {
+      return std::unexpected("failed to load manifest for moid '" +
+                             node.declaration.name + "'");
+    }
+
+    // 2. Get input description (sources, public headers, prebuilt libs)
+    MoidDeclaration declaration;
+    if ((moid_dir / "build.cpp").is_regular_file()) {
+      // Cache: skip build.cpp compilation if inputs unchanged
+      Path decl_path = moid_declaration_path(out_dir, node.id.value);
+      bool cache_hit = false;
+      if (decl_path.is_regular_file()) {
+        namespace fs = std::filesystem;
+        auto decl_time = fs::last_write_time(decl_path.fs());
+        auto inputs_older = [&]() {
+          if (fs::last_write_time((moid_dir / "build.cpp").fs()) > decl_time)
+            return false;
+          Path toml = moid_dir / "bake.toml";
+          if (toml.is_regular_file() &&
+              fs::last_write_time(toml.fs()) > decl_time)
+            return false;
+          Path wrapper = find_bake_build_source();
+          if (wrapper.is_regular_file() &&
+              fs::last_write_time(wrapper.fs()) > decl_time)
+            return false;
+          return true;
+        };
+        if (inputs_older()) {
+          if (auto cached = read_moid_declaration(decl_path)) {
+            if (validate_resolved_declaration(*cached, node)) {
+              declaration = std::move(*cached);
+              cache_hit = true;
+            }
+          }
+        }
+      }
+      if (!cache_hit)
+        declaration =
+            compile_and_run_build_cpp(moid_dir, *manifest, node, target, out_dir);
+    } else {
+      // Default: scan src/ + public/
+      auto layout = Layout::detect(moid_dir);
+      declaration = declare_default_inputs(*manifest, layout, node.id.value,
+                                           node.declaration.options,
+                                           node.declaration.dependencies);
+    }
+
+    // Incremental mode: a build.cpp that describes no main-moid inputs
+    // (only binaries, tests, or prebuilt libs) keeps default input
+    // discovery for the main moid.
+    if ((moid_dir / "build.cpp").is_regular_file() &&
+        declaration.sources.empty() &&
+        declaration.public_include_dirs.empty()) {
+      auto layout = Layout::detect(moid_dir);
+      auto discovered = declare_default_inputs(
+          *manifest, layout, node.id.value, node.declaration.options,
+          node.declaration.dependencies);
+      declaration.sources = std::move(discovered.sources);
+      declaration.public_include_dirs =
+          std::move(discovered.public_include_dirs);
+    }
+
+    // 3. Merge bake.toml configuration
+    merge_manifest_config(declaration, *manifest, target, profile_name);
+
+    // 4. Validate
+    auto validated = validate_resolved_declaration(declaration, node);
+    if (!validated)
+      return std::unexpected(validated.error());
+
+    // 5. Persist (once — after merge)
+    Path decl_path = moid_declaration_path(out_dir, node.id.value);
+    auto written = write_moid_declaration(decl_path, declaration);
+    if (!written)
+      return std::unexpected(written.error());
+
+    node.declaration = std::move(declaration);
+
+    // Executable moids cannot be dependencies
+    if (node.declaration.type != MoidType::Executable)
+      continue;
+    for (const auto &[_, consumer] : graph.nodes) {
+      for (const auto &edge : consumer.dependencies) {
+        if (edge.target != id)
+          continue;
+        return std::unexpected("moid '" + consumer.declaration.name +
+                               "' cannot use executable moid '" +
+                               node.declaration.name +
+                               "' as a normal dependency");
+      }
+    }
+  }
+
+  return {};
+}
+
 export std::expected<BuildGraph, std::string> build_graph(
         const MoidGraph& outer_graph,
-        const Toolchain& tc,
+        const TargetSpec& target,
         const Path& out_dir,
         const Path& project_root,
         const ModuleFileMap& prebuilt_modules) {
@@ -723,7 +1309,7 @@ export std::expected<BuildGraph, std::string> build_graph(
                     "reserved device name");
             }
 
-            std::string out_name = library_name(decl.name, rm.type, tc.target);
+            std::string out_name = library_name(decl.name, rm.type, target);
             rm.output = (rm.type == MoidType::Executable)
                 ? out_dir / "bin" / out_name
                 : out_dir / "lib" / out_name;
@@ -1146,7 +1732,7 @@ export std::expected<BuildGraph, std::string> build_graph(
         for (auto& [_, dep_pcm] : cc.module_deps)
             action.inputs.push_back(dep_pcm);
         action.outputs = {obj, pcm};
-        action.command = make_compile_command(tc, cc);
+        action.command = make_compile_command(target, cc);
 
         for (const auto& dependency : module_dependencies[module_key]) {
             auto dependency_action = module_actions.find(dependency);
@@ -1263,7 +1849,7 @@ export std::expected<BuildGraph, std::string> build_graph(
             for (auto& [_, dep_pcm] : cc.module_deps)
                 action.inputs.push_back(dep_pcm);
             action.outputs = {obj};
-            action.command = make_compile_command(tc, cc);
+            action.command = make_compile_command(target, cc);
 
             for (const auto& provider :
                  module_provider_closure(consumer_roots)) {
@@ -1411,7 +1997,7 @@ export std::expected<BuildGraph, std::string> build_graph(
             ArchiveCommand archive;
             archive.objects = paths_for(command_objects);
             archive.output = rm.output;
-            action.command = make_archive_command(tc, archive);
+            action.command = make_archive_command(target, archive);
 
             exports.terminal = terminal;
             exports.link.objects.clear();
@@ -1445,7 +2031,7 @@ export std::expected<BuildGraph, std::string> build_graph(
             link.system_libraries = requirements.system_libraries;
             link.frameworks = requirements.frameworks;
             link.extra_flags = rm.decl->link_flags;
-            action.command = make_link_command(tc, link);
+            action.command = make_link_command(target, link);
 
             exports.terminal = terminal;
             exports.link.objects.clear();

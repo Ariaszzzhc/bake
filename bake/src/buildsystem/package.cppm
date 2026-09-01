@@ -1,12 +1,12 @@
-export module bake.package;
+export module bake.buildsystem.package;
 
 import std;
 import bake.util;
-import bake.project;
+import bake.buildsystem.project;
 import nlohmann.json;
 
 // ============================================================
-// bake.package — Resolver, Fetcher, Cache
+// bake.buildsystem.package — Resolver, Fetcher, Cache
 // ============================================================
 
 namespace bake {
@@ -58,8 +58,8 @@ private:
 };
 
 // compute_tree_sha256 is exported below (as a free function) for use by
-// the CLI layer's cache verification. It lives here because bake.engine
-// does NOT import bake.package, so new exports here don't trigger the
+// the CLI layer's cache verification. It lives here because bake.buildsystem.engine
+// does NOT import bake.buildsystem.package, so new exports here don't trigger the
 // clang 22 module deserialization crash in self-bootstrap.
 
 export inline std::string compute_tree_sha256(const Path& dir) {

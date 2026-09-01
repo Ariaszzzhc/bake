@@ -1,11 +1,11 @@
-// bake.llvm — LLVM/Clang/LLD bridge module interface.
+// bake.toolchain.llvm — LLVM/Clang/LLD bridge module interface.
 //
 // Exposes functions implemented across multiple module implementation units
 // (bake_llvm.cpp, bake_clang_driver.cpp, bake_clang_cc1_main.cpp,
 // bake_clang_cc1as_main.cpp). All signatures use built-in or LLVM-opaque
 // types, so consumers never need to include LLVM headers.
 
-export module bake.llvm;
+export module bake.toolchain.llvm;
 
 import std;
 
@@ -29,6 +29,3 @@ export int bake_ar_write(const char *archive_name,
 
 // Clang driver entry point (bake cc / bake c++).
 export int bake_clang_main(int argc, const char **argv);
-
-// Returns 1 (LLVM support is always compiled in).
-export int bake_has_llvm();

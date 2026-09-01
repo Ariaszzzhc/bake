@@ -59,7 +59,7 @@ module;
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 
-module bake.llvm;
+module bake.toolchain.llvm;
 
 import std;
 

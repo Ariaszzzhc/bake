@@ -1,9 +1,9 @@
-export module bake.graph;
+export module bake.buildsystem.graph;
 
 import std;
 import bake.util;
-import bake.project;
-import bake.moid;
+import bake.buildsystem.project;
+import bake.buildsystem.moid;
 
 namespace bake {
 

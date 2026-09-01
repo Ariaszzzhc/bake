@@ -1,8 +1,8 @@
-export module bake.moid;
+export module bake.buildsystem.moid;
 
 import std;
 import bake.util;
-import bake.project;
+import bake.buildsystem.project;
 import nlohmann.json;
 
 namespace bake {
@@ -56,6 +56,12 @@ export struct MoidDeclaration {
     // Named test mappings onto declared binaries
     std::vector<TestRegistration> tests;
 };
+
+// Persisted-declaration store: out_dir/.bake/<identity-key>.moid.json.
+export Path moid_declaration_path(const Path& out_dir, std::string_view id) {
+    const std::string identity_key = SHA256::hex(id).substr(0, 24);
+    return out_dir / ".bake" / (identity_key + ".moid.json");
+}
 
 namespace {
 

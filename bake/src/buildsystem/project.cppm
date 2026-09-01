@@ -1,4 +1,4 @@
-export module bake.project;
+export module bake.buildsystem.project;
 
 import std;
 import bake.util;
@@ -6,7 +6,7 @@ import tomlplusplus;
 import nlohmann.json;
 
 // ============================================================
-// bake.project — bake.toml model, layout, project discovery
+// bake.buildsystem.project — bake.toml model, layout, project discovery
 // ============================================================
 
 namespace bake {
@@ -663,14 +663,6 @@ export Path get_cache_dir() {
     if (!home) home = "/tmp";
     return Path(home) / ".cache" / "bake" / "src";
 #endif
-}
-
-// Get the root of the global toolchain cache (content-addressed).
-// Honours BAKE_CACHE_DIR for testing; defaults to ~/.cache/bake.
-export Path get_toolchain_cache_root() {
-    if (const char* env = std::getenv("BAKE_CACHE_DIR"))
-        if (env[0] != '\0') return Path(env);
-    return get_cache_dir().parent();
 }
 
 } // namespace bake

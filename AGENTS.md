@@ -41,11 +41,11 @@ glibc targets default to version 2.28; pick another with a triple suffix
 newest glibc). gnu is dynamic-only — static builds are rejected with musl
 guidance.
 
-The dispatch chain in `bake.compiler.cppm`:
+The dispatch chain in `bake.toolchain.runtime`:
 
 1. `resolve_libc_family(target)` → `LibcFamily` (`Darwin`, `Musl`, `Windows`, `Gnu`, `None`)
-2. `prepare_runtime(tc)` → calls the right `ensure_*_objects()` builder
-3. `make_compile_command()` / `make_link_command()` → target-specific flags
+2. `prepare_runtime(target)` → calls the right `ensure_*_objects()` builder
+3. `make_compile_command()` / `make_link_command()` (`bake.buildsystem.cmdgen`) → target-specific flags
 4. LLD flavor selected in `bake_clang_driver.cpp` (`Darwin`, `COFF/MinGW`, `GNU`)
 
 Each libc family is self-contained:
@@ -109,19 +109,23 @@ bake/
 │   ├── bake.toml
 │   ├── build.cpp           self-hosting build script
 │   └── src/
-│       ├── main.cpp             import bake.cli; → bake::cli::main()
-│       ├── cli.cppm             CLI dispatch (init/build/add/update/run/clean/test)
-│       ├── bake.util.cppm       Path, SHA-256, glob, process spawn
-│       ├── bake.project.cppm    Manifest, Lockfile, layout
-│       ├── bake.compiler.cppm   Toolchain, compile/link commands, runtime builders
-│       ├── bake.moid.cppm       MoidDeclaration model, JSON codec
-│       ├── bake.graph.cppm      MoidGraph, dependency resolution
-│       ├── bake.engine.cppm     Source discovery, module scan, DAG, executor
-│       ├── bake.package.cppm    Resolver, Fetcher, Cache, lockfile
-│       └── compiler/            in-process LLVM/Clang/LLD
-│           ├── bake_llvm.cpp          LLVM init, in-process LLD
-│           ├── bake_clang_driver.cpp  Clang driver shim
-│           └── bake_clang_cc1_main.cpp
+│       ├── main.cpp             composition root: multicall dispatch + build commands
+│       ├── bake.util.cppm       Path, SHA-256, glob, process spawn, bake_exe_path
+│       ├── toolchain/           bake.toolchain.* — the embedded toolchain (mechanism)
+│       │   ├── target.cppm                TargetSpec, triple parsing/matching
+│       │   ├── llvm.cppm                  Clang/LLD bridge (interface)
+│       │   ├── runtime.cppm               ensure_* runtime builders, toolchain cache
+│       │   ├── bake_llvm.cpp               LLVM init, in-process LLD/ar
+│       │   ├── bake_clang_driver.cpp       Clang driver shim (bake cc / bake c++)
+│       │   ├── bake_clang_cc1_main.cpp     cc1 frontend
+│       │   └── bake_clang_cc1as_main.cpp   integrated assembler frontend
+│       └── buildsystem/         bake.buildsystem.* — the build system (policy)
+│           ├── project.cppm               Manifest, Lockfile, layout
+│           ├── cmdgen.cppm                build intent → compiler argv/flags/macros
+│           ├── moid.cppm                  MoidDeclaration model, JSON codec
+│           ├── graph.cppm                 MoidGraph, dependency resolution
+│           ├── engine.cppm                configure, source discovery, DAG, executor
+│           └── package.cppm               Resolver, Fetcher, Cache, lockfile
 ├── lib/                   vendored runtime (distributed with bake)
 │   ├── bake/                    bake.build.cppm (build.cpp API)
 │   ├── libcxx/                  libc++ (include/, src/, modules/)
@@ -257,8 +261,8 @@ no manual bump markers. Managed by `toolchain_cache_lookup`/`finish`.
 - **C++23**, strict standard (`CMAKE_CXX_EXTENSIONS OFF`), Clang + libc++.
 - **`import std;`** — all standard library access via `import std;`, not `#include`. The only `#include` in module files are platform/OS headers (`<errno.h>`, `<sys/wait.h>`, `<windows.h>`) in the **global module fragment** (`module;` before `export module`).
 - **I/O**: `std::println(...)` for stdout, `std::println(std::cerr, ...)` for stderr. `{}` format placeholders, not printf. No `fprintf`/`printf`/bare `stderr`/`stdout`.
-- **Module naming**: `bake.<subsystem>`, file name mirrors module (`bake.<name>.cppm`).
-- **Module chain**: `bake.util` → `bake.project` → `bake.compiler` → `bake.moid` / `bake.graph` → `bake.engine` / `bake.package` → `bake.cli`.
+- **Module naming**: `bake.<scope>.<name>` with two scopes — `bake.toolchain.*` (the embedded toolchain: mechanism, must never import `bake.buildsystem.*`) and `bake.buildsystem.*` (build system: policy, may import `bake.toolchain.*`). Inside a scope directory the file carries only the leaf name (`toolchain/target.cppm` → module `bake.toolchain.target`); the unscoped `bake.util.cppm` keeps its full name at src/ root, as does `bake.build` (downstream build.cpp API).
+- **Module chain**: `bake.util` → { `bake.toolchain.target`, `bake.buildsystem.project` } → `bake.toolchain.llvm` → `bake.buildsystem.cmdgen` → `bake.toolchain.runtime` → `bake.buildsystem.moid` / `bake.buildsystem.graph` → `bake.buildsystem.engine` / `bake.buildsystem.package` → `main.cpp` (composition root, no CLI module). The two scopes meet only at `TargetSpec` + plain argv strings.
 - **User-facing output uses `macos`** not `darwin` for platform names.
 - **Commit messages**: conventional commits, subject-only ≤ 50 chars. Describe what changed, not why.
 

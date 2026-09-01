@@ -1,7 +1,7 @@
 /*
  * bake_llvm.cpp — LLVM/LLD/AR bridge: module implementation unit.
  *
- * LLVM headers go in the global module fragment (before `module bake.llvm;`)
+ * LLVM headers go in the global module fragment (before `module bake.toolchain.llvm;`)
  * — same pattern every bake module uses for non-modular headers.
  */
 
@@ -20,7 +20,7 @@ LLD_HAS_DRIVER(macho)
 LLD_HAS_DRIVER(mingw)
 LLD_HAS_DRIVER(wasm)
 
-module bake.llvm;
+module bake.toolchain.llvm;
 
 import std;
 
@@ -90,8 +90,4 @@ int bake_ar_write(const char *archive_name,
     }
 
     return 0;
-}
-
-int bake_has_llvm() {
-    return 1;
 }

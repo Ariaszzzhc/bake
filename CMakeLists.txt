@@ -69,10 +69,10 @@ target_include_directories(nlohmann_json INTERFACE
 
 add_executable(bake
     bake/src/main.cpp
-    bake/src/compiler/bake_llvm.cpp
-    bake/src/compiler/bake_clang_driver.cpp
-    bake/src/compiler/bake_clang_cc1_main.cpp
-    bake/src/compiler/bake_clang_cc1as_main.cpp
+    bake/src/toolchain/bake_llvm.cpp
+    bake/src/toolchain/bake_clang_driver.cpp
+    bake/src/toolchain/bake_clang_cc1_main.cpp
+    bake/src/toolchain/bake_clang_cc1as_main.cpp
 )
 
 target_sources(bake
@@ -82,14 +82,15 @@ target_sources(bake
             third_party/nlohmann/public/nlohmann.json.cppm
             third_party/tomlplusplus/public/tomlplusplus.cppm
             bake/src/bake.util.cppm
-            bake/src/bake.project.cppm
-            bake/src/bake.moid.cppm
-            bake/src/bake.graph.cppm
-            bake/src/compiler/bake.llvm.cppm
-            bake/src/bake.compiler.cppm
-            bake/src/bake.engine.cppm
-            bake/src/bake.package.cppm
-            bake/src/cli.cppm
+            bake/src/buildsystem/project.cppm
+            bake/src/buildsystem/moid.cppm
+            bake/src/buildsystem/graph.cppm
+            bake/src/toolchain/llvm.cppm
+            bake/src/toolchain/target.cppm
+            bake/src/buildsystem/cmdgen.cppm
+            bake/src/toolchain/runtime.cppm
+            bake/src/buildsystem/engine.cppm
+            bake/src/buildsystem/package.cppm
 )
 
 target_compile_features(bake PRIVATE cxx_std_23)
@@ -186,9 +187,9 @@ target_sources(graph_test
             third_party/nlohmann/public/nlohmann.json.cppm
             third_party/tomlplusplus/public/tomlplusplus.cppm
             bake/src/bake.util.cppm
-            bake/src/bake.project.cppm
-            bake/src/bake.moid.cppm
-            bake/src/bake.graph.cppm
+            bake/src/buildsystem/project.cppm
+            bake/src/buildsystem/moid.cppm
+            bake/src/buildsystem/graph.cppm
 )
 
 add_test(

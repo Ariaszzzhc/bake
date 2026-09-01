@@ -65,7 +65,7 @@ module;
 #include <sys/resource.h>
 #endif
 
-module bake.llvm;
+module bake.toolchain.llvm;
 
 import std;
 

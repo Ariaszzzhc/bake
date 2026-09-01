@@ -1,6 +1,6 @@
 import std;
-import bake.graph;
-import bake.moid;
+import bake.buildsystem.graph;
+import bake.buildsystem.moid;
 
 namespace {
 

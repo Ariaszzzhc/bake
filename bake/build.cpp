@@ -46,19 +46,20 @@ int main() {
 
     b.sources({
         "src/bake.util.cppm",
-        "src/bake.project.cppm",
-        "src/bake.moid.cppm",
-        "src/bake.graph.cppm",
-        "src/compiler/bake.llvm.cppm",
-        "src/bake.compiler.cppm",
-        "src/bake.engine.cppm",
-        "src/bake.package.cppm",
-        "src/cli.cppm",
+        "src/buildsystem/project.cppm",
+        "src/buildsystem/moid.cppm",
+        "src/buildsystem/graph.cppm",
+        "src/toolchain/llvm.cppm",
+        "src/toolchain/target.cppm",
+        "src/buildsystem/cmdgen.cppm",
+        "src/toolchain/runtime.cppm",
+        "src/buildsystem/engine.cppm",
+        "src/buildsystem/package.cppm",
     });
-    b.sources("src/compiler/bake_llvm.cpp");
-    b.sources("src/compiler/bake_clang_cc1_main.cpp");
-    b.sources("src/compiler/bake_clang_cc1as_main.cpp");
-    b.sources("src/compiler/bake_clang_driver.cpp");
+    b.sources("src/toolchain/bake_llvm.cpp");
+    b.sources("src/toolchain/bake_clang_cc1_main.cpp");
+    b.sources("src/toolchain/bake_clang_cc1as_main.cpp");
+    b.sources("src/toolchain/bake_clang_driver.cpp");
     b.sources("src/main.cpp");
     b.include_dirs({
         llvm_include,

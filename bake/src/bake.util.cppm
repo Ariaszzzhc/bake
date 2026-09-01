@@ -438,6 +438,15 @@ export inline std::string get_self_exe_path() {
 #endif
 }
 
+// Path to the bake binary used to spawn cc/c++/ar driver invocations.
+// BAKE_EXE (set for build_app subprocesses) wins over the real self path.
+export inline std::string bake_exe_path() {
+    if (const char* exe = std::getenv("BAKE_EXE"))
+        return exe;
+    std::string path = get_self_exe_path();
+    return path.empty() ? "bake" : path;
+}
+
 // ===== Runtime resource path resolution =====
 //
 // All paths are resolved at runtime relative to the executable, eliminating
