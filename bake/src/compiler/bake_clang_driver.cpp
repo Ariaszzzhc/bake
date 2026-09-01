@@ -366,7 +366,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     // from the vendored compiler-rt sources. Components without a vendored
     // runtime are rejected with a clear message (compilation/instrumenting
     // still works — only the link is rejected).
-    std::string san_ubsan_a, san_tsan_a, san_asan_a;
+    std::string san_ubsan_a, san_asan_a;
     for (const char *Arg : Cmd->getArguments()) {
       if (!Arg) continue;
       StringRef A(Arg);
@@ -388,23 +388,6 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
           san_ubsan_a = bake::ensure_sanitizer_objects(
               tc, bake::SanitizerKind::Ubsan).string();
           if (san_ubsan_a.empty()) {
-            FailingCommands.push_back({1, Cmd});
-            if (!Res) Res = 1;
-            return;
-          }
-        }
-      } else if (Component == "tsan" || Component == "tsan_cxx") {
-        if (!is_elf) {
-          llvm::errs() << "bake: -fsanitize=thread is not supported on "
-                          "this target yet.\n";
-          FailingCommands.push_back({1, Cmd});
-          if (!Res) Res = 1;
-          return;
-        }
-        if (san_tsan_a.empty()) {
-          san_tsan_a = bake::ensure_sanitizer_objects(
-              tc, bake::SanitizerKind::Tsan).string();
-          if (san_tsan_a.empty()) {
             FailingCommands.push_back({1, Cmd});
             if (!Res) Res = 1;
             return;
@@ -435,8 +418,8 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
         // msan, lsan, profile, fuzzer, ... — nothing else is vendored.
         llvm::errs()
           << "bake: sanitizer runtime '" << Component
-          << "' is not vendored; supported sanitizers are 'address', "
-             "'undefined' and 'thread'.\n"
+          << "' is not vendored; supported sanitizers are 'address' and "
+             "'undefined'.\n"
           << "  (-fsanitize=" << Component
           << " still instruments compile-only invocations; the link step "
              "is rejected.)\n";
@@ -450,8 +433,7 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     // runtime is also forced in for sanitize links: the sanitizer runtime
     // itself uses the C++ ABI (dynamic_cast/typeinfo) and unwinder.
     bool needs_cxx_runtime =
-        IsCxx || !san_ubsan_a.empty() || !san_tsan_a.empty() ||
-        !san_asan_a.empty();
+        IsCxx || !san_ubsan_a.empty() || !san_asan_a.empty();
     bake::RuntimeArtifacts rt =
         bake::prepare_runtime(tc, needs_cxx_runtime, link_mode);
 
@@ -581,14 +563,6 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
           static std::string compiler_rt_path;
           if (Component.starts_with("ubsan")) {
             LldArgs.push_back(san_ubsan_a.c_str());
-            continue;
-          }
-          if (Component == "tsan") {
-            LldArgs.push_back(san_tsan_a.c_str());
-            continue;
-          }
-          if (Component == "tsan_cxx") {
-            // The tsan archive already embeds the C++ reporting core.
             continue;
           }
           if (Component == "asan") {

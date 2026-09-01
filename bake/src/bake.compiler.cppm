@@ -1887,12 +1887,11 @@ export Path ensure_compiler_rt_objects(const Toolchain& tc) {
     return result_a;
 }
 
-// ── Sanitizer runtimes (ubsan standalone + tsan), built from vendored
+// ── Sanitizer runtimes (ubsan standalone + asan), built from vendored
 //    compiler-rt sources per ELF target (linux-gnu, linux-musl) ──
 
 export enum class SanitizerKind {
     Ubsan,
-    Tsan,
     Asan,
 };
 
@@ -1949,20 +1948,7 @@ const char* interception_sources[] = {
     "interception_linux.cpp", "interception_mac.cpp",
     "interception_win.cpp", "interception_type_test.cpp",
 };
-const char* tsan_core_sources[] = {
-    "tsan_debugging.cpp", "tsan_external.cpp", "tsan_fd.cpp",
-    "tsan_flags.cpp", "tsan_ignoreset.cpp",
-    "tsan_interceptors_memintrinsics.cpp", "tsan_interceptors_posix.cpp",
-    "tsan_interface.cpp", "tsan_interface_ann.cpp",
-    "tsan_interface_atomic.cpp", "tsan_interface_java.cpp",
-    "tsan_malloc_mac.cpp", "tsan_md5.cpp", "tsan_mman.cpp",
-    "tsan_mutexset.cpp", "tsan_new_delete.cpp",
-    "tsan_platform_windows.cpp", "tsan_preinit.cpp", "tsan_report.cpp",
-    "tsan_rtl.cpp", "tsan_rtl_access.cpp", "tsan_rtl_mutex.cpp",
-    "tsan_rtl_proc.cpp", "tsan_rtl_report.cpp", "tsan_rtl_thread.cpp",
-    "tsan_stack_trace.cpp", "tsan_suppressions.cpp", "tsan_symbolize.cpp",
-    "tsan_sync.cpp", "tsan_vector_clock.cpp",
-};
+
 const char* ubsan_standalone_sources[] = {
     "ubsan_diag.cpp", "ubsan_diag_standalone.cpp", "ubsan_flags.cpp",
     "ubsan_handlers.cpp", "ubsan_handlers_cxx.cpp", "ubsan_init.cpp",
@@ -2013,18 +1999,15 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     if (!common_dir.is_directory()) return Path();
 
     const char* label = kind == SanitizerKind::Ubsan ? "san-ubsan"
-                      : kind == SanitizerKind::Tsan  ? "san-tsan"
                                                      : "san-asan";
     std::string product = kind == SanitizerKind::Ubsan
         ? "libclang_rt.ubsan_standalone.a"
-        : kind == SanitizerKind::Tsan
-        ? "libclang_rt.tsan.a"
         : "libclang_rt.asan.a";
 
     // (source directory, file) pairs to compile — assembled BEFORE the
     // cache lookup so the unit list itself is a config input: changing
     // the list re-keys the products automatically.
-    Path tsan_rtl = rt_root / "tsan" / "rtl";
+
     std::vector<std::pair<Path, const char*>> units;
     auto add = [&](const Path& dir, const char* const* files, size_t n) {
         for (size_t i = 0; i < n; ++i)
@@ -2036,19 +2019,7 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         std::size(sanitizer_libcdep_sources));
     add(common_dir, sanitizer_symbolizer_sources,
         std::size(sanitizer_symbolizer_sources));
-    if (kind == SanitizerKind::Tsan) {
-        add(tsan_rtl, tsan_core_sources, std::size(tsan_core_sources));
-        units.emplace_back(tsan_rtl, "tsan_platform_linux.cpp");
-        units.emplace_back(tsan_rtl, "tsan_platform_posix.cpp");
-        add(rt_root / "interception", interception_sources,
-            std::size(interception_sources));
-        // The tsan runtime embeds the ubsan reporting core (its rtl
-        // references __ubsan::* directly).
-        add(rt_root / "ubsan", ubsan_core_sources,
-            std::size(ubsan_core_sources));
-        units.emplace_back(common_dir, "sanitizer_coverage_libcdep_new.cpp");
-        units.emplace_back(common_dir, "sancov_flags.cpp");
-    } else if (kind == SanitizerKind::Asan) {
+    if (kind == SanitizerKind::Asan) {
         add(rt_root / "asan", asan_core_sources,
             std::size(asan_core_sources));
         // Leak detection is built into the asan runtime (RTLSanCommon).
@@ -2075,11 +2046,7 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         units.emplace_back(common_dir, "sanitizer_coverage_libcdep_new.cpp");
         units.emplace_back(common_dir, "sancov_flags.cpp");
     }
-    if (kind == SanitizerKind::Tsan) {
-        std::string arch_s = tc.target.arch() == "x86_64"
-            ? "tsan_rtl_amd64.S" : "tsan_rtl_aarch64.S";
-        units.emplace_back(tsan_rtl, arch_s.c_str());
-    }
+
 
     // Flags shared by every unit (self-contained C++; no standard headers).
     // Built before the cache lookup: every compile flag is a config input,
@@ -2115,9 +2082,7 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         flags.push_back("-I" + rt_root.string());
         flags.push_back("-I" + common_dir.string());
         flags.push_back("-I" + (rt_root / "interception").string());
-        if (kind == SanitizerKind::Tsan)
-            flags.push_back("-I" + (rt_root / "tsan" / "rtl").string());
-        else if (kind == SanitizerKind::Asan)
+        if (kind == SanitizerKind::Asan)
             flags.push_back("-I" + (rt_root / "asan").string());
         else
             flags.push_back("-I" + (rt_root / "ubsan").string());
@@ -2127,7 +2092,6 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
 
     std::vector<std::string> config;
     config.push_back(kind == SanitizerKind::Ubsan ? "san-ubsan-v3"
-                      : kind == SanitizerKind::Tsan ? "san-tsan-v3"
                                                     : "san-asan-v3");
     config.push_back(compiler_identity_block(tc));
     for (auto& l : target_surface_lines(tc)) config.push_back(l);
@@ -2140,8 +2104,6 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     std::vector<Path> inputs{common_dir, rt_root / "interception"};
     if (kind == SanitizerKind::Ubsan)
         inputs.push_back(rt_root / "ubsan");
-    else if (kind == SanitizerKind::Tsan)
-        inputs.push_back(rt_root / "tsan");
     else
         inputs.push_back(rt_root / "asan"), inputs.push_back(rt_root / "lsan");
 
@@ -2156,8 +2118,7 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     }
 
     std::println("   Compiling {} runtime for {} (cached)",
-                 kind == SanitizerKind::Ubsan ? "ubsan"
-                 : kind == SanitizerKind::Tsan ? "tsan" : "asan",
+                 kind == SanitizerKind::Ubsan ? "ubsan" : "asan",
                  tc.target.triple_with_version());
 
 

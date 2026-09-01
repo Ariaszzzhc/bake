@@ -1,6 +1,0 @@
-[package]
-name = "cross-gnu-tsan"
-version = "0.1.0"
-
-[profile.dev]
-sanitize = ["thread"]

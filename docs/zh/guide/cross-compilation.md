@@ -35,7 +35,7 @@ bake build -t x86_64-linux-gnu.2.36     # 显式版本
 
 ## Sanitizer 支持
 
-`bake cc` / `bake c++` 与 `bake build`（`[profile.*] sanitize = [...]`）支持 `-fsanitize=address`、`-fsanitize=undefined`（UBSan standalone）与 `-fsanitize=thread`（TSan）：runtime 从随附的 compiler-rt 源码按目标现编（首次链接时，进入全局缓存）。目前仅支持 ELF 目标（linux-gnu / linux-musl）。其他 sanitizer（msan 等）未随附：纯编译（`-c`）仍可插桩，链接会被拒绝并给出明确提示。
+`bake cc` / `bake c++` 与 `bake build`（`[profile.*] sanitize = [...]`）支持 `-fsanitize=address` 与 `-fsanitize=undefined`（UBSan standalone）：runtime 从随附的 compiler-rt 源码按目标现编（首次链接时，进入全局缓存）。目前仅支持 ELF 目标（linux-gnu / linux-musl）。其他 sanitizer（tsan、msan 等）未随附：纯编译（`-c`）仍可插桩，链接会被拒绝并给出明确提示。
 
 
 ## 工作原理

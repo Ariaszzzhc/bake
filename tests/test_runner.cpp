@@ -3491,34 +3491,6 @@ TestResult test_cross_gnu_ubsan() {
     return {};
 }
 
-TestResult test_cross_gnu_tsan() {
-    // The TSan runtime links from vendored sources (build + symbol
-    // surface + reporter strings). Running the report needs either a
-    // native-arch container or relaxed sandboxing (ASLR/layout): on
-    // this host only emulated amd64 containers exist, so the runtime
-    // report is not asserted here.
-    auto dir = make_temp_dir("cross_gnu_tsan");
-    copy_fixture("cross_gnu_tsan", dir);
-
-    auto build = run_bake("build -t x86_64-linux-gnu.2.36", dir);
-    CHECK(build.success(), "tsan cross build failed: " + build.stdout);
-    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-tsan";
-    CHECK(fs::exists(out), "tsan binary missing");
-    auto elf = inspect_elf64(out);
-    CHECK(elf.valid && elf.interp == "/lib64/ld-linux-x86-64.so.2",
-          "tsan output is not a dynamic gnu executable");
-
-    std::string tsan_bytes;
-    {
-        std::ifstream f(out, std::ios::binary);
-        tsan_bytes.assign(std::istreambuf_iterator<char>(f), {});
-    }
-    CHECK(tsan_bytes.find("ThreadSanitizer") != std::string::npos,
-          "tsan runtime not statically linked into the binary");
-
-    return {};
-}
-
 TestResult test_cross_gnu_asan() {
     // The ASan runtime is built from vendored compiler-rt sources
     // (asan + lsan_common + ubsan core) at link time and statically
@@ -3768,7 +3740,6 @@ TestResult test_target_output_isolation() {
 
 static std::vector<TestCase> all_tests = {
     {"cross_gnu_ubsan",              test_cross_gnu_ubsan},
-    {"cross_gnu_tsan",               test_cross_gnu_tsan},
     {"cross_gnu_asan",               test_cross_gnu_asan},
     {"target_conditions",             test_target_conditions},
     {"cross_gnu",                     test_cross_gnu},
