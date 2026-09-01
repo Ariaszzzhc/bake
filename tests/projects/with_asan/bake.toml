@@ -1,5 +1,5 @@
 [package]
-name = "cross-gnu-asan"
+name = "with-asan"
 version = "0.1.0"
 
 [profile.dev]

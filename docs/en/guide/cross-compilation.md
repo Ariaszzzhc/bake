@@ -35,7 +35,7 @@ How: the crt objects and `libc_nonshared.a` are compiled from the vendored glibc
 
 ## Sanitizers
 
-`bake cc` / `bake c++` and `bake build` (`[profile.*] sanitize = [...]`) support `-fsanitize=address` and `-fsanitize=undefined` (UBSan standalone): the runtimes are compiled from the vendored compiler-rt sources per target on first link and cached globally. ELF targets only (linux-gnu / linux-musl) for now. Other sanitizers (tsan, msan, ...) are not vendored: compile-only invocations still instrument; the link is rejected with a clear message.
+`bake cc` / `bake c++` and `bake build` (`[profile.*] sanitize = [...]`) support `-fsanitize=address` and `-fsanitize=undefined`: the runtimes are compiled from the vendored compiler-rt sources per target on first link and cached globally, each platform in its official form — static archives on linux-gnu / linux-musl (asan whole-archive'd), shared dylibs on macos (`@rpath` install names with the cache-dir rpath injected at link, matching the official Clang layout), and on windows-gnu a ubsan static archive plus an asan DLL (x86_64 only, per upstream; the DLL is copied next to the executable). Sanitizers are a native development tool: native builds are the contract; cross-built sanitized products are not validated. Other sanitizers (tsan, msan, ...) are not vendored: compile-only invocations still instrument; the link is rejected with a clear message.
 
 
 ## How it works

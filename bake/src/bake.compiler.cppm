@@ -1983,13 +1983,215 @@ const char* ubsan_core_sources[] = {
     "ubsan_init.cpp", "ubsan_monitor.cpp", "ubsan_value.cpp",
 };
 
+// SDK version from the vendored SDKSettings.json ("MinimalDisplayName").
+// Empty when the file is absent — callers fall back to the deployment
+// minimum.
+std::string darwin_vendored_sdk_version(const Path& lib) {
+    if (auto content = read_file(lib / "libc" / "darwin" /
+                                 "SDKSettings.json")) {
+        auto key = std::string("\"MinimalDisplayName\":\"");
+        auto pos = content->find(key);
+        if (pos != std::string::npos) {
+            auto start = pos + key.size();
+            auto end = content->find('"', start);
+            if (end != std::string::npos)
+                return content->substr(start, end - start);
+        }
+    }
+    return std::string();
+}
+
+// Darwin link surface — the single place deciding where libSystem and the
+// SDK version come from. Native builds use the system SDK via xcrun (like
+// the platform toolchain); cross builds — and any xcrun failure — use the
+// vendored stub set, whose libSystem.tbd is an equivalent export table.
+struct DarwinLinkFace {
+    std::string lib_dir;        // -L directory holding libSystem
+    std::string framework_dir;  // system frameworks ("" for vendored)
+    std::string sdk_version;    // -platform_version's 4th argument
+};
+
+DarwinLinkFace resolve_darwin_link_face(const Toolchain& tc) {
+    DarwinLinkFace f;
+    Path lib = find_lib_dir();
+    std::string vendored = (lib / "libc" / "darwin").string();
+    f.sdk_version = tc.target.macos_deployment_min();  // last resort
+
+    if (resolve_darwin_sdk(tc.target) == DarwinSdkLayout::SystemSdk) {
+        auto run_trimmed = [](const char* what) {
+            std::string out;
+            auto r = run_process({"xcrun", "--sdk", "macosx", what},
+                                 Path(), true);
+            if (r.success()) {
+                out = r.stdout_output;
+                while (!out.empty() && (out.back() == '\n' ||
+                                        out.back() == '\r'))
+                    out.pop_back();
+            }
+            return out;
+        };
+        std::string sdk_path = run_trimmed("--show-sdk-path");
+        if (!sdk_path.empty()) {
+            f.lib_dir = sdk_path + "/usr/lib";
+            f.framework_dir = sdk_path + "/System/Library/Frameworks";
+            std::string v = run_trimmed("--show-sdk-version");
+            if (!v.empty()) f.sdk_version = v;
+            return f;
+        }
+    }
+    f.lib_dir = vendored;
+    if (auto v = darwin_vendored_sdk_version(lib); !v.empty())
+        f.sdk_version = v;
+    return f;
+}
+
+// Undefined references the official darwin sanitizer dylibs ship with:
+//  - cxxabi/typeinfo, resolved against the main executable's C++ ABI
+//  - operator new/delete, the __DATA,__interpose originals — dyld
+//    reroutes calls made through stubs into the runtime's wrappers
+// -U permits exactly these; anything else fails at link time, so a hole
+// in the source list (a missing platform file) surfaces when the dylib
+// is built, not when the user runs their program.
+const char* darwin_dylib_undef_allowances[] = {
+    "___cxa_atexit", "___cxa_demangle",
+    "___cxa_rethrow_primary_exception", "___cxa_throw", "___dynamic_cast",
+    "__ZTIN10__cxxabiv117__class_type_infoE",
+    "__ZTIN10__cxxabiv120__si_class_type_infoE",
+    "__ZTIN10__cxxabiv121__vmi_class_type_infoE",
+    "__ZTISt9type_info",
+    "__ZTVN10__cxxabiv117__class_type_infoE",
+    "__ZTVN10__cxxabiv120__si_class_type_infoE",
+    "__Znwm", "__ZnwmRKSt9nothrow_t", "__Znam", "__ZnamRKSt9nothrow_t",
+    "__ZdlPv", "__ZdlPvRKSt9nothrow_t", "__ZdaPv", "__ZdaPvRKSt9nothrow_t",
+};
+
+// Per-directory weak-reference allowances the dylib may leave
+// undefined (hooks the user's program may define; weak SDK imports).
+// These lists are vendored next to the sources — upstream uses the same
+// lists when linking the official darwin dylibs.
+std::vector<std::string> load_weak_symbols(const Path& dir) {
+    std::vector<std::string> syms;
+    auto content = read_file(dir / "weak_symbols.txt");
+    if (!content) return syms;
+    size_t pos = 0;
+    while (pos < content->size()) {
+        size_t eol = content->find('\n', pos);
+        if (eol == std::string::npos) eol = content->size();
+        std::string_view line(content->data() + pos, eol - pos);
+        pos = eol + 1;
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' '))
+            line.remove_suffix(1);
+        if (!line.empty() && line[0] != '#' && line[0] != ';')
+            syms.emplace_back(line);
+    }
+    return syms;
+}
+ 
+// Link a sanitizer dylib with the in-process Mach-O driver. The
+// -install_name is @rpath-based: the driver injects the cache-directory
+// rpath into sanitized links, matching the official Clang layout.
+bool link_darwin_sanitizer_dylib(const Toolchain& tc, const Path& rt_root,
+                                 SanitizerKind kind, const Path& out,
+                                 const std::vector<Path>& objs,
+                                 const std::string& soname) {
+    auto face = resolve_darwin_link_face(tc);
+    std::string arch = tc.target.arch() == "x86_64" ? "x86_64" : "arm64";
+    std::string min_v = tc.target.macos_deployment_min();
+
+    std::vector<std::string> args;
+    args.push_back("ld64.lld");
+    args.push_back("-dylib");
+    args.push_back("-arch");
+    args.push_back(arch);
+    args.push_back("-platform_version");
+    args.push_back("macos");
+    args.push_back(min_v);
+    args.push_back(face.sdk_version);
+    args.push_back("-install_name");
+    args.push_back("@rpath/" + soname);
+    args.push_back("-o");
+    args.push_back(out.string());
+    for (auto& o : objs) args.push_back(o.string());
+    // Fixed cxxabi/interpose allowances, plus every vendored weak list of
+    // the runtime families the dylib embeds (asan pulls ubsan+lsan+common).
+    std::vector<std::string> und = {std::begin(darwin_dylib_undef_allowances),
+                                    std::end(darwin_dylib_undef_allowances)};
+    auto append_dir = [&](const char* d) {
+        for (auto& s : load_weak_symbols(rt_root / d)) und.push_back(s);
+    };
+    if (kind == SanitizerKind::Asan) {
+        for (auto* d : {"sanitizer_common", "asan", "ubsan", "lsan"})
+            append_dir(d);
+    } else {
+        for (auto* d : {"sanitizer_common", "ubsan"}) append_dir(d);
+    }
+    for (auto& s : und) {
+        args.push_back("-U");
+        args.push_back(s);
+    }
+    args.push_back("-L" + face.lib_dir);
+    args.push_back("-lSystem");
+
+    std::vector<const char*> cargs;
+    cargs.reserve(args.size());
+    for (auto& s : args) cargs.push_back(s.c_str());
+    return bake_lld_link(LldFlavor::MACHO, static_cast<int>(cargs.size()),
+                         cargs.data()) == 0;
+}
+
+// Link the asan runtime DLL with the in-process MinGW driver and produce
+// its import library. import_libs carry the win32 APIs the runtime
+// references (full paths into the mingw cache).
+bool link_mingw_asan_dll(const Toolchain& tc, const Path& dll,
+                         const Path& implib,
+                         const std::vector<Path>& objs,
+                         const std::vector<Path>& import_libs) {
+    std::vector<std::string> args;
+    args.push_back("ld.lld");
+    args.push_back("-m");
+    args.push_back("i386pep");  // x86_64 PE (only supported mingw asan arch)
+    args.push_back("-shared");
+    args.push_back("--out-implib");
+    args.push_back(implib.string());
+    args.push_back("-o");
+    args.push_back(dll.string());
+    for (auto& o : objs) args.push_back(o.string());
+    for (auto& l : import_libs) args.push_back(l.string());
+
+    std::vector<const char*> cargs;
+    cargs.reserve(args.size());
+    for (auto& s : args) cargs.push_back(s.c_str());
+    return bake_lld_link(LldFlavor::MinGW, static_cast<int>(cargs.size()),
+                         cargs.data()) == 0;
+}
+
+// win32 import libraries the sanitizer DLL references — defined after
+// ensure_mingw_objects (needs the mingw cache layout).
+std::vector<Path> mingw_sanitizer_import_libs(const Toolchain& tc);
+ 
 } // namespace
 
 export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
-    // ELF targets only (linux-gnu, linux-musl) for now; the driver link
-    // interception rejects other targets with a clear message.
-    if (!tc.target.is_linux_gnu() && !tc.target.is_linux_musl())
+    // Runtimes bake builds from the vendored compiler-rt sources, in each
+    // platform's official form (what the Clang driver links by default):
+    //   ELF (linux-gnu/musl): static archives, whole-archive'd by the driver
+    //   darwin:               shared dylibs with @rpath install names
+    //   windows-gnu:          ubsan static archive, asan shared DLL
+    // Native builds are the contract; cross-built products are unverified.
+    bool elf = tc.target.is_linux_gnu() || tc.target.is_linux_musl();
+    bool darwin = tc.target.is_darwin();
+    bool mingw = tc.target.is_windows_gnu();
+    if (!elf && !darwin && !mingw) return Path();
+    // Upstream compiler-rt supports asan on x86_64 windows-gnu only
+    // (other mingw arches don't ship a working runtime).
+    if (mingw && kind == SanitizerKind::Asan &&
+        tc.target.arch() != "x86_64") {
+        std::println(std::cerr,
+            "bake: -fsanitize=address is not available on {} "
+            "(compiler-rt supports x86_64 windows-gnu only)",
+            tc.target.triple());
         return Path();
+    }
 
     Path lib = find_lib_dir();
     if (lib.string().empty()) return Path();
@@ -1998,20 +2200,38 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     Path common_dir = rt_root / "sanitizer_common";
     if (!common_dir.is_directory()) return Path();
 
-    const char* label = kind == SanitizerKind::Ubsan ? "san-ubsan"
-                                                     : "san-asan";
-    std::string product = kind == SanitizerKind::Ubsan
-        ? "libclang_rt.ubsan_standalone.a"
-        : "libclang_rt.asan.a";
+    bool shared = darwin || (mingw && kind == SanitizerKind::Asan);
+    std::string product;
+    if (kind == SanitizerKind::Ubsan)
+        product = darwin ? "libclang_rt.ubsan_osx_dynamic.dylib"
+                         : "libclang_rt.ubsan_standalone.a";
+    else
+        product = darwin ? "libclang_rt.asan_osx_dynamic.dylib"
+                : mingw ? "libclang_rt.asan.dll"
+                        : "libclang_rt.asan.a";
+    // mingw asan: the driver links against the import library; the DLL
+    // (its sibling) is copied next to the executable by the driver —
+    // windows resolves it from the exe directory.
+    std::string link_name = product;
+    if (mingw && kind == SanitizerKind::Asan) link_name += ".a";
+
+    const char* label =
+        kind == SanitizerKind::Ubsan ? "san-ubsan" : "san-asan";
 
     // (source directory, file) pairs to compile — assembled BEFORE the
     // cache lookup so the unit list itself is a config input: changing
     // the list re-keys the products automatically.
-
     std::vector<std::pair<Path, const char*>> units;
     auto add = [&](const Path& dir, const char* const* files, size_t n) {
         for (size_t i = 0; i < n; ++i)
             units.emplace_back(dir, files[i]);
+    };
+    auto add_ubsan_standalone = [&]() {
+        // ubsan_init_standalone_preinit rides .preinit_array — ELF only.
+        for (auto* f : ubsan_standalone_sources)
+            if (elf || std::string_view(f) !=
+                           "ubsan_init_standalone_preinit.cpp")
+                units.emplace_back(rt_root / "ubsan", f);
     };
     add(common_dir, sanitizer_common_sources,
         std::size(sanitizer_common_sources));
@@ -2022,24 +2242,46 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     if (kind == SanitizerKind::Asan) {
         add(rt_root / "asan", asan_core_sources,
             std::size(asan_core_sources));
+        if (darwin) {
+            units.emplace_back(rt_root / "asan", "asan_mac.cpp");
+            units.emplace_back(rt_root / "asan", "asan_malloc_mac.cpp");
+        }
+        if (mingw) {
+            units.emplace_back(rt_root / "asan", "asan_win.cpp");
+            units.emplace_back(rt_root / "asan", "asan_globals_win.cpp");
+            units.emplace_back(rt_root / "asan", "asan_malloc_win.cpp");
+        }
         // Leak detection is built into the asan runtime (RTLSanCommon).
         add(rt_root / "lsan", lsan_common_sources,
             std::size(lsan_common_sources));
-        // The ubsan reporting core (RTUbsan, non-apple set) — asan
-        // reports undefined-behavior-shaped errors through it.
+        // The ubsan reporting core asan reports through. darwin embeds
+        // the apple set (adds the itanium cxx handlers, needs RTTI).
         add(rt_root / "ubsan", ubsan_core_sources,
             std::size(ubsan_core_sources));
+        if (darwin) {
+            units.emplace_back(rt_root / "ubsan",
+                               "ubsan_handlers_cxx.cpp");
+            units.emplace_back(rt_root / "ubsan", "ubsan_type_hash.cpp");
+            units.emplace_back(rt_root / "ubsan",
+                               "ubsan_type_hash_itanium.cpp");
+        }
         add(rt_root / "interception", interception_sources,
             std::size(interception_sources));
-        // Early __asan_init via .preinit_array, plus the vfork
-        // interceptor assembly upstream appends to ASAN_SOURCES on ELF.
-        units.emplace_back(rt_root / "asan", "asan_preinit.cpp");
-        units.emplace_back(rt_root / "asan", "asan_interceptors_vfork.S");
+        if (elf) {
+            // Early __asan_init via .preinit_array, plus the vfork
+            // interceptor assembly upstream appends on ELF.
+            units.emplace_back(rt_root / "asan", "asan_preinit.cpp");
+            units.emplace_back(rt_root / "asan",
+                               "asan_interceptors_vfork.S");
+        }
         units.emplace_back(common_dir, "sanitizer_coverage_libcdep_new.cpp");
         units.emplace_back(common_dir, "sancov_flags.cpp");
     } else {
-        add(rt_root / "ubsan", ubsan_standalone_sources,
-            std::size(ubsan_standalone_sources));
+        add_ubsan_standalone();
+        if (mingw)
+            // static-rt interface registration for the COFF runtime
+            units.emplace_back(rt_root / "ubsan",
+                               "ubsan_win_runtime_thunk.cpp");
         add(rt_root / "interception", interception_sources,
             std::size(interception_sources));
         // ubsan_init references the coverage initialization hooks.
@@ -2047,10 +2289,9 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         units.emplace_back(common_dir, "sancov_flags.cpp");
     }
 
-
     // Flags shared by every unit (self-contained C++; no standard headers).
     // Built before the cache lookup: every compile flag is a config input,
-    // so a flag change re-keys the products (a stale archive with the old
+    // so a flag change re-keys the products (a stale artifact with the old
     // flags can never be picked up).
     auto make_flags = [&]() {
         std::vector<std::string> flags;
@@ -2067,12 +2308,22 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
         // the interceptors before init completes and deadlocks.
         // Upstream compiler-rt compiles runtimes with -fno-builtin.
         flags.push_back("-fno-builtin");
-        // ubsan's itanium type-hash unit uses dynamic_cast and needs
-        // RTTI; every other runtime is compiled without.
-        if (kind == SanitizerKind::Ubsan)
+        // The itanium type-hash units use dynamic_cast and need RTTI:
+        // every ubsan build, and the darwin asan dylib (it embeds the
+        // apple ubsan cxx set). Everything else is compiled without.
+        if (kind == SanitizerKind::Ubsan || darwin)
             flags.push_back("-frtti");
         else
             flags.push_back("-fno-rtti");
+        if (kind == SanitizerKind::Asan && (darwin || mingw)) {
+            // shared-runtime build (upstream ASAN_DYNAMIC_DEFINITIONS);
+            // the darwin dylib pins initial-exec TLS like the official one
+            flags.push_back("-DASAN_DYNAMIC=1");
+            if (darwin) flags.push_back("-ftls-model=initial-exec");
+        }
+        if (mingw && kind == SanitizerKind::Ubsan)
+            flags.push_back("-DSANITIZER_DYNAMIC_RUNTIME_THUNK"),
+            flags.push_back("-DSANITIZER_STATIC_RUNTIME_THUNK");
         flags.push_back("-fno-exceptions");
         flags.push_back("-fvisibility=hidden");
         flags.push_back("-fvisibility-inlines-hidden");
@@ -2091,8 +2342,9 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     auto base_flags = make_flags();
 
     std::vector<std::string> config;
-    config.push_back(kind == SanitizerKind::Ubsan ? "san-ubsan-v3"
-                                                    : "san-asan-v3");
+    config.push_back(kind == SanitizerKind::Ubsan ? "san-ubsan-v4"
+                                                  : "san-asan-v4");
+    config.push_back("product:" + product);
     config.push_back(compiler_identity_block(tc));
     for (auto& l : target_surface_lines(tc)) config.push_back(l);
     std::string unit_list;
@@ -2102,25 +2354,28 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     for (auto& f : base_flags) config.push_back("flag:" + f);
 
     std::vector<Path> inputs{common_dir, rt_root / "interception"};
-    if (kind == SanitizerKind::Ubsan)
+    if (kind == SanitizerKind::Ubsan) {
         inputs.push_back(rt_root / "ubsan");
-    else
-        inputs.push_back(rt_root / "asan"), inputs.push_back(rt_root / "lsan");
+    } else {
+        inputs.push_back(rt_root / "asan");
+        inputs.push_back(rt_root / "lsan");
+        // the ubsan reporting core is embedded in the asan runtime
+        inputs.push_back(rt_root / "ubsan");
+    }
 
     auto entry = toolchain_cache_lookup(tc, label, config, inputs);
     Path cache_dir = entry.output_dir;
-    Path result_a = cache_dir / product;
+    Path result = cache_dir / link_name;
 
-    if (entry.hit && result_a.is_regular_file()) return result_a;
-    if (result_a.is_regular_file()) {
+    if (entry.hit && result.is_regular_file()) return result;
+    if (result.is_regular_file()) {
         toolchain_cache_finish(entry);
-        return result_a;
+        return result;
     }
 
     std::println("   Compiling {} runtime for {} (cached)",
                  kind == SanitizerKind::Ubsan ? "ubsan" : "asan",
                  tc.target.triple_with_version());
-
 
     std::vector<Path> obj_files;
     int compiled = 0;
@@ -2147,13 +2402,28 @@ export Path ensure_sanitizer_objects(const Toolchain& tc, SanitizerKind kind) {
     }
 
     if (obj_files.empty()) return Path();
-    if (!write_archive(result_a, obj_files, false)) {
-        std::println(std::cerr, "bake: failed to create {}", product);
-        return Path();
+    bool ok = false;
+    if (shared && darwin) {
+        ok = link_darwin_sanitizer_dylib(tc, rt_root, kind,
+                                         cache_dir / product, obj_files,
+                                         product);
+        if (!ok)
+            std::println(std::cerr, "bake: failed to link {}", product);
+    } else if (shared) {  // mingw asan DLL + import library
+        Path dll = cache_dir / product;
+        ok = link_mingw_asan_dll(tc, dll, result, obj_files,
+                                 mingw_sanitizer_import_libs(tc));
+        if (!ok)
+            std::println(std::cerr, "bake: failed to link {}", product);
+    } else {
+        ok = write_archive(result, obj_files, false, mingw);
+        if (!ok)
+            std::println(std::cerr, "bake: failed to create {}", product);
     }
+    if (!ok) return Path();
     std::println("   Compiled {} runtime sources", compiled);
     toolchain_cache_finish(entry);
-    return result_a;
+    return result;
 }
 
 // ── mingw-w64 (windows-gnu) ──
@@ -2671,6 +2941,22 @@ export MingwObjects ensure_mingw_objects(const Toolchain& tc) {
     toolchain_cache_finish(entry);
     return result;
 }
+
+namespace {
+// win32 import libraries the sanitizer DLL references (win32 APIs the
+// runtime calls). All are always-link mingw libraries with cached
+// import libraries.
+std::vector<Path> mingw_sanitizer_import_libs(const Toolchain& tc) {
+    std::vector<Path> libs;
+    auto mw = ensure_mingw_objects(tc);
+    if (mw.import_lib_dir.string().empty()) return libs;
+    for (auto* n : mingw_always_link_libs) {
+        Path p = mw.import_lib_dir / (std::string(n) + ".lib");
+        if (p.is_regular_file()) libs.push_back(p);
+    }
+    return libs;
+}
+} // namespace
 
 // ── On-demand import library generation ──
 //
@@ -3512,53 +3798,18 @@ export RuntimeArtifacts prepare_runtime(
         break;
     }
     case LibcFamily::Darwin: {
-        auto sdk_layout = resolve_darwin_sdk(tc.target);
-        Path lib = find_lib_dir();
-
         // Deployment minimum from the target spec (explicit -target
-        // suffix or the built-in default) — the target
-        // query is authoritative for compile and link alike. The
-        // vendored SDKSettings.json only carries the SDK version.
+        // suffix or the built-in default) — the target query is
+        // authoritative for compile and link alike.
         rt.macos_deployment_target = tc.target.macos_deployment_min();
-
-        // SDK version (platform_version's 4th argument): from the
-        // vendored SDKSettings.json; falls back to the deployment min.
-        Path settings = lib / "libc" / "darwin" / "SDKSettings.json";
-        rt.macos_sdk_version = rt.macos_deployment_target;
-        if (auto content = read_file(settings)) {
-            auto key = std::string("\"MinimalDisplayName\":\"");
-            auto pos = content->find(key);
-            if (pos != std::string::npos) {
-                auto start = pos + key.size();
-                auto end = content->find('"', start);
-                if (end != std::string::npos)
-                    rt.macos_sdk_version = content->substr(start, end - start);
-            }
-        }
-
-        if (sdk_layout == DarwinSdkLayout::SystemSdk) {
-            std::vector<std::string> xcrun_cmd = {
-                "xcrun", "--sdk", "macosx", "--show-sdk-path"
-            };
-            auto r = run_process(xcrun_cmd, Path(), true);
-            if (r.success()) {
-                std::string sdk_path = r.stdout_output;
-                while (!sdk_path.empty() &&
-                       (sdk_path.back() == '\n' || sdk_path.back() == '\r'))
-                    sdk_path.pop_back();
-                if (!sdk_path.empty()) {
-                    rt.link_dirs.push_back(sdk_path + "/usr/lib");
-                    rt.framework_dirs.push_back(
-                        sdk_path + "/System/Library/Frameworks");
-                } else {
-                    rt.link_dirs.push_back((lib / "libc" / "darwin").string());
-                }
-            } else {
-                rt.link_dirs.push_back((lib / "libc" / "darwin").string());
-            }
-        } else {
-            rt.link_dirs.push_back((lib / "libc" / "darwin").string());
-        }
+        // libSystem directory, frameworks, and SDK version: system SDK
+        // when native (xcrun), vendored stubs when cross — one place
+        // decides (shared with the sanitizer dylib linker).
+        auto face = resolve_darwin_link_face(tc);
+        rt.macos_sdk_version = face.sdk_version;
+        rt.link_dirs.push_back(face.lib_dir);
+        if (!face.framework_dir.empty())
+            rt.framework_dirs.push_back(face.framework_dir);
         break;
     }
     case LibcFamily::Windows: {

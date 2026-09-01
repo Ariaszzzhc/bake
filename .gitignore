@@ -22,3 +22,5 @@ compile_commands.json
 /.superpowers/
 .DS_Store
 .tmp/
+.idea
+.local:

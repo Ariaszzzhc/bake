@@ -315,6 +315,55 @@ static void bakeGetLLDInfo(const llvm::Triple &Triple,
 // glibc version suffix (LLVM triples cannot encode it). Set during
 // argument preprocessing, consumed by the link interception.
 static bake::TargetSpec g_explicit_target;
+/// Semantics of a libclang_rt.<component>.<ext> reference on a link
+/// line — the single parser both dispatch and argument-rewriting use.
+enum class SanRtRef {
+  Asan,     // asan, asan_osx_dynamic — the runtime itself
+  Ubsan,    // ubsan* (standalone and dynamic names)
+  Helper,   // asan_cxx/asan_static/*thunk — covered by what bake links
+  Builtins, // compiler-rt builtins (swapped for bake's archive)
+  Unknown,  // msan, lsan, profile, fuzzer, ... — nothing vendored
+  None,     // not a sanitizer reference at all
+};
+static SanRtRef parseSanRtRef(StringRef Arg, StringRef &Component) {
+  auto Pos = Arg.find("libclang_rt.");
+  if (Pos == StringRef::npos) return SanRtRef::None;
+  StringRef Base = Arg.substr(Pos + 12);
+  Component = Base.substr(0, Base.find('.'));
+  if (Component.starts_with("asan"))
+    return (Component == "asan" || Component == "asan_osx_dynamic")
+               ? SanRtRef::Asan
+               : SanRtRef::Helper;
+  if (Component.starts_with("ubsan")) return SanRtRef::Ubsan;
+  if (Component == "builtins") return SanRtRef::Builtins;
+  return SanRtRef::Unknown;
+}
+
+/// windows resolves the asan runtime DLL from the executable's
+/// directory — after a successful link, place the DLL (sibling of the
+/// import library bake linked against) next to the linked output.
+static void copyMingwAsanDll(const Command *Cmd, StringRef ImportLib) {
+  std::string Implib(ImportLib);
+  auto Sfx = Implib.find(".dll.a");
+  if (Sfx == std::string::npos) return;
+  std::string Dll = Implib;
+  Dll.replace(Sfx, 6, ".dll");
+
+  std::string Out;
+  auto Args = Cmd->getArguments();
+  for (size_t i = 0; i + 1 < Args.size(); ++i)
+    if (Args[i] && StringRef(Args[i]) == "-o") {
+      Out = Args[i + 1] ? Args[i + 1] : "";
+      break;
+    }
+  if (Out.empty()) return;
+
+  std::error_code EC;
+  std::filesystem::copy_file(
+      Dll, std::filesystem::path(Out).parent_path() /
+               std::filesystem::path(Dll).filename(),
+      std::filesystem::copy_options::overwrite_existing, EC);
+}
 /// Execute a single job from the compilation.
 ///
 /// Link jobs are intercepted and dispatched to the in-process LLD driver
@@ -343,7 +392,6 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     bool is_darwin = Flavor == LldFlavor::MACHO;
     bool is_mingw = Flavor == LldFlavor::MinGW;
     bool is_gnu = !is_darwin && !is_mingw && tc.target.is_linux_gnu();
-    bool is_elf = !is_darwin && !is_mingw;  // linux-gnu + linux-musl
 
     // Parse link mode from user args.
     std::vector<std::string> user_args;
@@ -360,62 +408,23 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       if (!Res) Res = 1;
       return;
     }
-
-    // Sanitizer runtime dispatch. The driver emits references shaped
-    // libclang_rt.<component>.a; map them onto the runtimes bake builds
-    // from the vendored compiler-rt sources. Components without a vendored
-    // runtime are rejected with a clear message (compilation/instrumenting
-    // still works — only the link is rejected).
+    // Sanitizer runtime dispatch: resolve every libclang_rt.* reference
+    // once, mapping components onto the runtimes bake builds from the
+    // vendored compiler-rt sources (per-platform form: ELF archives,
+    // darwin dylibs, mingw ubsan archive / asan DLL). Components without
+    // a vendored runtime are rejected with a clear message (compiling
+    // and instrumenting still works — only the link is rejected);
+    // ensure_sanitizer_objects reports why a target is unavailable
+    // (e.g. asan on non-x86_64 mingw).
     std::string san_ubsan_a, san_asan_a;
     for (const char *Arg : Cmd->getArguments()) {
       if (!Arg) continue;
-      StringRef A(Arg);
-      auto Pos = A.find("libclang_rt.");
-      if (Pos == StringRef::npos) continue;
-      StringRef Base = A.substr(Pos + 12);
-      auto End = Base.find('.');
-      StringRef Component = Base.substr(0, End);
-
-      if (Component.starts_with("ubsan")) {
-        if (!is_elf) {
-          llvm::errs() << "bake: -fsanitize=undefined is not supported on "
-                          "this target yet.\n";
-          FailingCommands.push_back({1, Cmd});
-          if (!Res) Res = 1;
-          return;
-        }
-        if (san_ubsan_a.empty()) {
-          san_ubsan_a = bake::ensure_sanitizer_objects(
-              tc, bake::SanitizerKind::Ubsan).string();
-          if (san_ubsan_a.empty()) {
-            FailingCommands.push_back({1, Cmd});
-            if (!Res) Res = 1;
-            return;
-          }
-        }
-      } else if (Component == "asan" || Component == "asan_cxx" ||
-                 Component == "asan_static") {
-        // One static archive serves all three components: asan_cxx
-        // (operator new/delete) is embedded in the archive, and
-        // asan_static only carries windows report thunks.
-        if (!is_elf) {
-          llvm::errs() << "bake: -fsanitize=address is not supported on "
-                          "this target yet.\n";
-          FailingCommands.push_back({1, Cmd});
-          if (!Res) Res = 1;
-          return;
-        }
-        if (san_asan_a.empty()) {
-          san_asan_a = bake::ensure_sanitizer_objects(
-              tc, bake::SanitizerKind::Asan).string();
-          if (san_asan_a.empty()) {
-            FailingCommands.push_back({1, Cmd});
-            if (!Res) Res = 1;
-            return;
-          }
-        }
-      } else if (Component != "builtins") {
-        // msan, lsan, profile, fuzzer, ... — nothing else is vendored.
+      StringRef Component;
+      SanRtRef Ref = parseSanRtRef(StringRef(Arg), Component);
+      if (Ref != SanRtRef::Ubsan && Ref != SanRtRef::Asan &&
+          Ref != SanRtRef::Unknown)
+        continue;
+      if (Ref == SanRtRef::Unknown) {
         llvm::errs()
           << "bake: sanitizer runtime '" << Component
           << "' is not vendored; supported sanitizers are 'address' and "
@@ -426,6 +435,18 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
         FailingCommands.push_back({1, Cmd});
         if (!Res) Res = 1;
         return;
+      }
+      std::string &Rt = Ref == SanRtRef::Ubsan ? san_ubsan_a : san_asan_a;
+      if (Rt.empty()) {
+        Rt = bake::ensure_sanitizer_objects(
+                 tc, Ref == SanRtRef::Ubsan ? bake::SanitizerKind::Ubsan
+                                            : bake::SanitizerKind::Asan)
+                 .string();
+        if (Rt.empty()) {
+          FailingCommands.push_back({1, Cmd});
+          if (!Res) Res = 1;
+          return;
+        }
       }
     }
 
@@ -470,6 +491,19 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       for (auto& dir : rt.framework_dirs)
         Prefix.push_back("-F" + dir);
       Prefix.push_back("-lSystem");
+      // Sanitized links load the runtime dylibs through their @rpath
+      // install names from the bake cache — the layout the official
+      // Clang uses for its bundled darwin runtimes.
+      if (!san_ubsan_a.empty()) {
+        Prefix.push_back("-rpath");
+        Prefix.push_back(std::filesystem::path(san_ubsan_a)
+                             .parent_path().string());
+      }
+      if (!san_asan_a.empty()) {
+        Prefix.push_back("-rpath");
+        Prefix.push_back(std::filesystem::path(san_asan_a)
+                             .parent_path().string());
+      }
     }
 
 
@@ -526,10 +560,31 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
              n == "nss_dns" || n == "nss_files";
     };
 
+    // darwin: the Clang driver points -rpath at its resource dir
+    // (…/lib/darwin) for its bundled sanitizer dylibs; bake's dylibs
+    // live in the cache dir (rpath injected in the Prefix). Strip the
+    // stale pairs up front so the rewriting loop below stays simple.
+    llvm::SmallVector<const char *> LinkArgs;
+    if (is_darwin) {
+      auto Src = Cmd->getArguments();
+      for (size_t i = 0; i < Src.size(); ++i) {
+        if (Src[i] && StringRef(Src[i]) == "-rpath" && i + 1 < Src.size() &&
+            Src[i + 1] &&
+            StringRef(Src[i + 1]).ends_with("/lib/darwin")) {
+          ++i;
+          continue;
+        }
+        LinkArgs.push_back(Src[i]);
+      }
+    } else {
+      for (const char *A : Cmd->getArguments())
+        LinkArgs.push_back(A);
+    }
+
     bool skip_next_dynamic_linker = false;
     int skip_platform_values = 0;  // remaining -platform_version values
     bool bake_owns_platform_version = is_darwin;
-    for (const char *Arg : Cmd->getArguments()) {
+    for (const char *Arg : LinkArgs) {
       if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
         continue;
       if (skip_platform_values > 0) {
@@ -550,39 +605,36 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
         continue;
       }
       // Sanitizer runtime references: swap the driver-emitted path for
-      // the archive bake built from the vendored sources. (The .c_str()
-      // pointers stay valid: san_*_a and the compiler_rt copy outlive
-      // the bake_lld_link call.)
+      // the artifact bake built. (The .c_str() pointers stay valid:
+      // san_*_a and the compiler_rt copy outlive the bake_lld_link
+      // call.) ELF asan keeps the driver's --whole-archive markers
+      // around it — __asan_preinit and the interceptors must survive,
+      // and the archive lands before the libc archives, so its malloc
+      // definition wins. darwin swaps the dylib reference (loaded via
+      // the injected rpath); mingw links the import library.
       if (Arg) {
-        StringRef A(Arg);
-        auto Pos = A.find("libclang_rt.");
-        if (Pos != StringRef::npos) {
-          StringRef Base = A.substr(Pos + 12);
-          auto End = Base.find('.');
-          StringRef Component = Base.substr(0, End);
-          static std::string compiler_rt_path;
-          if (Component.starts_with("ubsan")) {
-            LldArgs.push_back(san_ubsan_a.c_str());
-            continue;
-          }
-          if (Component == "asan") {
-            // The driver wraps this in --whole-archive/--no-whole-archive
-            // (markers pass through untouched), keeping __asan_preinit
-            // and the interceptors alive; it lands before the libc
-            // archives, so its malloc definition wins.
-            LldArgs.push_back(san_asan_a.c_str());
-            continue;
-          }
-          if (Component == "asan_cxx" || Component == "asan_static") {
-            // operator new/delete and the report thunks are already
-            // embedded in the asan archive.
-            continue;
-          }
-          if (Component == "builtins" && !rt.compiler_rt.string().empty()) {
+        StringRef Component;
+        static std::string compiler_rt_path;
+        switch (parseSanRtRef(StringRef(Arg), Component)) {
+        case SanRtRef::Ubsan:
+          LldArgs.push_back(san_ubsan_a.c_str());
+          continue;
+        case SanRtRef::Asan:
+          LldArgs.push_back(san_asan_a.c_str());
+          continue;
+        case SanRtRef::Helper:
+          // Covered by the runtime bake links — drop the reference.
+          continue;
+        case SanRtRef::Builtins:
+          if (!rt.compiler_rt.string().empty()) {
             compiler_rt_path = rt.compiler_rt.string();
             LldArgs.push_back(compiler_rt_path.c_str());
             continue;
           }
+          break;
+        case SanRtRef::Unknown:
+        case SanRtRef::None:
+          break;
         }
       }
       if (is_mingw && Arg) {
@@ -651,6 +703,8 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
       FailingCommands.push_back({LinkRes, Cmd});
       if (!Res)
         Res = LinkRes;
+    } else if (is_mingw && !san_asan_a.empty()) {
+      copyMingwAsanDll(Cmd, san_asan_a);
     }
     return;
   }

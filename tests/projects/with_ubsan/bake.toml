@@ -1,5 +1,5 @@
 [package]
-name = "cross-gnu-ubsan"
+name = "with-ubsan"
 version = "0.1.0"
 
 [profile.dev]

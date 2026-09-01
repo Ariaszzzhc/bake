@@ -3455,69 +3455,59 @@ TestResult test_cross_gnu_prereq() {
     return {};
 }
 
-TestResult test_cross_gnu_ubsan() {
-    // The UBSan standalone runtime is built from the vendored
-    // compiler-rt sources at link time and statically linked in; its
-    // reporter strings are present in the binary. (The runtime report
-    // itself is verified ad hoc in a container; the suite does not
-    // depend on docker.)
-    auto dir = make_temp_dir("cross_gnu_ubsan");
-    copy_fixture("cross_gnu_ubsan", dir);
+TestResult test_with_asan() {
+    // Native asan on whatever host the suite runs on: the runtime is
+    // built from the vendored compiler-rt sources into the global cache
+    // (per-platform form — static archive or dylib). The faulting
+    // program aborts with a report.
+    auto dir = make_temp_dir("with_asan");
+    copy_fixture("with_asan", dir);
 
-    auto build = run_bake("build -t x86_64-linux-gnu.2.36", dir);
-    CHECK(build.success(), "ubsan cross build failed: " + build.stdout);
-    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-ubsan";
-    CHECK(fs::exists(out), "ubsan binary missing");
-    auto elf = inspect_elf64(out);
-    CHECK(elf.valid, "ubsan output is not a valid ELF64 binary");
+    auto build = run_bake("build", dir);
+    CHECK(build.success(), "asan native build failed: " + build.stdout);
+    const fs::path exe =
+        native_executable_path(target_output_dir(dir), "with-asan");
+    CHECK(fs::exists(exe), "asan executable missing");
 
-    std::string bytes;
-    {
-        std::ifstream f(out, std::ios::binary);
-        bytes.assign(std::istreambuf_iterator<char>(f), {});
-    }
-    CHECK(bytes.find("UndefinedBehaviorSanitizer") != std::string::npos,
-          "ubsan runtime not statically linked into the binary");
-
-    // Runtimes without a vendored counterpart (msan, lsan, ...) are
-    // rejected at link with a clear message.
-    auto msan = run_bake("cc -target x86_64-linux-gnu -fsanitize=memory "
-                         "src/main.c -o msan-rejected",
-                         dir);
-    CHECK(!msan.success() &&
-              msan.stdout.find("not vendored") != std::string::npos,
-          "msan link should be rejected with a clear message");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK(!run.success(),
+          "asan-detected overflow must abort: " + run.stdout);
+    CHECK(run.stdout.find("AddressSanitizer: heap-buffer-overflow") !=
+              std::string::npos,
+          "asan report missing from output: " + run.stdout);
+    CHECK(run.stdout.find("SUMMARY: AddressSanitizer") != std::string::npos,
+          "asan SUMMARY line missing: " + run.stdout);
 
     return {};
 }
 
-TestResult test_cross_gnu_asan() {
-    // The ASan runtime is built from vendored compiler-rt sources
-    // (asan + lsan_common + ubsan core) at link time and statically
-    // linked in via --whole-archive; its reporter strings and
-    // interface symbols are present in the binary. The runtime report
-    // itself is verified ad hoc in a container; the suite does not
-    // depend on docker.
-    auto dir = make_temp_dir("cross_gnu_asan");
-    copy_fixture("cross_gnu_asan", dir);
+TestResult test_with_ubsan() {
+    // Native ubsan on whatever host the suite runs on. The faulting
+    // program reports and (default recover mode) keeps running.
+    auto dir = make_temp_dir("with_ubsan");
+    copy_fixture("with_ubsan", dir);
 
-    auto build = run_bake("build -t x86_64-linux-gnu.2.36", dir);
-    CHECK(build.success(), "asan cross build failed: " + build.stdout);
-    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-asan";
-    CHECK(fs::exists(out), "asan binary missing");
-    auto elf = inspect_elf64(out);
-    CHECK(elf.valid && elf.interp == "/lib64/ld-linux-x86-64.so.2",
-          "asan output is not a dynamic gnu executable");
+    auto build = run_bake("build", dir);
+    CHECK(build.success(), "ubsan native build failed: " + build.stdout);
+    const fs::path exe =
+        native_executable_path(target_output_dir(dir), "with-ubsan");
+    CHECK(fs::exists(exe), "ubsan executable missing");
 
-    std::string bytes;
-    {
-        std::ifstream f(out, std::ios::binary);
-        bytes.assign(std::istreambuf_iterator<char>(f), {});
-    }
-    CHECK(bytes.find("AddressSanitizer") != std::string::npos,
-          "asan runtime not statically linked into the binary");
-    CHECK(bytes.find("__asan_report_store1") != std::string::npos,
-          "asan report interface missing from the binary");
+    auto run = run_cmd(exe.string(), dir);
+    CHECK(run.stdout.find("runtime error: division by zero") !=
+              std::string::npos,
+          "ubsan report missing from output: " + run.stdout);
+    CHECK(run.stdout.find("SUMMARY: UndefinedBehaviorSanitizer") !=
+              std::string::npos,
+          "ubsan SUMMARY line missing: " + run.stdout);
+
+    // Runtimes without a vendored counterpart are rejected at link with
+    // a clear message. (fuzzer: every platform's driver accepts it, so
+    // the rejection comes from bake's link interception.)
+    auto fz = run_bake("cc -fsanitize=fuzzer src/main.c -o fuzzer-rejected",
+                       dir);
+    CHECK(!fz.success() && fz.stdout.find("not vendored") != std::string::npos,
+          "fuzzer link should be rejected with a clear message");
 
     return {};
 }
@@ -3739,9 +3729,8 @@ TestResult test_target_output_isolation() {
 // ----------------------------------------------------------------
 
 static std::vector<TestCase> all_tests = {
-    {"cross_gnu_ubsan",              test_cross_gnu_ubsan},
-    {"cross_gnu_asan",               test_cross_gnu_asan},
-    {"target_conditions",             test_target_conditions},
+    {"with_ubsan",                   test_with_ubsan},
+    {"with_asan",                    test_with_asan},
     {"cross_gnu",                     test_cross_gnu},
     {"cross_gnu_cpp",                 test_cross_gnu_cpp},
     {"cross_gnu_prereq",              test_cross_gnu_prereq},

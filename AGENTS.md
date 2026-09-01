@@ -232,21 +232,25 @@ no manual bump markers. Managed by `toolchain_cache_lookup`/`finish`.
 
 ## Sanitizers
 
-- Supported: `-fsanitize=address` (static asan, whole-archive'd) and
-  `-fsanitize=undefined` (ubsan standalone) — runtimes built from the
-  vendored compiler-rt sources
+- Supported: `-fsanitize=address` and `-fsanitize=undefined` — runtimes
+  built from the vendored compiler-rt sources
   (`lib/compiler-rt/lib/{sanitizer_common,interception,ubsan,asan,lsan}`)
-  per ELF target (linux-gnu, linux-musl) at first link, cached like any
-  runtime product. The asan archive embeds lsan_common (leak detection),
-  the ubsan reporting core and operator new/delete. Runtime compile
-  flags include `-fno-builtin` (loop-idiom recognition would otherwise
-  route internal_* loops through the interceptors and deadlock init)
-  and every flag is part of the cache config key.
+  at first link, cached like any runtime product. Each platform uses its
+  official form: ELF (linux-gnu/musl) static archives (asan
+  whole-archive'd; embeds lsan_common, the ubsan reporting core and
+  operator new/delete), darwin shared dylibs (`@rpath` install names, the
+  driver injects the cache-dir rpath — the official Clang layout; cxxabi
+  and operator-new references stay undefined like upstream's dylibs),
+  windows-gnu ubsan static archive + asan shared DLL (x86_64 only, per
+  upstream; the DLL is copied next to the executable).
+- Runtime compile flags include `-fno-builtin` (loop-idiom recognition
+  would otherwise route internal_* loops through the interceptors and
+  deadlock init); every flag is part of the cache config key.
+- Sanitizers are a native development tool: native builds are the
+  contract; cross-built sanitized products are not validated.
 - Other sanitizers (tsan, msan, ...) are not vendored: compile-only
   invocations still instrument; the link is rejected with a clear
   message.
-- Non-ELF targets reject sanitize links with "not supported on this
-  target yet".
 
 ## Coding Style
 
