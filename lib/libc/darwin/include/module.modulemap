@@ -1,5 +1,4 @@
 // High level C interfaces.
-extern module AppleTextureEncoder "AppleTextureEncoder.modulemap"
 extern module asl "asl.modulemap"
 extern module Compression "compression.modulemap"
 extern module CUPS "cups.modulemap"
@@ -11,7 +10,6 @@ extern module ICU "unicode.modulemap"
 extern module krb5 "krb5.modulemap"
 extern module ldap "ldap.modulemap"
 extern module SQLite3 "SQLite3.modulemap"
-extern module xcselect "xcselect.modulemap"
 extern module zlib "zlib.modulemap"
 
 // Interfaces for process management and interprocess communication.

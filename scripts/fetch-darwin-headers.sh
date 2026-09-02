@@ -34,9 +34,10 @@ mkdir -p "$DEST/include" "$DEST"
 # 1. Copy /usr/include/* excluding:
 #    - c++/ (bake builds its own libc++ headers)
 #    - closed Apple framework interfaces with no open-source counterpart
-CLOSED_FW=(AppleArchive AppleEXR.h AppleTextureEncoder.h EndpointSecurity \
-           Spatial SystemHealthClient.h SystemHealthManager.h networkext \
-           odmodule hvf libmanagedconfigurationfiles.h xcselect.h arm64/hv)
+CLOSED_FW=(AppleArchive AppleEXR.h AppleTextureEncoder.h AppleTextureEncoder.modulemap \
+           EndpointSecurity Spatial SystemHealthClient.h SystemHealthManager.h \
+           networkext odmodule hvf libmanagedconfigurationfiles.h xcselect.h \
+           xcselect.modulemap arm64/hv)
 RSYNC_ARGS=(-a --exclude='c++/')
 for p in "${CLOSED_FW[@]}"; do RSYNC_ARGS+=(--exclude="$p"); done
 rsync "${RSYNC_ARGS[@]}" "$SDK/usr/include/" "$DEST/include/"
