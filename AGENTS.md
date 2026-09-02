@@ -6,6 +6,27 @@ bake is an all-in-one C/C++ build system and compiler toolchain. Think "Cargo fo
 
 APIs are not frozen — make changes clean, not backward-compatible.
 
+## Iteration Posture
+
+Fast iteration, quality-first. When these rules conflict with minimal-diff
+instincts, these rules win:
+
+- **Growth justifies breaking changes.** Requirements start small and grow.
+  When one outgrows its shape — signature, type, module boundary — reshape it
+  and migrate every caller in the same change. Never add a parallel path,
+  adapter, compat flag, or defaulted parameter to dodge a break.
+- **Refactoring is in scope.** If a change makes neighboring code wrong or
+  redundant, fixing or deleting those neighbors belongs to the task. Never
+  leave old and new paths both alive; cutover clean.
+- **Map before writing.** Before designing, find how the concern is currently
+  handled everywhere — search concept keywords, not one file. Before adding
+  any function/type/constant, search for an existing equivalent. Two similar
+  implementations → unify; never add a third.
+- **Reshape instead of stacking.** If a change fights the current structure,
+  the structure is wrong — change the structure. Wrappers, pre/post passes,
+  and special cases layered on top are rejected; inline them or reshape what
+  is underneath.
+
 ## Build & Test
 
 ```bash
