@@ -9,7 +9,7 @@ int main() {
         "src/right/value.c",
     });
 
-    if (b.option_bool("native-backend"))
+    if (b.feature("native-backend"))
         b.sources("src/backend/native.c");
     else
         b.sources("src/backend/portable.c");

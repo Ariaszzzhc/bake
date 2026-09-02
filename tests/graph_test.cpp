@@ -58,7 +58,7 @@ bool manifest_form_tests() {
         "\n"
         "[dependencies]\n"
         "fmt = { url = \"https://github.com/fmtlib/fmt\", tag = \"11.1.4\" }\n"
-        "dev = { url = \"https://example.com/dev\", branch = \"main\", options = [\"a\", \"b\"] }\n"
+        "dev = { url = \"https://example.com/dev\", branch = \"main\", features = [\"a\", \"b\"] }\n"
         "pin = { url = \"https://example.com/pin\", rev = \"deadbeef\" }\n"
         "head = { url = \"https://example.com/head\" }\n"
         "arc = { url = \"https://example.com/arc-1.0.tar.gz\" }\n"
@@ -83,9 +83,9 @@ bool manifest_form_tests() {
     check(manifest->dependencies.at("dev").git_ref() ==
               std::pair<std::string, std::string>{"branch", "main"},
           "dev ref is branch main");
-    check(manifest->dependencies.at("dev").options ==
+    check(manifest->dependencies.at("dev").features ==
               std::vector<std::string>{"a", "b"},
-          "dev options");
+          "dev features");
     check(manifest->dependencies.at("pin").git_ref() ==
               std::pair<std::string, std::string>{"rev", "deadbeef"},
           "pin ref is rev");
@@ -154,7 +154,7 @@ bool effective_dependency_tests() {
         }
     };
 
-    auto musl = bake::effective_dependencies(*manifest, "x86_64-linux-musl");
+    auto musl = bake::effective_dependencies(*manifest, "x86_64-linux-musl", {});
     check(musl.has_value(), "musl resolves");
     if (musl) {
         check(musl->size() == 3, "musl set = fmt + extra + shared");
@@ -163,7 +163,7 @@ bool effective_dependency_tests() {
     }
 
     auto darwin = bake::effective_dependencies(*manifest,
-                                               "x86_64-apple-darwin");
+                                               "x86_64-apple-darwin", {});
     check(darwin.has_value(), "darwin resolves");
     if (darwin) {
         check(darwin->size() == 1 && darwin->contains("fmt"),
@@ -184,7 +184,7 @@ bool effective_dependency_tests() {
     check(cmanifest.has_value(), "conflict manifest loads");
     if (cmanifest) {
         auto result =
-            bake::effective_dependencies(*cmanifest, "x86_64-linux-musl");
+            bake::effective_dependencies(*cmanifest, "x86_64-linux-musl", {});
         check(!result.has_value(), "conflicting definition rejected");
         if (!result) {
             const std::string& error = result.error();
@@ -195,7 +195,7 @@ bool effective_dependency_tests() {
                   "conflict error names both scopes");
         }
         auto clean =
-            bake::effective_dependencies(*cmanifest, "x86_64-apple-darwin");
+            bake::effective_dependencies(*cmanifest, "x86_64-apple-darwin", {});
         check(clean.has_value() && clean->size() == 1,
               "conflict invisible on non-matching triple");
     }

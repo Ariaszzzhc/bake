@@ -1,0 +1,10 @@
+[package]
+name = "mathlib"
+version = "0.1.0"
+type = "lib"
+
+[language]
+c = "c17"
+
+[features]
+fast = { dependencies = { tabdata = { path = "../tabdata" } }, defines = ["MATH_FAST=1"] }

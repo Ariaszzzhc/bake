@@ -270,13 +270,16 @@ std::string normalize_macro_name(std::string_view name) {
 }
 
 export std::vector<std::pair<std::string, std::string>>
-generate_option_macros(const std::string& moid_name,
-                       const std::map<std::string, BuildOption>& options) {
+generate_feature_macros(const std::string& moid_name,
+                        const std::map<std::string, FeatureSpec>& features,
+                        const std::vector<std::string>& active) {
     std::string prefix = "BAKE_" + normalize_macro_name(moid_name);
+    std::set<std::string> active_set(active.begin(), active.end());
     std::vector<std::pair<std::string, std::string>> macros;
-    for (const auto& [name, opt] : options) {
-        std::string macro_name = prefix + "_" + normalize_macro_name(name);
-        macros.emplace_back(macro_name, opt.value ? "1" : "0");
+    for (const auto& [name, spec] : features) {
+        (void)spec;
+        macros.emplace_back(prefix + "_" + normalize_macro_name(name),
+                            active_set.count(name) ? "1" : "0");
     }
     return macros;
 }

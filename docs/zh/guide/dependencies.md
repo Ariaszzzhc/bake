@@ -146,4 +146,4 @@ bake remove <name> [--target <glob>]
 
 ## 图中的选项
 
-`[options]` 是仅允许 bool 的功能标志，会在整个依赖图中以 OR 合并（参见 [Profiles and Options](../reference/profiles.md)）。在 `curl` 依赖中激活 `use_tls` 会使该依赖（以及其下游的任何内容）以 `BAKE_CURL_USE_TLS=1` 编译。
+`[features]` 是命名的特性束，会在整个依赖图上并集合一（参见 [Profiles 与特性](../reference/profiles.md)）。在 `curl` 依赖上激活 `tls-openssl` 会解析该特性的依赖（openssl port）、注入其 `defines`，并以 `BAKE_CURL_TLS_OPENSSL=1` 编译该依赖；互斥特性（`conflicts`）在 configure 期报错。

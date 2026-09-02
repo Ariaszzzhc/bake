@@ -1101,24 +1101,62 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
 
     Lockfile lockfile;
 
-    // BFS queue: (dep, parent manifest dir for relative path resolution).
-    // Every declared scope (global + all [target.*] tables) participates.
+    // BFS queue: (dep, parent manifest dir, features the consumer
+    // activated on this dependency).
+    //
+    // The lock carries the union over every target and every reachable
+    // feature activation: default features always, explicit activations
+    // arriving on dependency edges. Conflicts are not checked here —
+    // they are a per-build-target concern validated during graph
+    // resolution.
     struct QueueEntry {
         Dependency dep;
         Path manifest_dir;
+        std::set<std::string> features;
     };
     std::vector<QueueEntry> queue;
 
-    auto enqueue_scopes = [&](const Manifest& m) {
+    // Accumulated activation per package identity (dedup key / path).
+    std::map<std::string, std::set<std::string>> activated_by_key;
+    std::map<Path, std::set<std::string>> activated_by_path;
+
+    auto active_features_of = [&](const Manifest& m,
+                                  const std::set<std::string>& extra)
+            -> std::optional<std::set<std::string>> {
+        std::set<std::string> active(m.default_features.begin(),
+                                     m.default_features.end());
+        for (const auto& name : extra) {
+            if (!m.features.count(name)) {
+                std::println(std::cerr,
+                             "bake: feature '{}' is not declared by "
+                             "package '{}'",
+                             name,
+                             m.moid ? m.moid->name : std::string("<unknown>"));
+                return std::nullopt;
+            }
+            active.insert(name);
+        }
+        return active;
+    };
+
+    auto enqueue_scopes = [&](const Manifest& m,
+                              const std::set<std::string>& active) {
         std::vector<const std::map<std::string, Dependency>*> scopes;
         scopes.push_back(&m.dependencies);
         for (const auto& condition : m.targets)
             scopes.push_back(&condition.dependencies);
+        for (const auto& name : active)
+            scopes.push_back(&m.features.at(name).dependencies);
         for (auto* scope : scopes)
             for (auto& [name, dep] : *scope)
-                queue.push_back({dep, m.project_dir});
+                queue.push_back({dep, m.project_dir,
+                                 {dep.features.begin(), dep.features.end()}});
     };
-    enqueue_scopes(manifest);
+    {
+        auto root_active = active_features_of(manifest, {});
+        if (!root_active) return std::nullopt;
+        enqueue_scopes(manifest, *root_active);
+    }
 
     // Dedupe by normalized url + ref identity within this run.
     std::set<std::string> seen_refs;
@@ -1140,25 +1178,43 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
             return std::nullopt;
         }
 
-        auto [dep, manifest_dir] = queue.front();
+        auto entry = queue.front();
         queue.erase(queue.begin());
+        const Dependency& dep = entry.dep;
 
         if (dep.is_path_dep) {
             // Path deps are manifest-only (never locked); recurse into
             // native ones to reach their remote dependencies.
-            Path dep_dir = (manifest_dir / dep.path.c_str()).lexically_normal();
+            Path dep_dir = (entry.manifest_dir / dep.path.c_str())
+                               .lexically_normal();
             Path dep_toml = dep_dir / "bake.toml";
             if (dep_toml.is_regular_file()) {
                 auto sub_manifest = Manifest::load_moid(dep_dir);
                 if (sub_manifest) {
                     sub_manifest->project_dir = dep_dir;
-                    enqueue_scopes(*sub_manifest);
+                    auto& seen = activated_by_path[dep_dir.absolute()];
+                    bool grew = false;
+                    for (const auto& name : entry.features)
+                        if (seen.insert(name).second) grew = true;
+                    if (grew || seen.empty()) {
+                        auto active =
+                            active_features_of(*sub_manifest, seen);
+                        if (!active) return std::nullopt;
+                        enqueue_scopes(*sub_manifest, *active);
+                    }
                 }
             }
             continue;
         }
 
-        if (!seen_refs.insert(dedup_key(dep)).second) continue;  // done this run
+        // A first visit resolves over the network; a later visit only
+        // matters when it activated additional features, in which case the
+        // newly reachable feature dependencies are enqueued below.
+        auto& accumulated = activated_by_key[dedup_key(dep)];
+        bool grew = false;
+        for (const auto& name : entry.features)
+            if (accumulated.insert(name).second) grew = true;
+        if (!seen_refs.insert(dedup_key(dep)).second && !grew) continue;
 
         std::string ref_type = dep.is_archive() ? "archive" : "";
         std::string ref;
@@ -1169,9 +1225,10 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
         }
 
         // Locked-as-hints: url+ref unchanged → carry the entry verbatim.
-        // No ls-remote, no download. The transitive closure of a carried
-        // entry was locked together with it and is covered by other hints.
-        if (hints) {
+        // No ls-remote, no download. Only safe when this visit activated
+        // no new features — otherwise the closure reachable through the
+        // new features is not covered by the carried entry.
+        if (hints && !grew) {
             const LockDep* hint = hints->find_remote(dep.url, ref_type, ref);
             if (hint && !hint->integrity.empty() &&
                 (dep.is_archive() || !hint->commit.empty())) {
@@ -1194,7 +1251,9 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
             Path dep_cache = cache_dir_ / hash;
             if (auto sub_manifest = Manifest::load_moid(dep_cache)) {
                 sub_manifest->project_dir = dep_cache;
-                enqueue_scopes(*sub_manifest);
+                auto active = active_features_of(*sub_manifest, accumulated);
+                if (!active) return std::nullopt;
+                enqueue_scopes(*sub_manifest, *active);
             }
         }
     }
@@ -1203,58 +1262,81 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
 }
 
 // Rebuild a lockfile restricted to the entries reachable from the
-// manifest's declared closure (every scope). Zero network: reachability
+// manifest's declared closure (every scope, defaults plus the feature
+// activations requested on dependency edges). Zero network: reachability
 // walks path-dep manifests and cached native sources through lock entries.
 // Used by `bake remove` to drop entries the manifest no longer references.
 export Lockfile prune_lock(const Manifest& manifest, const Lockfile& lock) {
     Lockfile pruned;
 
-    std::set<Path> visited;
-    std::function<void(const Manifest&)> walk = [&](const Manifest& m) {
-        std::vector<const std::map<std::string, Dependency>*> scopes;
-        scopes.push_back(&m.dependencies);
-        for (const auto& condition : m.targets)
-            scopes.push_back(&condition.dependencies);
-        for (auto* scope : scopes) {
-            for (auto& [alias, dep] : *scope) {
-                (void)alias;
-                if (dep.is_path_dep) {
-                    Path dep_dir = (m.project_dir / dep.path.c_str())
-                                       .lexically_normal();
-                    if ((dep_dir / "bake.toml").is_regular_file() &&
-                        visited.insert(dep_dir.absolute()).second) {
-                        if (auto sub = Manifest::load_moid(dep_dir)) {
-                            sub->project_dir = dep_dir;
-                            walk(*sub);
+    std::map<Path, std::set<std::string>> visited;
+    std::function<void(const Manifest&, const std::set<std::string>&)> walk =
+        [&](const Manifest& m, const std::set<std::string>& activated) {
+            std::vector<const std::map<std::string, Dependency>*> scopes;
+            scopes.push_back(&m.dependencies);
+            for (const auto& condition : m.targets)
+                scopes.push_back(&condition.dependencies);
+            for (const auto& name : m.default_features)
+                if (m.features.count(name))
+                    scopes.push_back(&m.features.at(name).dependencies);
+            for (const auto& name : activated)
+                if (m.features.count(name) &&
+                    std::ranges::find(m.default_features, name) ==
+                        m.default_features.end())
+                    scopes.push_back(&m.features.at(name).dependencies);
+            for (auto* scope : scopes) {
+                for (auto& [alias, dep] : *scope) {
+                    (void)alias;
+                    if (dep.is_path_dep) {
+                        Path dep_dir = (m.project_dir / dep.path.c_str())
+                                           .lexically_normal();
+                        if ((dep_dir / "bake.toml").is_regular_file()) {
+                            auto& seen = visited[dep_dir.absolute()];
+                            bool grew = false;
+                            for (const auto& name : dep.features)
+                                if (seen.insert(name).second) grew = true;
+                            if (grew || seen.size() == dep.features.size()) {
+                                if (auto sub = Manifest::load_moid(dep_dir)) {
+                                    sub->project_dir = dep_dir;
+                                    walk(*sub, seen);
+                                }
+                            }
                         }
+                        continue;
                     }
-                    continue;
-                }
 
-                std::string ref_type = dep.is_archive() ? "archive" : "";
-                std::string ref;
-                if (ref_type.empty()) {
-                    auto pair = dep.git_ref();
-                    ref_type = pair.first;
-                    ref = pair.second;
-                }
-                const LockDep* entry = lock.find_remote(dep.url, ref_type, ref);
-                if (!entry) continue;  // lock was already stale here
-                pruned.deps.emplace(entry->key, *entry);
+                    std::string ref_type = dep.is_archive() ? "archive" : "";
+                    std::string ref;
+                    if (ref_type.empty()) {
+                        auto pair = dep.git_ref();
+                        ref_type = pair.first;
+                        ref = pair.second;
+                    }
+                    const LockDep* entry =
+                        lock.find_remote(dep.url, ref_type, ref);
+                    if (!entry) continue;  // lock was already stale here
+                    pruned.deps.emplace(entry->key, *entry);
 
-                // Recurse into cached native sources for transitive reach.
-                Path cache_dir = get_cache_dir() / entry->cache_hash();
-                if (cache_dir.is_directory() &&
-                    visited.insert(cache_dir.absolute()).second) {
-                    if (auto sub = Manifest::load_moid(cache_dir)) {
-                        sub->project_dir = cache_dir;
-                        walk(*sub);
+                    // Recurse into cached native sources for transitive
+                    // reach, tracking feature activations per source.
+                    Path cache_dir =
+                        get_cache_dir() / entry->cache_hash();
+                    if (cache_dir.is_directory()) {
+                        auto& seen = visited[cache_dir.absolute()];
+                        bool grew = false;
+                        for (const auto& name : dep.features)
+                            if (seen.insert(name).second) grew = true;
+                        if (grew || seen.size() == dep.features.size()) {
+                            if (auto sub = Manifest::load_moid(cache_dir)) {
+                                sub->project_dir = cache_dir;
+                                walk(*sub, seen);
+                            }
+                        }
                     }
                 }
             }
-        }
-    };
-    walk(manifest);
+        };
+    walk(manifest, {});
     return pruned;
 }
 

@@ -346,7 +346,7 @@ static std::optional<std::string> declaration_semantics(
     auto c_standard = json_scalar_field(document, "c_std");
     auto pattern = json_scalar_field(document, "pattern");
     auto visibility = json_scalar_field(document, "visibility");
-    auto options = json_value_field(document, "options");
+    auto features = json_value_field(document, "features");
     auto flags = json_value_field(document, "flags");
     auto defines = json_value_field(document, "defines");
     auto include_dirs = json_value_field(document, "include_dirs");
@@ -357,7 +357,7 @@ static std::optional<std::string> declaration_semantics(
     auto dependencies = json_value_field(document, "dependencies");
     const std::size_t source_group_count = json_key_count(document, "pattern");
     if (!id || !name || !version || !type || !root ||
-        !cxx_standard || !c_standard || !pattern || !visibility || !options || !flags ||
+        !cxx_standard || !c_standard || !pattern || !visibility || !features || !flags ||
         !defines || !include_dirs || !public_include_dirs || !libraries ||
         !frameworks || !prebuilt_libs || !dependencies || root->empty() ||
         source_group_count == 0) {
@@ -370,7 +370,7 @@ static std::optional<std::string> declaration_semantics(
            ";c_std=" + *c_standard +
            ";source_groups=" + std::to_string(source_group_count) +
            ";pattern=" + *pattern + ";visibility=" + *visibility +
-           ";options=" + *options + ";flags=" + *flags +
+           ";features=" + *features + ";flags=" + *flags +
            ";defines=" + *defines + ";include_dirs=" + *include_dirs +
            ";public_include_dirs=" + *public_include_dirs +
            ";libraries=" + *libraries + ";frameworks=" + *frameworks +
@@ -409,7 +409,7 @@ static bool contains_command_token(
 static std::string declaration_reader_payload(
         const fs::path& root,
         std::string_view type_member = ",\"type\":\"executable\"",
-        std::string_view options = "{}",
+        std::string_view features = "[]",
         std::string_view sources =
             "[{\"pattern\":\"src/main.cpp\",\"visibility\":\"private\"}]",
         std::string_view link = "{\"libraries\":[],\"frameworks\":[]}",
@@ -421,7 +421,7 @@ static std::string declaration_reader_payload(
            ",\"version\":\"0.1.0\"" + std::string(type_member) +
            ",\"root\":\"$BAKE_SOURCE_DIR\"" +
            ",\"cxx_std\":\"c++23\",\"c_std\":\"c17\"" +
-           ",\"options\":" + std::string(options) +
+           ",\"features\":" + std::string(features) +
            ",\"sources\":" + std::string(sources) +
            ",\"public_include_dirs\":[]" +
            ",\"link\":" + std::string(link) +
@@ -502,8 +502,8 @@ TestResult test_input_declaration_equivalence() {
     CHECK_EQ(json_scalar_field(default_json, "visibility").value_or("<missing>"),
              std::string("private"),
              "default input declaration has the wrong source visibility");
-    CHECK_EQ(json_value_field(default_json, "options").value_or("<missing>"),
-             std::string("{}"), "default input declaration options are not empty");
+    CHECK_EQ(json_value_field(default_json, "features").value_or("<missing>"),
+             std::string("[]"), "default input declaration features are not empty");
     CHECK(json_value_field(default_json, "flags").has_value(),
           "default input declaration has no source flags field");
     CHECK(json_value_field(default_json, "defines").has_value(),
@@ -543,8 +543,8 @@ TestResult test_input_declaration_equivalence() {
     CHECK_EQ(json_scalar_field(build_cpp_json, "visibility").value_or("<missing>"),
              std::string("private"),
              "build.cpp input declaration has the wrong source visibility");
-    CHECK_EQ(json_value_field(build_cpp_json, "options").value_or("<missing>"),
-             std::string("{}"), "build.cpp declaration options are not empty");
+    CHECK_EQ(json_value_field(build_cpp_json, "features").value_or("<missing>"),
+             std::string("[]"), "build.cpp declaration features are not empty");
     CHECK(json_value_field(build_cpp_json, "flags").has_value(),
           "build.cpp declaration has no source flags field");
     CHECK(json_value_field(build_cpp_json, "defines").has_value(),
@@ -648,32 +648,32 @@ TestResult test_declaration_reader_validation() {
         {"unknown type", declaration_reader_payload(
              dir, ",\"type\":\"unknown\""),
          "unknown moid type 'unknown'"},
-        {"options type", declaration_reader_payload(
-             dir, type, "[]"),
-         "moid declaration field 'options' must be an object"},
+        {"features type", declaration_reader_payload(
+             dir, type, "\"not-an-array\""),
+         "moid declaration field 'features' must be an array"},
         {"sources type", declaration_reader_payload(
-             dir, type, "{}", "{}"),
+             dir, type, "[]", "{}"),
          "moid declaration field 'sources' must be an array"},
         {"source field type", declaration_reader_payload(
-             dir, type, "{}",
+             dir, type, "[]",
              "[{\"pattern\":17,\"visibility\":\"private\"}]"),
          "moid declaration field 'sources[0].pattern' must be a string"},
         {"link type", declaration_reader_payload(
-             dir, type, "{}", sources, "[]"),
+             dir, type, "[]", sources, "[]"),
          "moid declaration field 'link' must be an object"},
         {"dependencies type", declaration_reader_payload(
-             dir, type, "{}", sources, link, "{}"),
+             dir, type, "[]", sources, link, "{}"),
          "moid declaration field 'dependencies' must be an array"},
         {"prebuilt_libs type", declaration_reader_payload(
-             dir, type, "{}", sources, link, "[]", "{}"),
+             dir, type, "[]", sources, link, "[]", "{}"),
          "moid declaration field 'prebuilt_libs' must be an array"},
         {"prebuilt_libs entry type", declaration_reader_payload(
-             dir, type, "{}", sources, link, "[]", "[17]"),
+             dir, type, "[]", sources, link, "[]", "[17]"),
          "moid declaration field 'prebuilt_libs[0]' must be a string"},
         {"duplicate dependency alias", declaration_reader_payload(
-             dir, type, "{}", sources, link,
-             "[{\"alias\":\"dup\",\"id\":\"first\",\"options\":[]},"
-             "{\"alias\":\"dup\",\"id\":\"second\",\"options\":[]}]"),
+             dir, type, "[]", sources, link,
+            "[{\"alias\":\"dup\",\"id\":\"first\",\"features\":[]},"
+            "{\"alias\":\"dup\",\"id\":\"second\",\"features\":[]}]"),
          "duplicate moid dependency alias 'dup'"},
         {"resolved id mismatch", wrong_id,
          "moid declaration field 'id' does not match resolved identity"},
@@ -681,14 +681,15 @@ TestResult test_declaration_reader_validation() {
          "moid declaration field 'root' does not match resolved root"},
         {"resolved version mismatch", wrong_version,
          "moid declaration field 'version' does not match resolved version"},
-        {"resolved options mismatch", declaration_reader_payload(
-             dir, type, "{\"foreign\":true}"),
-         "moid declaration field 'options' does not match resolved options"},
+        {"resolved features mismatch", declaration_reader_payload(
+             dir, type, "[\"extra\"]"),
+         "moid declaration field 'features' does not match "
+         "resolved features"},
         {"resolved dependencies mismatch", declaration_reader_payload(
-             dir, type, "{}", sources, link,
-             "[{\"alias\":\"foreign\",\"id\":\"foreign-id\","
-             "\"options\":[]}]"),
-         "moid declaration field 'dependencies' does not match resolved dependencies"},
+             dir, type, "[]", sources, link,
+             "[{\"alias\":\"dup\",\"id\":\"first\",\"features\":[]}]"),
+         "moid declaration field 'dependencies' does not "
+         "match resolved dependencies"},
     };
 
     std::string failures;
@@ -1897,9 +1898,8 @@ TestResult test_workspace_selection_identity() {
         "name = \"path-target\"\n"
         "version = \"0.1.0\"\n"
         "type = \"executable\"\n"
-        "[language]\nc = \"c17\"\n\n"
-        "[options]\n"
-        "marker = false\n");
+        "[features]\n"
+        "marker = {}\n");
     write_file(dir / "chosen/src/main.c",
         "int main(void) { return 0; }\n");
     write_file(dir / "other/bake.toml",
@@ -1910,9 +1910,8 @@ TestResult test_workspace_selection_identity() {
         "[language]\nc = \"c17\"\n");
     write_file(dir / "other/src/value.c",
         "int other_value(void) { return 1; }\n");
-
     auto by_path = run_bake(
-        "build -p chosen --option marker -j 1", dir);
+        "build -p chosen --feature marker -j 1", dir);
     CHECK(by_path.success(),
           "canonical workspace path did not take precedence over display name: " +
               by_path.stdout);
@@ -2336,15 +2335,15 @@ TestResult test_default_discovery_meta_dependency() {
         "type = \"executable\"\n"
         "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
-        "answer = { path = \"answer\", options = [\"missing\"] }\n");
+        "answer = { path = \"answer\", features = [\"missing\"] }\n");
     auto unknown = run_bake("build", unknown_dir);
-    CHECK(!unknown.success(), "undeclared dependency option should fail");
-    CHECK(unknown.stdout.find("option 'missing' is not declared by package 'answer'") !=
+    CHECK(!unknown.success(), "undeclared dependency feature should fail");
+    CHECK(unknown.stdout.find(
+              "feature 'missing' is not declared by package 'answer'") !=
               std::string::npos,
-          "undeclared dependency option did not identify its owner: " +
+          "undeclared dependency feature did not identify its owner: " +
               unknown.stdout);
-
-    auto wrong_type_dir = make_temp_dir("build_cpp_meta_dep_non_bool_option");
+    auto wrong_type_dir = make_temp_dir("build_cpp_meta_dep_non_table_feature");
     copy_fixture("build_cpp_meta_dep", wrong_type_dir);
     write_file(wrong_type_dir / "answer/bake.toml",
         "[package]\n"
@@ -2354,19 +2353,17 @@ TestResult test_default_discovery_meta_dependency() {
         "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
         "base = { path = \"../base\" }\n\n"
-        "[options]\n"
+        "[features]\n"
         "biased = 1\n");
     auto wrong_type = run_bake("build", wrong_type_dir);
-    CHECK(!wrong_type.success(), "non-bool option declaration should fail");
+    CHECK(!wrong_type.success(), "non-table feature declaration should fail");
     CHECK(wrong_type.stdout.find("biased") != std::string::npos &&
-              (wrong_type.stdout.find("bool") != std::string::npos ||
-               wrong_type.stdout.find("boolean") != std::string::npos),
-          "non-bool option type was not diagnosed: " +
+              wrong_type.stdout.find("table") != std::string::npos,
+          "non-table feature type was not diagnosed: " +
               wrong_type.stdout);
-
     // One path leaves base.wolfssl at its default while another enables it.
-    // Bool options merge with OR, so base is compiled once with wolfssl=true.
-    auto unified_dir = make_temp_dir("build_cpp_meta_dep_unified_option");
+    // Features unify by union, so base is compiled once with wolfssl active.
+    auto unified_dir = make_temp_dir("build_cpp_meta_dep_unified_feature");
     copy_fixture("build_cpp_meta_dep", unified_dir);
     write_file(unified_dir / "bake.toml",
         "[package]\n"
@@ -2375,8 +2372,8 @@ TestResult test_default_discovery_meta_dependency() {
         "type = \"executable\"\n"
         "[language]\ncxx = \"c++23\"\n\n"
         "[dependencies]\n"
-        "answer = { path = \"answer\", options = [\"biased\"] }\n"
-        "base = { path = \"base\", options = [\"wolfssl\"] }\n");
+        "answer = { path = \"answer\", features = [\"biased\"] }\n"
+        "base = { path = \"base\", features = [\"wolfssl\"] }\n");
     write_file(unified_dir / "src/main.cpp",
         "#include <answer/answer.hpp>\n\n"
         "int main() { return answer() == 42 ? 0 : 1; }\n");
@@ -2571,38 +2568,21 @@ TestResult test_build_cpp_options() {
     CHECK(unchanged.success(), "unchanged option rebuild failed: " + unchanged.stdout);
     CHECK(unchanged.stdout.find("Compiling") == std::string::npos,
           "unchanged options did not reuse build actions: " + unchanged.stdout);
-
     auto overridden = run_option_bake(
-        "build --option native-backend --option diagnostics");
-    CHECK(overridden.success(), "overridden option build failed: " + overridden.stdout);
+        "build --feature native-backend --feature diagnostics");
+    CHECK(overridden.success(), "activated feature build failed: " + overridden.stdout);
     CHECK(overridden.stdout.find("Compiling") != std::string::npos,
-          "option change incorrectly reused stale actions: " + overridden.stdout);
+          "feature change incorrectly reused stale actions: " + overridden.stdout);
 
     auto overridden_run = run_cmd(exe.string(), dir);
-    CHECK(overridden_run.success(), "overridden option executable failed");
+    CHECK(overridden_run.success(), "activated feature executable failed");
     CHECK_EQ(overridden_run.stdout, std::string("native|1\n"),
-             "build.cpp and generated macros disagree on enabled bool options");
+             "build.cpp and generated macros disagree on activated features");
 
-    auto disabled = run_option_bake(
-        "build --option native-backend=false --option diagnostics=false");
-    CHECK(disabled.success(),
-          "explicit false option override failed: " + disabled.stdout);
-    auto disabled_run = run_cmd(exe.string(), dir);
-    CHECK(disabled_run.success(), "explicit-false option executable failed");
-    CHECK_EQ(disabled_run.stdout, std::string("portable|0\n"),
-             "explicit false did not reach build.cpp and generated macros");
-
-    auto invalid_type = run_option_bake("build --option diagnostics=maybe");
-    CHECK(!invalid_type.success(), "non-boolean CLI option should fail");
-    CHECK(invalid_type.stdout.find("diagnostics") != std::string::npos &&
-              (invalid_type.stdout.find("bool") != std::string::npos ||
-               invalid_type.stdout.find("boolean") != std::string::npos),
-          "invalid bool option did not report its type: " + invalid_type.stdout);
-
-    auto unknown = run_option_bake("build --option missing");
-    CHECK(!unknown.success(), "undeclared option should fail");
-    CHECK(unknown.stdout.find("unknown build option 'missing'") != std::string::npos,
-          "unknown option did not report its name: " + unknown.stdout);
+    auto unknown = run_option_bake("build --feature missing");
+    CHECK(!unknown.success(), "undeclared feature should fail");
+    CHECK(unknown.stdout.find("unknown feature 'missing'") != std::string::npos,
+          "unknown feature did not report its name: " + unknown.stdout);
 
     auto run_via_bake = run_option_bake("run");
     CHECK(run_via_bake.success(),
@@ -2616,35 +2596,158 @@ TestResult test_build_cpp_options() {
 }
 
 TestResult test_options_reject_non_bool() {
-    struct InvalidOption {
+    struct InvalidManifest {
         std::string name;
-        std::string value;
+        std::string extra;
+        std::string diagnostic;
     };
-    const std::vector<InvalidOption> invalid = {
-        {"integer", "1"},
-        {"string", "\"enabled\""},
+    const std::vector<InvalidManifest> invalid = {
+        {"legacy_options_table",
+         "[options]\nflag = true\n",
+         "[options] was replaced by [features]"},
+        {"default_not_array",
+         "[features]\ndefault = { accelerated = true }\n",
+         "features key 'default' must be an array"},
+        {"feature_not_table",
+         "[features]\naccelerated = true\n",
+         "feature 'accelerated' must be a table"},
+        {"bad_platform_pattern",
+         "[features]\naccelerated = { platforms = [\"x86*-linux\"] }\n",
+         "not a valid triple pattern"},
     };
 
-    for (const auto& option : invalid) {
-        auto dir = make_temp_dir("non_bool_option_" + option.name);
+    for (const auto& manifest_case : invalid) {
+        auto dir = make_temp_dir("features_manifest_" + manifest_case.name);
         write_file(dir / "bake.toml",
             "[package]\n"
-            "name = \"non-bool-option\"\n"
+            "name = \"feature-manifest\"\n"
             "version = \"0.1.0\"\n"
-            "[language]\nc = \"c17\"\n\n"
-            "[options]\n"
-            "feature = " + option.value + "\n");
+            "[language]\nc = \"c17\"\n\n" +
+            manifest_case.extra);
         write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
 
         auto result = run_bake("build", dir);
         CHECK(!result.success(),
-              option.name + " option unexpectedly succeeded");
-        CHECK(result.stdout.find("feature") != std::string::npos &&
-                  (result.stdout.find("bool") != std::string::npos ||
-                   result.stdout.find("boolean") != std::string::npos),
-              option.name + " option lacked a bool-only diagnostic: " +
+              manifest_case.name + " unexpectedly succeeded");
+        CHECK(result.stdout.find(manifest_case.diagnostic) !=
+                  std::string::npos,
+              manifest_case.name + " lacked its diagnostic: " +
                   result.stdout);
     }
+
+    return {};
+}
+
+// A feature can pull its own dependencies (resolved only when active) and
+// inject compile defines into the declaring package.
+TestResult test_feature_activation() {
+    auto dir = make_temp_dir("feature_activation");
+    copy_fixture("feature_activation", dir);
+
+    auto activated = run_bake("build", dir);
+    CHECK(activated.success(),
+          "feature-activated build failed: " + activated.stdout);
+    auto run_activated = run_cmd(
+        (target_output_dir(dir) / "bin" / "feature-app").string(), dir);
+    CHECK_EQ(run_activated.exit_code, 0,
+             "activated feature path was not taken (expected 8): " +
+                 run_activated.stdout);
+    CHECK_EQ(run_activated.stdout, std::string("8\n"),
+             "feature dependency was not pulled (expected tabdata+1): " +
+                 run_activated.stdout);
+
+    // Without the activation the feature dependency is absent and the
+    // plain implementation is used.
+    auto plain_dir = make_temp_dir("feature_activation_plain");
+    copy_fixture("feature_activation", plain_dir);
+    write_file(plain_dir / "bake.toml",
+        "[package]\n"
+        "name = \"feature-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "mathlib = { path = \"mathlib\" }\n");
+    auto plain = run_bake("build", plain_dir);
+    CHECK(plain.success(), "feature-off build failed: " + plain.stdout);
+    auto run_plain = run_cmd(
+        (target_output_dir(plain_dir) / "bin" / "feature-app").string(),
+        plain_dir);
+    CHECK_EQ(run_plain.exit_code, 0,
+             "feature-off build failed to run: " + run_plain.stdout);
+    CHECK_EQ(run_plain.stdout, std::string("1\n"),
+             "feature-off path was not taken: " + run_plain.stdout);
+
+    return {};
+}
+
+// Conflicting features activated through the same dependency edge fail at
+// configure time and name both features.
+TestResult test_feature_conflict() {
+    auto dir = make_temp_dir("feature_conflict");
+    write_file(dir / "conflicted/bake.toml",
+        "[package]\n"
+        "name = \"conflicted\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[features]\n"
+        "alpha = { defines = [\"ALPHA=1\"], conflicts = [\"beta\"] }\n"
+        "beta = { defines = [\"BETA=1\"] }\n");
+    write_file(dir / "conflicted/src/v.c",
+        "int v(void) { return 1; }\n");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"conflict-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "conflicted = { path = \"conflicted\", features = [\"alpha\", \"beta\"] }\n");
+    write_file(dir / "src/main.c",
+        "int v(void);\n"
+        "int main(void) { return v(); }\n");
+
+    auto result = run_bake("build", dir);
+    CHECK(!result.success(), "conflicting features unexpectedly succeeded");
+    CHECK(result.stdout.find(
+              "features 'alpha' and 'beta' of package 'conflicted' are "
+              "mutually exclusive") != std::string::npos,
+          "conflicting features did not name both sides: " + result.stdout);
+
+    return {};
+}
+
+// A platform-restricted feature in the default set is a silent no-op on
+// non-matching targets; activating it explicitly on such a target is an
+// error.
+TestResult test_feature_platform() {
+    auto dir = make_temp_dir("feature_platform");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"platform-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[features]\n"
+        "default = [\"win-only\"]\n"
+        "win-only = { platforms = [\"*-windows-gnu\"], defines = [\"PLATFORM_LEAK=1\"] }\n");
+    write_file(dir / "src/main.c",
+        "#ifdef PLATFORM_LEAK\n"
+        "#error \"platform-restricted feature leaked into a non-matching build\"\n"
+        "#endif\n"
+        "int main(void) { return 0; }\n");
+
+    auto silent = run_bake("build", dir);
+    CHECK(silent.success(),
+          "default platform-restricted feature broke a non-matching target: " +
+              silent.stdout);
+
+    auto explicit_build = run_bake("build --feature win-only", dir);
+    CHECK(!explicit_build.success(),
+          "explicit activation on an unsupported platform unexpectedly "
+          "succeeded");
+    CHECK(explicit_build.stdout.find("does not support target") !=
+              std::string::npos,
+          "unsupported activation did not explain itself: " +
+              explicit_build.stdout);
 
     return {};
 }
@@ -4286,6 +4389,9 @@ static std::vector<TestCase> all_tests = {
     {"symlink_source_identity",       test_symlink_source_identity},
     {"build_cpp_options",             test_build_cpp_options},
     {"options_reject_non_bool",       test_options_reject_non_bool},
+    {"feature_activation",            test_feature_activation},
+    {"feature_conflict",              test_feature_conflict},
+    {"feature_platform",              test_feature_platform},
     {"build_cpp_transitive_modules",  test_build_cpp_transitive_modules},
     {"std_compat_default_discovery",  test_std_compat_default_discovery},
     {"std_compat_build_cpp",          test_std_compat_build_cpp},
@@ -4334,9 +4440,6 @@ int main(int argc, char* argv[]) {
     for (auto& tc : all_tests) {
         if (!filter.empty() && tc.name.find(filter) == std::string::npos)
             continue;
-
-        g_current_test = tc.name;
-        std::printf("  %-30s ", tc.name.c_str());
         std::fflush(stdout);
 
         try {

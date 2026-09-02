@@ -1,4 +1,4 @@
-# Profiles and Options
+# Profiles and Features
 
 ## Profiles
 
@@ -48,35 +48,37 @@ warnings = "extra"
 
 Only fields you set are overridden; the rest of the base profile stands. Profile selection does not invalidate other profiles' output — each (`profile`, `target`) combination is fingerprinted independently.
 
-## Options
+## Features
 
-Options are the feature-flag system — bool-only, declared in `[options]`, propagated across the graph:
+Features are the capability system — declared in `[features]`, unified by union across the graph (see the [Manifest reference](manifest.md#features)):
 
 ```toml
 # mylib/bake.toml
-[options]
-use_tls = false
+[features]
+default = ["core"]
+use-tls = { dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } },
+            defines = ["USE_TLS"] }
 ```
 
 Activation paths:
 
-1. **Dependency edge** — `flagged = { path = "../x", options = ["use_tls"] }` in a dependent's `[dependencies]`.
-2. **CLI** — `bake build --option use_tls` (or `--option use_tls=false`).
-3. **Default** — the value in the declaring `bake.toml`.
+1. **Dependency edge** — `flagged = { path = "../x", features = ["use-tls"] }` in a dependent's `[dependencies]`.
+2. **CLI** — `bake build --feature use-tls` (root moid only).
+3. **Default set** — the declaring `bake.toml`'s `default` list.
 
-The resolved value is the OR of all activations. In code:
+The effective set is the union of all three. Every declared feature yields a macro (`1` active / `0` inactive):
 
 ```cpp
-#ifdef BAKE_MYLIB_USE_TLS
-    // compiled only when the feature is on
+#if BAKE_MYLIB_USE_TLS
+    // compiled only when the feature is active
 #endif
 ```
 
-In `build.cpp`, read options programmatically:
+In `build.cpp`, read features programmatically:
 
 ```cpp
-if (b.option_bool("use_tls"))
+if (b.feature("use-tls"))
     b.sources("src/tls/*.cpp");
 ```
 
-This is the intended way to make input sets feature-dependent — the option macro gates code, `option_bool` gates which files compile at all.
+This is the intended way to make input sets feature-dependent — the feature macro gates code, `feature()` gates which files compile at all, and the feature's `dependencies` gate which packages enter the graph.

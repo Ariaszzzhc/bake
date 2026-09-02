@@ -6,8 +6,8 @@ type = "lib"
 [dependencies]
 upstream = { path = "upstream" }
 
-[options]
-wolfssl = false
+[features]
+wolfssl = {}
 
 [language]
 cxx = "c++23"

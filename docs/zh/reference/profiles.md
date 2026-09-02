@@ -1,4 +1,4 @@
-# Profile 和选项
+# Profile 与特性
 
 ## Profile
 
@@ -48,35 +48,37 @@ warnings = "extra"
 
 只有已设置的字段会被覆盖；基础 profile 的其余字段保持不变。Profile 的选择不会使其他 profile 的输出失效——每个（`profile`、`target`）组合均独立计算指纹。
 
-## 选项
+## 特性
 
-选项构成特性开关系统——仅限 bool，声明在 `[options]` 中，并在图中传播：
+特性是能力开关系统——声明在 `[features]` 中，在图上并集合一（详见 [Manifest 参考](manifest.md#features)）：
 
 ```toml
 # mylib/bake.toml
-[options]
-use_tls = false
+[features]
+default = ["core"]
+use-tls = { dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } },
+            defines = ["USE_TLS"] }
 ```
 
-启用路径：
+激活路径：
 
-1. **依赖边** — 在依赖方的 `[dependencies]` 中使用 `flagged = { path = "../x", options = ["use_tls"] }`。
-2. **CLI** — `bake build --option use_tls`（或 `--option use_tls=false`）。
-3. **默认值** — 声明该选项的 `bake.toml` 中的值。
+1. **依赖边** — 在依赖方的 `[dependencies]` 中使用 `flagged = { path = "../x", features = ["use-tls"] }`。
+2. **CLI** — `bake build --feature use-tls`（仅 root moid）。
+3. **默认集** — 声明方 `bake.toml` 的 `default` 列表。
 
-解析后的值是所有启用来源的 OR。代码中：
+有效集 = 三者之并。每个声明特性产生宏（激活 `1` / 未激活 `0`）：
 
 ```cpp
-#ifdef BAKE_MYLIB_USE_TLS
-    // compiled only when the feature is on
+#if BAKE_MYLIB_USE_TLS
+    // 仅在特性激活时编译
 #endif
 ```
 
-在 `build.cpp` 中，以编程方式读取选项：
+在 `build.cpp` 中，以编程方式读取：
 
 ```cpp
-if (b.option_bool("use_tls"))
+if (b.feature("use-tls"))
     b.sources("src/tls/*.cpp");
 ```
 
-这是使输入集合依赖于特性的预期方式——选项宏控制代码是否启用，`option_bool` 控制哪些文件会被编译。
+这是使输入集合依赖于特性的预期方式——特性宏控制代码是否启用，`feature()` 控制哪些文件会被编译；特性的 `dependencies` 控制哪些包进入图。

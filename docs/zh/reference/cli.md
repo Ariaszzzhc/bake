@@ -31,7 +31,7 @@ bake <subcommand> --help
 
 | 标志 | 含义 |
 |---|---|
-| `--option <name>[=value]` | 覆盖 `bake.toml` 中的 `[options]` 值 |
+| `--feature <name>` | 激活 root 的 `[features]` 特性 |
 | `-t <triple>`, `--target=<triple>` | 交叉编译目标 |
 | `--release` | 使用 release profile 构建 |
 | `--profile <name>` | 使用指定 profile 构建 |

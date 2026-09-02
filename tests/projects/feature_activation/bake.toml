@@ -1,0 +1,9 @@
+[package]
+name = "feature-app"
+version = "0.1.0"
+
+[language]
+c = "c17"
+
+[dependencies]
+mathlib = { path = "mathlib", features = ["fast"] }

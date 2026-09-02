@@ -13,7 +13,7 @@ module;
 //   BAKE_SOURCE_DIR        — absolute path to the Moid root
 //   BAKE_BUILD_DIR         — absolute path to out/
 //   BAKE_DECLARATION_PATH  — destination for declaration JSON
-//   BAKE_OPTIONS           — length-prefixed name/value build option records
+//   BAKE_FEATURES          — length-prefixed active feature names
 //   BAKE_DECLARATION_OPTIONS / BAKE_DECLARATION_DEPENDENCIES
 //                         — typed JSON fragments supplied by Bake
 
@@ -163,50 +163,34 @@ std::vector<std::string> expand_glob(const std::string& pattern,
     return result;
 }
 
-std::map<std::string, std::string> parse_options_env() {
-    std::map<std::string, std::string> options;
-    const char* env = std::getenv("BAKE_OPTIONS");
-    if (!env) return options;
+std::set<std::string> parse_features_env() {
+    std::set<std::string> features;
+    const char* env = std::getenv("BAKE_FEATURES");
+    if (!env) return features;
 
     std::string_view encoded(env);
     std::size_t cursor = 0;
-    auto read_length = [&](std::size_t& length) {
-        if (cursor >= encoded.size() || encoded[cursor] < '0' ||
-            encoded[cursor] > '9') {
-            return false;
-        }
-        length = 0;
+    while (cursor < encoded.size()) {
+        std::size_t length = 0;
+        if (encoded[cursor] < '0' || encoded[cursor] > '9')
+            return {};
         while (cursor < encoded.size() && encoded[cursor] >= '0' &&
                encoded[cursor] <= '9') {
             const std::size_t digit =
                 static_cast<std::size_t>(encoded[cursor] - '0');
             if (length >
-                (std::numeric_limits<std::size_t>::max() - digit) / 10) {
-                return false;
-            }
+                (std::numeric_limits<std::size_t>::max() - digit) / 10)
+                return {};
             length = length * 10 + digit;
             ++cursor;
         }
-        if (cursor >= encoded.size() || encoded[cursor] != ':') return false;
+        if (cursor >= encoded.size() || encoded[cursor] != ':') return {};
         ++cursor;
-        return true;
-    };
-
-    while (cursor < encoded.size()) {
-        std::size_t name_length = 0;
-        std::size_t value_length = 0;
-        if (!read_length(name_length) || !read_length(value_length) ||
-            name_length > encoded.size() - cursor) {
-            return {};
-        }
-        std::string name(encoded.substr(cursor, name_length));
-        cursor += name_length;
-        if (value_length > encoded.size() - cursor) return {};
-        options[std::move(name)] =
-            std::string(encoded.substr(cursor, value_length));
-        cursor += value_length;
+        if (length > encoded.size() - cursor) return {};
+        features.insert(std::string(encoded.substr(cursor, length)));
+        cursor += length;
     }
-    return options;
+    return features;
 }
 
 } // anonymous namespace
@@ -297,13 +281,13 @@ public:
             build_dir_ = value;
         if (const char* value = std::getenv("BAKE_DECLARATION_PATH"))
             declaration_path_ = value;
-        if (const char* value = std::getenv("BAKE_DECLARATION_OPTIONS"))
-            declaration_options_ = value;
+        if (const char* value = std::getenv("BAKE_DECLARATION_FEATURES"))
+            declaration_features_ = value;
         if (const char* value = std::getenv("BAKE_DECLARATION_DEPENDENCIES"))
             declaration_dependencies_ = value;
         if (const char* value = std::getenv("BAKE_TARGET"))
             target_ = value;
-        options_ = parse_options_env();
+        features_ = parse_features_env();
 
         // Dependency source directories arrive as alias=/absolute/path.
         if (const char* env = std::getenv("BAKE_DEPS")) {
@@ -380,10 +364,8 @@ public:
         return tests_.back();
     }
 
-    bool option_bool(std::string_view name) const {
-        auto it = options_.find(std::string(name));
-        return it != options_.end() &&
-               (it->second == "true" || it->second == "1");
+    bool feature(std::string_view name) const {
+        return features_.count(std::string(name)) != 0;
     }
 
     std::string_view source_dir() const { return source_dir_; }
@@ -418,7 +400,7 @@ private:
         json += "  \"root\": " + json_string(source_dir_) + ",\n";
         json += "  \"cxx_std\": " + json_string(cxx_std_) + ",\n";
         json += "  \"c_std\": " + json_string(c_std_) + ",\n";
-        json += "  \"options\": " + declaration_options_ + ",\n";
+        json += "  \"features\": " + declaration_features_ + ",\n";
 
         json += "  \"sources\": [";
         for (std::size_t i = 0; i < source_groups_.size(); ++i) {
@@ -493,7 +475,7 @@ private:
     std::string build_dir_;
     std::string target_;
     std::string declaration_path_;
-    std::string declaration_options_ = "{}";
+    std::string declaration_features_ = "[]";
     std::string declaration_dependencies_ = "[]";
     std::vector<SourceGroup> source_groups_;
     std::vector<std::string> include_dirs_;
@@ -501,7 +483,7 @@ private:
     std::vector<std::string> prebuilt_libs_;
     std::vector<BinaryBuilder> binaries_;
     std::vector<TestRegistration> tests_;
-    std::map<std::string, std::string> options_;
+    std::set<std::string> features_;
     std::map<std::string, std::string> dep_dirs_;
     std::set<std::string> used_source_deps_;
 };

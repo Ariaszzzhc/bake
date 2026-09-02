@@ -58,7 +58,7 @@ Registers a named test backed by a binary (declared via `binary()`). `set_defaul
 
 | Member | Value |
 |---|---|
-| `b.option_bool("name")` | Resolved `[options]` value (graph-OR'd) |
+| `b.feature("name")` | Whether the `[features]` feature is active (graph-unified) |
 | `b.source_dir()` | Package root (absolute) |
 | `b.build_dir()` | `out/` directory (absolute) |
 | `b.target()` | Active target triple |

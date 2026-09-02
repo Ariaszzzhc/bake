@@ -31,7 +31,7 @@ bake <subcommand> --help
 
 | Flag | Meaning |
 |---|---|
-| `--option <name>[=value]` | Override an `[options]` value from `bake.toml` |
+| `--feature <name>` | Activate a root `[features]` feature |
 | `-t <triple>`, `--target=<triple>` | Cross-compile target |
 | `--release` | Build with the release profile |
 | `--profile <name>` | Build with a specific profile |

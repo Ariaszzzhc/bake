@@ -37,7 +37,7 @@ Tier choice is data-driven: `sources.empty() && public_include_dirs.empty()` aft
 - extra binaries — additional executables built from the package (see below)
 - test registrations (see [Testing](testing.md))
 
-**Cannot** — change configuration. Compiler flags, defines, system libraries, frameworks, optimization: these belong in `bake.toml` (`[profile.*]`, `[link]`, `[target.*]`, `[options]`). A build.cpp cannot rename the moid, change its type, or override the manifest. The build script owns *what* is built; the manifest owns *how*.
+**Cannot** — change configuration. Compiler flags, defines, system libraries, frameworks, optimization: these belong in `bake.toml` (`[profile.*]`, `[link]`, `[target.*]`, `[features]`). A build.cpp cannot rename the moid, change its type, or override the manifest. The build script owns *what* is built; the manifest owns *how*.
 
 This split is deliberate: input discovery can be arbitrarily project-specific, while configuration stays declarative, diffable, and target-gated.
 

@@ -15,7 +15,7 @@ export struct MoidId {
 export struct MoidEdge {
     std::string alias;
     MoidId target;
-    std::vector<std::string> options;
+    std::vector<std::string> features;
 };
 
 export struct MoidNode {
@@ -36,7 +36,7 @@ export struct MoidGraph {
 
 export struct BuildSelection {
     std::optional<std::string> workspace_member;
-    std::map<std::string, BuildOption> root_options;
+    std::vector<std::string> root_features;
     // Build triple used to filter target-scoped dependencies. Native
     // builds carry the detected host triple.
     std::string target_triple;
@@ -120,7 +120,6 @@ MoidDeclaration manifest_declaration(const Manifest& manifest,
     declaration.root = source_root.string();
     declaration.cxx_std = manifest.moid->cxx_std;
     declaration.c_std = manifest.moid->c_std;
-    declaration.options = manifest.options;
     return declaration;
 }
 
@@ -456,157 +455,272 @@ resolve_moid_graph(const Manifest& root,
         return std::unexpected("project does not declare a [package] or [workspace]");
     }
 
-    for (std::size_t index = 0; index < worklist.size(); ++index) {
-        const MoidId source_id = worklist[index];
-        const SourceRecord source = source_records.at(source_id);
-        auto& source_node = graph.nodes.at(source_id);
+    // ── Feature activation + conditional dependency expansion ──
+    //
+    // A feature's dependencies are conditional edges: they exist only when
+    // the feature is active, and activation arrives on edges from
+    // dependents that may themselves be feature-gated. Activation only
+    // grows, so expansion and unification iterate to a fixpoint.
+    std::map<MoidId, std::set<std::string>> activated;
+    std::map<MoidId, std::set<std::string>> expanded_with;
 
-        auto effective =
-            effective_dependencies(source.manifest, selection.target_triple);
-        if (!effective) return std::unexpected(effective.error());
-        for (const auto& [alias, dependency] : *effective) {
-            std::optional<MoidId> target_id;
-            std::optional<Manifest> target_manifest;
-            std::string source_key;
+    auto is_root = [&](const MoidId& id) {
+        return std::ranges::any_of(
+            graph.roots, [&](const MoidId& root) { return root == id; });
+    };
 
-            if (dependency.is_path_dep) {
-                auto dependency_root = canonical_source_root(
-                    source.manifest.project_dir / dependency.path.c_str());
-                if (!dependency_root)
-                    return std::unexpected(dependency_root.error());
-                if (!dependency_root->is_directory()) {
+    // Unify every node's activation set (defaults ∪ incoming edges ∪ CLI,
+    // platform-filtered) and validate declarations, platforms and
+    // conflicts. Returns whether any activation grew.
+    auto unify = [&]() -> std::expected<bool, std::string> {
+        bool grew = false;
+        for (auto& [id, node] : graph.nodes) {
+            const Manifest& manifest = source_records.at(id).manifest;
+            std::set<std::string> effective;
+            std::map<std::string, std::string> origin;
+
+            for (const auto& name : manifest.default_features) {
+                auto it = manifest.features.find(name);
+                if (it == manifest.features.end()) {
                     return std::unexpected(
-                        "path dependency '" + alias + "' at '" +
-                        dependency.path + "' does not exist or is not a directory");
+                        "default feature '" + name + "' of package '" +
+                        node.declaration.name + "' is not declared");
                 }
-
-                if (!(*dependency_root / "bake.toml").is_regular_file()) {
-                    // Non-moid path dep — record source dir for build.cpp.
-                    source_node.source_deps[alias] = dependency_root->string();
+                if (!feature_supports_target(it->second,
+                                             selection.target_triple))
                     continue;
-                }
-
-                auto manifest = Manifest::load(*dependency_root);
-                if (!manifest || !manifest->has_moid()) {
-                    return std::unexpected(
-                        "dependency '" + alias + "' at '" +
-                        dependency_root->string() + "' does not declare a [package]");
-                }
-                manifest->project_dir = *dependency_root;
-                target_manifest = std::move(*manifest);
-
-                const std::string path_key =
-                    canonical_path_string(*dependency_root);
-                auto workspace = workspace_ids.find(path_key);
-                if (workspace != workspace_ids.end()) {
-                    target_id = workspace->second;
-                    source_key = "workspace:" + path_key;
-                } else {
-                    target_id = MoidId{"path:" + SHA256::hex(path_key)};
-                    source_key = path_key;
-                }
-            } else {
-                // Remote dep: pre-resolved by the caller into SourceIndex.
-                const LockedSource* locked = sources.find(dependency);
-                if (!locked) {
-                    return std::unexpected(
-                        "remote dependency '" + alias +
-                        "' is not resolved (no lock entry matching "
-                        "URL/ref) — run 'bake update'");
-                }
-                if (locked->integrity.empty() ||
-                    (locked->ref_type != "archive" && locked->commit.empty())) {
-                    return std::unexpected(
-                        "locked dependency '" + alias +
-                        "' is missing canonical hashes");
-                }
-                if (!locked->cache_dir.is_directory()) {
-                    return std::unexpected(
-                        std::string(policy.offline ? "offline cache" : "cache") +
-                        " for dependency '" + alias + "' is missing at " +
-                        locked->cache_dir.string());
-                }
-
-                auto manifest = Manifest::load_moid(locked->cache_dir);
-                if (!manifest) {
-                    // Non-native remote dep — source-only, no graph node.
-                    // Record its source dir for build.cpp access.
-                    source_node.source_deps[alias] =
-                        locked->cache_dir.string();
-                    continue;
-                }
-                manifest->project_dir = locked->cache_dir;
-                target_manifest = std::move(*manifest);
-
-                source_key = locked->identity();
-                target_id = MoidId{source_key};
+                effective.insert(name);
+                origin.emplace(name, "default");
             }
 
-            auto added = register_source(
-                *target_id, source_key, std::move(*target_manifest));
-            if (!added) return std::unexpected(added.error());
+            for (const auto& [_, source] : graph.nodes) {
+                for (const auto& edge : source.dependencies) {
+                    if (edge.target != id) continue;
+                    for (const auto& name : edge.features) {
+                        auto it = manifest.features.find(name);
+                        if (it == manifest.features.end()) {
+                            return std::unexpected(
+                                "feature '" + name + "' is not declared by "
+                                "package '" + node.declaration.name +
+                                "' (requested by dependency '" + edge.alias +
+                                "' of '" + source.declaration.name + "')");
+                        }
+                        if (!feature_supports_target(
+                                it->second, selection.target_triple)) {
+                            std::string supported =
+                                it->second.platforms.empty()
+                                    ? "*"
+                                    : join(it->second.platforms, ", ");
+                            return std::unexpected(
+                                "feature '" + name + "' of package '" +
+                                node.declaration.name +
+                                "' does not support target '" +
+                                selection.target_triple +
+                                "' (activated by dependency '" + edge.alias +
+                                "' of '" + source.declaration.name +
+                                "'; supported: " + supported + ")");
+                        }
+                        effective.insert(name);
+                        origin.emplace(name,
+                                       "dependency '" + edge.alias + "' of '" +
+                                           source.declaration.name + "'");
+                    }
+                }
+            }
 
-            source_node.dependencies.push_back(
-                MoidEdge{alias, *target_id, dependency.options});
+            if (is_root(id)) {
+                for (const auto& name : selection.root_features) {
+                    auto it = manifest.features.find(name);
+                    if (it == manifest.features.end()) {
+                        return std::unexpected(
+                            "feature '" + name + "' is not declared by "
+                            "package '" + node.declaration.name +
+                            "' (requested on the command line)");
+                    }
+                    if (!feature_supports_target(
+                            it->second, selection.target_triple)) {
+                        return std::unexpected(
+                            "feature '" + name + "' of package '" +
+                            node.declaration.name +
+                            "' does not support target '" +
+                            selection.target_triple +
+                            "' (requested on the command line)");
+                    }
+                    effective.insert(name);
+                    origin.emplace(name, "command line");
+                }
+            }
+
+            for (const auto& name : effective) {
+                for (const auto& other :
+                     manifest.features.at(name).conflicts) {
+                    if (!effective.count(other)) continue;
+                    return std::unexpected(
+                        "features '" + name + "' and '" + other +
+                        "' of package '" + node.declaration.name +
+                        "' are mutually exclusive (activated by " +
+                        origin.at(name) + " and " + origin.at(other) + ")");
+                }
+            }
+
+            auto& known = activated[id];
+            if (!std::ranges::includes(known, effective)) {
+                known = std::move(effective);
+                grew = true;
+            }
+            node.declaration.active_features.assign(known.begin(),
+                                                     known.end());
         }
+        return grew;
+    };
+
+    // Expand dependency edges using the current activation sets. Nodes are
+    // revisited when their activation grew; registered sources dedup.
+    auto expand = [&]() -> std::expected<void, std::string> {
+        for (std::size_t index = 0; index < worklist.size(); ++index) {
+            const MoidId source_id = worklist[index];
+            const std::set<std::string> features = activated[source_id];
+            auto [marker_entry, first_visit] =
+                expanded_with.try_emplace(source_id);
+            std::set<std::string>& marker = marker_entry->second;
+            if (!first_visit && std::ranges::includes(marker, features))
+                continue;
+            marker.insert(features.begin(), features.end());
+            const SourceRecord source = source_records.at(source_id);
+            auto& source_node = graph.nodes.at(source_id);
+
+            auto effective = effective_dependencies(
+                source.manifest, selection.target_triple, features);
+            if (!effective) return std::unexpected(effective.error());
+            for (const auto& [alias, dependency] : *effective) {
+                std::optional<MoidId> target_id;
+                std::optional<Manifest> target_manifest;
+                std::string source_key;
+
+                if (dependency.is_path_dep) {
+                    auto dependency_root = canonical_source_root(
+                        source.manifest.project_dir / dependency.path.c_str());
+                    if (!dependency_root)
+                        return std::unexpected(dependency_root.error());
+                    if (!dependency_root->is_directory()) {
+                        return std::unexpected(
+                            "path dependency '" + alias + "' at '" +
+                            dependency.path +
+                            "' does not exist or is not a directory");
+                    }
+
+                    if (!(*dependency_root / "bake.toml").is_regular_file()) {
+                        // Non-moid path dep — record source dir for build.cpp.
+                        source_node.source_deps[alias] =
+                            dependency_root->string();
+                        continue;
+                    }
+
+                    auto manifest = Manifest::load(*dependency_root);
+                    if (!manifest || !manifest->has_moid()) {
+                        return std::unexpected(
+                            "dependency '" + alias + "' at '" +
+                            dependency_root->string() +
+                            "' does not declare a [package]");
+                    }
+                    manifest->project_dir = *dependency_root;
+                    target_manifest = std::move(*manifest);
+
+                    const std::string path_key =
+                        canonical_path_string(*dependency_root);
+                    auto workspace = workspace_ids.find(path_key);
+                    if (workspace != workspace_ids.end()) {
+                        target_id = workspace->second;
+                        source_key = "workspace:" + path_key;
+                    } else {
+                        target_id = MoidId{"path:" + SHA256::hex(path_key)};
+                        source_key = path_key;
+                    }
+                } else {
+                    // Remote dep: pre-resolved by the caller into SourceIndex.
+                    const LockedSource* locked = sources.find(dependency);
+                    if (!locked) {
+                        return std::unexpected(
+                            "remote dependency '" + alias +
+                            "' is not resolved (no lock entry matching "
+                            "URL/ref) — run 'bake update'");
+                    }
+                    if (locked->integrity.empty() ||
+                        (locked->ref_type != "archive" &&
+                         locked->commit.empty())) {
+                        return std::unexpected(
+                            "locked dependency '" + alias +
+                            "' is missing canonical hashes");
+                    }
+                    if (!locked->cache_dir.is_directory()) {
+                        return std::unexpected(
+                            std::string(policy.offline ? "offline cache"
+                                                       : "cache") +
+                            " for dependency '" + alias +
+                            "' is missing at " + locked->cache_dir.string());
+                    }
+
+                    auto manifest = Manifest::load_moid(locked->cache_dir);
+                    if (!manifest) {
+                        // Non-native remote dep — source-only, no graph node.
+                        // Record its source dir for build.cpp access.
+                        source_node.source_deps[alias] =
+                            locked->cache_dir.string();
+                        continue;
+                    }
+                    manifest->project_dir = locked->cache_dir;
+                    target_manifest = std::move(*manifest);
+
+                    source_key = locked->identity();
+                    target_id = MoidId{source_key};
+                }
+
+                auto added = register_source(
+                    *target_id, source_key, std::move(*target_manifest));
+                if (!added) return std::unexpected(added.error());
+
+                auto existing = std::ranges::find_if(
+                    source_node.dependencies, [&](const MoidEdge& edge) {
+                        return edge.alias == alias;
+                    });
+                if (existing != source_node.dependencies.end()) {
+                    for (const auto& feature : dependency.features)
+                        if (!std::ranges::count(existing->features, feature))
+                            existing->features.push_back(feature);
+                } else {
+                    source_node.dependencies.push_back(
+                        MoidEdge{alias, *target_id, dependency.features});
+                }
+            }
+        }
+        return {};
+    };
+
+    auto seeded = unify();
+    if (!seeded) return std::unexpected(seeded.error());
+    std::size_t remaining_iterations = graph.nodes.size() + 8;
+    for (;;) {
+        if (remaining_iterations-- == 0) {
+            return std::unexpected(
+                "feature activation did not converge");
+        }
+        auto expanded = expand();
+        if (!expanded) return std::unexpected(expanded.error());
+        auto result = unify();
+        if (!result) return std::unexpected(result.error());
+        if (!*result) break;
     }
 
     for (auto& [_, node] : graph.nodes) {
         node.declaration.dependencies.clear();
         for (const auto& edge : node.dependencies) {
             node.declaration.dependencies.push_back(
-                MoidDependency{edge.alias, edge.target.value, edge.options});
+                MoidDependency{edge.alias, edge.target.value, edge.features});
         }
     }
 
     auto topology = configuration_topological_moids(graph);
     if (!topology) return std::unexpected(topology.error());
-
-    // ── Option resolution (bool-only, OR merge) ──
-    //
-    // For each moid:
-    //   1. Start with manifest defaults
-    //   2. OR with all dependency feature activations
-    //   3. Apply CLI overrides (root_options) last
-
-    for (auto& [id, node] : graph.nodes) {
-        auto effective = source_records.at(id).manifest.options;
-
-        // Collect feature activations from all dependency edges targeting this moid
-        for (auto& [_, src_node] : graph.nodes) {
-            for (auto& edge : src_node.dependencies) {
-                if (edge.target != id) continue;
-                for (auto& opt_name : edge.options) {
-                    auto it = effective.find(opt_name);
-                    if (it == effective.end()) {
-                        return std::unexpected(
-                            "option '" + opt_name +
-                            "' is not declared by package '" +
-                            node.declaration.name + "'");
-                    }
-                    it->second.value = true;  // OR merge
-                }
-            }
-        }
-
-        // CLI overrides for root moids
-        bool is_root = std::ranges::any_of(graph.roots,
-            [&](const MoidId& r) { return r == id; });
-        if (is_root) {
-            for (auto& [name, opt] : selection.root_options) {
-                auto it = effective.find(name);
-                if (it == effective.end()) {
-                    return std::unexpected(
-                        "build option '" + name +
-                        "' is not declared by package '" +
-                        node.declaration.name + "'");
-                }
-                it->second = opt;  // CLI override replaces value
-            }
-        }
-
-        node.declaration.options = std::move(effective);
-    }
 
     return graph;
 }

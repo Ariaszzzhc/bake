@@ -3,8 +3,9 @@ name = "header-only"
 version = "2.4.6"
 type = "lib"
 
-[options]
-fast-path = true
+[features]
+default = ["fast-path"]
+fast-path = {}
 
 [link]
 libraries = ["m"]

@@ -17,9 +17,10 @@ cxx = "c++23"             # c++17 | c++20 | c++23
 c = "c17"                 # c11 | c17 | c23
 # C++20 or later is required for `import std;` and named modules.
 
-[options]                 # bool-only feature flags
-use_tls = false
-use_json = true
+[features]                # 特性束：可选依赖 / defines / 互斥 / 平台
+default = ["tls", "zlib"]
+tls = { dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } }, defines = ["USE_MBEDTLS"] }
+zlib = {}
 
 [dependencies]
 local = { path = "../local" }                                      # 路径依赖
@@ -28,7 +29,7 @@ by_branch = { url = "https://github.com/org/repo", branch = "main" } # Git 分�
 by_rev = { url = "https://github.com/org/repo", rev = "d5598e..." }  # 确切 Git revision
 head = { url = "https://github.com/org/head" }                     # 默认分支 HEAD
 archive = { url = "https://example.com/lib-1.0.tar.xz" }           # 直接归档
-flagged = { path = "../x", options = ["use_tls"] }                # 激活特性
+flagged = { path = "../x", features = ["use-tls"] }              # 激活特性
 
 [link]                    # platform-agnostic system linking
 libraries = ["z"]         # -l flags
@@ -66,13 +67,35 @@ header_ext = [".h", ".hpp", ".hxx", ".hh"]
 
 `cxx` 和 `c` 分别设置 C++ 与 C 源文件的语言标准。默认值为 `c++17` / `c17`。（`bake init --std` 会为你写入此表。）
 
-## `[options]`
+## `[features]`
 
-仅支持 bool 的特性开关。每个选项都会成为设为 `1` 或 `0` 的预处理器宏 `BAKE_<MOID>_<OPTION>`（宏名称转为大写）。选项会在依赖图中按 OR 合并：若任一包启用某个依赖的选项，则该选项会在所有位置启用。命令行覆盖：
+命名的特性束。每个特性可携带四类东西：
+
+```toml
+[features]
+default = ["tls-mbedtls", "zlib"]     # 保留名：无任何激活时的默认激活集
+
+tls-mbedtls = {
+  platforms = ["*-apple-darwin", "*-linux-*"],   # 仅这些目标生效；缺省 = 全部
+  dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } },  # 条目语法与 [dependencies] 相同，仅激活时解析
+  defines = ["USE_MBEDTLS"],                     # 注入本包编译的宏（"NAME" 或 "NAME=VALUE"）
+  conflicts = ["tls-openssl"],                   # 互斥特性名
+}
+zlib = {}                             # 纯宏特性：只产生 BAKE_<MOID>_ZLIB
+```
+
+激活语义：
+
+- **并集合一**：包的有效集 = 自身 `default` ∪ 所有入边激活 ∪ CLI。`build.cpp` 用 `b.feature("zlib")` 查询
+- 每个声明的特性都产生宏 `BAKE_<MOID>_<FEATURE>`，激活为 `1`、未激活为 `0`
+- **conflicts** 在有效集内成对校验，configure 期报错并点名两条激活来源
+- **platforms** 是生效白名单：默认集里不匹配当前目标的特性静默不贡献；显式激活（依赖边或 `--feature`）不匹配则报错
+- 不激活的特性，其依赖不进图、不进锁、不下载
+
+命令行激活（仅 root moid）：
 
 ```bash
-bake build --option use_tls        # =true
-bake build --option use_tls=false
+bake build --feature tls-openssl
 ```
 
 每个 moid 还会获得版本宏：
@@ -96,7 +119,7 @@ BAKE_MYAPP_VERSION_PATCH = 0
 | `tag` | Git ref | 选择标签。与 `branch`、`rev` 互斥。 |
 | `branch` | Git ref | 选择分支。与 `tag`、`rev` 互斥。 |
 | `rev` | Git ref | 选择确切的 Git revision。与 `tag`、`branch` 互斥。 |
-| `options` | 任意依赖 | 要激活的依赖 `[options]` 列表。 |
+| `features` | 任意依赖 | 要在该依赖包上激活的 `[features]` 列表。 |
 
 不带 `tag`、`branch` 或 `rev` 的 Git 依赖会在构建时解析其默认分支 `HEAD`。归档依赖不得指定 ref。tar 归档由 `tar` 提取；ZIP 归档使用 `unzip`。
 

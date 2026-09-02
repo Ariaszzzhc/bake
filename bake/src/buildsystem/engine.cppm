@@ -354,7 +354,7 @@ export struct BuildGraph {
 export MoidDeclaration declare_default_inputs(
         const Manifest& manifest, const Layout& layout,
         const std::string& canonical_id,
-        const std::map<std::string, BuildOption>& options,
+        const std::vector<std::string>& active_features,
         const std::vector<MoidDependency>& dependencies) {
     MoidDeclaration declaration;
     declaration.id = canonical_id;
@@ -364,7 +364,7 @@ export MoidDeclaration declare_default_inputs(
     declaration.root = layout.root.absolute().string();
     declaration.cxx_std = manifest.moid->cxx_std;
     declaration.c_std = manifest.moid->c_std;
-    declaration.options = options;
+    declaration.active_features = active_features;
     declaration.dependencies = dependencies;
 
     const Path root = layout.root.absolute();
@@ -698,37 +698,30 @@ private:
   bool active_ = false;
 };
 
-// Serialise build options as repeated name-length:value-length:name value
-// records. Length prefixes preserve newlines and separators in string values.
-std::string serialize_options(const std::map<std::string, BuildOption> &opts) {
+// Serialise active feature names as repeated name-length:name records.
+std::string serialize_features(const std::vector<std::string> &features) {
   std::string out;
-  for (const auto &[name, opt] : opts) {
-    std::string value = opt.value ? "true" : "false";
-    out += std::to_string(name.size()) + ":" + std::to_string(value.size()) +
-           ":" + name + value;
-  }
+  for (const auto &name : features)
+    out += std::to_string(name.size()) + ":" + name;
   return out;
 }
 
 nlohmann::json
-declaration_options_json(const std::map<std::string, BuildOption> &options) {
-  nlohmann::json document = nlohmann::json::object();
-  for (const auto &[name, option] : options)
-    document[name] = option.value;
-  return document;
+declaration_features_json(const std::vector<std::string> &features) {
+  return nlohmann::json(features);
 }
 
 std::string
 serialize_declaration_dependencies(const std::vector<MoidEdge> &edges) {
   nlohmann::json dependencies = nlohmann::json::array();
   for (const auto &edge : edges) {
-    nlohmann::json dep_options = nlohmann::json::array();
-    for (const auto &opt : edge.options)
-      dep_options.push_back(opt);
+    nlohmann::json dep_features = nlohmann::json::array();
+    for (const auto &feature : edge.features)
+      dep_features.push_back(feature);
     dependencies.push_back({
         {"alias", edge.alias},
         {"id", edge.target.value},
-        {"options", dep_options},
+        {"features", dep_features},
     });
   }
   return dependencies.dump();
@@ -879,9 +872,10 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
   }
 
   // Step 4: Run build_app, then read its persisted declaration.
-  const auto &options = node.declaration.options;
-  std::string opts_str = serialize_options(options);
-  std::string declaration_options = declaration_options_json(options).dump();
+  const auto &features = node.declaration.active_features;
+  std::string features_str = serialize_features(features);
+  std::string declaration_features =
+      declaration_features_json(features).dump();
   std::string declaration_dependencies =
       serialize_declaration_dependencies(node.dependencies);
   std::string deps_str;
@@ -914,9 +908,9 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
     ScopedEnv c_std_env("BAKE_MOID_C_STD", manifest.moid->c_std);
     ScopedEnv declaration_env("BAKE_DECLARATION_PATH",
                               declaration_path.string());
-    ScopedEnv options_env("BAKE_OPTIONS", opts_str);
-    ScopedEnv declaration_options_env("BAKE_DECLARATION_OPTIONS",
-                                      declaration_options);
+    ScopedEnv features_env("BAKE_FEATURES", features_str);
+    ScopedEnv declaration_features_env("BAKE_DECLARATION_FEATURES",
+                                       declaration_features);
     ScopedEnv declaration_dependencies_env("BAKE_DECLARATION_DEPENDENCIES",
                                            declaration_dependencies);
     ScopedEnv dependencies_env("BAKE_DEPS", deps_str);
@@ -1000,8 +994,21 @@ void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
 
   // Defines: option macros + package macros + profile defines + target defines
   decl.compile_defines.clear();
-  for (auto &[k, v] : generate_option_macros(decl.name, decl.options))
+  for (auto &[k, v] : generate_feature_macros(decl.name, manifest.features,
+                                              decl.active_features))
     decl.compile_defines.push_back({k, v});
+  for (const auto& feature_name : decl.active_features) {
+    auto feature = manifest.features.find(feature_name);
+    if (feature == manifest.features.end()) continue;
+    for (const auto& define : feature->second.defines) {
+      auto equals = define.find('=');
+      decl.compile_defines.push_back(
+          equals == std::string::npos
+              ? std::pair{define, std::string{}}
+              : std::pair{define.substr(0, equals),
+                          define.substr(equals + 1)});
+    }
+  }
   for (auto &[k, v] : generate_package_macros(decl.name, decl.version))
     decl.compile_defines.push_back({k, v});
   for (auto &[k, v] : resolved.defines)
@@ -1064,9 +1071,9 @@ validate_resolved_declaration(const MoidDeclaration &declaration,
                            "resolved version for moid '" +
                            node.declaration.name + "'");
   }
-  if (declaration.options != node.declaration.options) {
-    return std::unexpected("moid declaration field 'options' does not match "
-                           "resolved options for moid '" +
+  if (declaration.active_features != node.declaration.active_features) {
+    return std::unexpected("moid declaration field 'features' does not match "
+                           "resolved features for moid '" +
                            node.declaration.name + "'");
   }
   if (declaration.dependencies.size() != node.declaration.dependencies.size()) {
@@ -1078,7 +1085,7 @@ validate_resolved_declaration(const MoidDeclaration &declaration,
     const auto &actual = declaration.dependencies[i];
     const auto &expected = node.declaration.dependencies[i];
     if (actual.alias != expected.alias || actual.id != expected.id ||
-        actual.options != expected.options) {
+        actual.features != expected.features) {
       return std::unexpected("moid declaration field 'dependencies' does not "
                              "match resolved dependencies for moid '" +
                              node.declaration.name + "'");
@@ -1149,7 +1156,7 @@ configure_moid_graph(MoidGraph &graph, const TargetSpec& target, const Path &out
       // Default: scan src/ + public/
       auto layout = Layout::detect(moid_dir);
       declaration = declare_default_inputs(*manifest, layout, node.id.value,
-                                           node.declaration.options,
+                                           node.declaration.active_features,
                                            node.declaration.dependencies);
     }
 
@@ -1161,7 +1168,8 @@ configure_moid_graph(MoidGraph &graph, const TargetSpec& target, const Path &out
         declaration.public_include_dirs.empty()) {
       auto layout = Layout::detect(moid_dir);
       auto discovered = declare_default_inputs(
-          *manifest, layout, node.id.value, node.declaration.options,
+          *manifest, layout, node.id.value,
+          node.declaration.active_features,
           node.declaration.dependencies);
       declaration.sources = std::move(discovered.sources);
       declaration.public_include_dirs =

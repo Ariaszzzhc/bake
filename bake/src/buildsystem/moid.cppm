@@ -15,7 +15,7 @@ export struct SourceGroup {
 export struct MoidDependency {
     std::string alias;
     std::string id;
-    std::vector<std::string> options;
+    std::vector<std::string> features;
 };
 
 export struct BinaryDeclaration {
@@ -38,7 +38,7 @@ export struct MoidDeclaration {
     std::string root;
     std::string cxx_std = "c++17";
     std::string c_std = "c17";
-    std::map<std::string, BuildOption> options;
+    std::vector<std::string> active_features;
     std::vector<SourceGroup> sources;
     std::vector<std::string> public_include_dirs;
     std::vector<std::string> libraries;
@@ -129,31 +129,7 @@ std::expected<std::vector<std::string>, std::string> required_string_array(
     return string_array(**value, field_path(parent, name));
 }
 
-std::expected<std::map<std::string, BuildOption>, std::string> options_from_json(
-        const Json& value, std::string_view path) {
-    if (!value.is_object()) {
-        return std::unexpected(
-            "moid declaration field '" + std::string(path) + "' must be an object");
-    }
-
-    std::map<std::string, BuildOption> result;
-    for (auto it = value.begin(); it != value.end(); ++it) {
-        if (!it.value().is_boolean()) {
-            return std::unexpected(
-                "moid declaration field '" +
-                field_path(path, it.key()) + "' must be a boolean");
-        }
-        result.emplace(it.key(), BuildOption{it.value().get<bool>()});
-    }
-    return result;
-}
-
-std::expected<std::map<std::string, BuildOption>, std::string> required_options(
-        const Json& object, std::string_view name, std::string_view parent = {}) {
-    auto value = required_field(object, name, parent);
-    if (!value) return std::unexpected(value.error());
-    return options_from_json(**value, field_path(parent, name));
-}
+// (features are a plain string array — required_string_array covers them)
 
 std::expected<std::vector<SourceGroup>, std::string> source_groups_from_json(
         const Json& value, std::string_view path) {
@@ -193,13 +169,7 @@ std::expected<std::vector<SourceGroup>, std::string> source_groups_from_json(
 }
 
 
-Json options_to_json(const std::map<std::string, BuildOption>& options) {
-    Json result = Json::object();
-    for (const auto& [name, option] : options) {
-        result[name] = option.value;
-    }
-    return result;
-}
+// (features serialize as a plain string array)
 
 Json compile_defines_to_json(
         const std::vector<std::pair<std::string, std::string>>& defines) {
@@ -244,7 +214,7 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
     document["root"] = declaration.root;
     document["cxx_std"] = declaration.cxx_std;
     document["c_std"] = declaration.c_std;
-    document["options"] = options_to_json(declaration.options);
+    document["features"] = declaration.active_features;
 
     document["sources"] = Json::array();
     for (const auto& source : declaration.sources) {
@@ -265,7 +235,7 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
         document["dependencies"].push_back({
             {"alias", dependency.alias},
             {"id", dependency.id},
-            {"options", dependency.options},
+            {"features", dependency.features},
         });
     }
 
@@ -346,9 +316,9 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
     if (!c_standard) return std::unexpected(c_standard.error());
     declaration.c_std = std::move(*c_standard);
 
-    auto options = required_options(document, "options");
-    if (!options) return std::unexpected(options.error());
-    declaration.options = std::move(*options);
+    auto features = required_string_array(document, "features");
+    if (!features) return std::unexpected(features.error());
+    declaration.active_features = std::move(*features);
 
     auto sources = required_field(document, "sources");
     if (!sources) return std::unexpected(sources.error());
@@ -409,11 +379,11 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
         if (!dependency_id) return std::unexpected(dependency_id.error());
         value.id = std::move(*dependency_id);
 
-        auto dependency_options =
-            required_string_array(dependency, "options", path);
-        if (!dependency_options)
-            return std::unexpected(dependency_options.error());
-        value.options = std::move(*dependency_options);
+        auto dependency_features =
+            required_string_array(dependency, "features", path);
+        if (!dependency_features)
+            return std::unexpected(dependency_features.error());
+        value.features = std::move(*dependency_features);
 
         declaration.dependencies.push_back(std::move(value));
     }

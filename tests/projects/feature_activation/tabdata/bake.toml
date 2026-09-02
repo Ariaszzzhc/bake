@@ -1,0 +1,7 @@
+[package]
+name = "tabdata"
+version = "0.1.0"
+type = "lib"
+
+[language]
+c = "c17"

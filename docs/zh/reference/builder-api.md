@@ -58,7 +58,7 @@ b.add_test("suite-name", "binary-name").set_default();
 
 | 成员 | 值 |
 |---|---|
-| `b.option_bool("name")` | 已解析的 `[options]` 值（按图 OR 合并） |
+| `b.feature("name")` | `[features]` 特性是否激活（图上并集合一） |
 | `b.source_dir()` | 包根目录（绝对路径） |
 | `b.build_dir()` | `out/` 目录（绝对路径） |
 | `b.target()` | 活动目标三元组 |

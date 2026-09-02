@@ -4,10 +4,10 @@ version = "0.1.0"
 type = "executable"
 
 [dependencies]
-answer = { path = "answer", options = ["biased"] }
+answer = { path = "answer", features = ["biased"] }
 
-[options]
-wolfssl = false
+[features]
+wolfssl = {}
 
 [language]
 cxx = "c++23"

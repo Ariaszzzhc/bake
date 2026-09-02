@@ -38,14 +38,6 @@ parse_moid_type(std::string_view text) {
         "unknown moid type '" + std::string(text) + "'");
 }
 
-// ===== BuildOption (bool-only) =====
-
-export struct BuildOption {
-    bool value = false;
-
-    bool operator==(const BuildOption&) const = default;
-};
-
 // ===== Dependency =====
 
 // Direct-archive URL detection — the extension discriminates archive
@@ -71,7 +63,7 @@ export struct Dependency {
     std::string rev;      // git ref: commit
     std::string path;     // relative path (for path deps)
     bool is_path_dep = false;
-    std::vector<std::string> options;  // feature names to enable
+    std::vector<std::string> features;  // features to activate on the target
 
     bool is_remote() const { return !url.empty(); }
     // Direct archive dependency — recognized by URL extension.
@@ -85,6 +77,19 @@ export struct Dependency {
         if (!rev.empty()) return {"rev", rev};
         return {"head", ""};
     }
+};
+
+// ===== Feature =====
+
+// A named capability bundle: platform applicability, the dependencies it
+// pulls (same entry grammar as [dependencies], resolved only when the
+// feature is active), compile defines it injects, and mutually exclusive
+// feature names.
+export struct FeatureSpec {
+    std::vector<std::string> platforms;  // triple globs; empty = all targets
+    std::map<std::string, Dependency> dependencies;
+    std::vector<std::string> defines;    // "NAME" or "NAME=VALUE"
+    std::vector<std::string> conflicts;  // mutually exclusive feature names
 };
 
 export std::string normalize_dependency_url(std::string_view raw_url) {
@@ -186,7 +191,8 @@ export struct Manifest {
     std::optional<Workspace> workspace;
     std::optional<Moid> moid;
     std::map<std::string, Dependency> dependencies;
-    std::map<std::string, BuildOption> options;
+    std::map<std::string, FeatureSpec> features;
+    std::vector<std::string> default_features;  // active when nothing else is
     std::map<std::string, ProfileConfig> profiles;
     std::vector<TargetCondition> targets;
     std::optional<LinkConfig> link;
@@ -297,14 +303,6 @@ export struct Manifest {
             return std::nullopt;
         }
 
-        auto parse_option_value = [](const toml::node& value)
-                -> std::optional<BuildOption> {
-            if (value.is_boolean()) {
-                return BuildOption{*value.value<bool>()};
-            }
-            return std::nullopt;
-        };
-
         auto parse_string_array = [](const toml::node& value)
                 -> std::vector<std::string> {
             std::vector<std::string> result;
@@ -340,10 +338,17 @@ export struct Manifest {
                 d.path = *v;
                 d.is_path_dep = true;
             }
-            if (auto* opts = (*t)["options"].as_array()) {
-                for (auto& elem : *opts) {
+            if (auto* legacy = (*t)["options"].as_array()) {
+                std::println(std::cerr,
+                    "bake: dependency '{}' uses 'options', which was "
+                    "replaced by 'features' in {}",
+                    name, toml_path.string());
+                return std::nullopt;
+            }
+            if (auto* feats = (*t)["features"].as_array()) {
+                for (auto& elem : *feats) {
                     if (auto s = elem.value<std::string>())
-                        d.options.push_back(*s);
+                        d.features.push_back(*s);
                 }
             }
 
@@ -444,18 +449,77 @@ export struct Manifest {
             }
         }
 
-        // [options] — bool only
-        if (auto* opts = tbl["options"].as_table()) {
-            for (auto& [key, val] : *opts) {
-                std::string opt_name = std::string(key.str());
-                if (auto parsed = parse_option_value(val)) {
-                    m.options[opt_name] = std::move(*parsed);
-                } else {
+        // [options] was replaced by [features] — fail loudly instead of
+        // silently ignoring stale manifests.
+        if (auto* legacy = tbl["options"].as_table()) {
+            (void)legacy;
+            std::println(std::cerr,
+                "bake: [options] was replaced by [features] in {}",
+                toml_path.string());
+            return std::nullopt;
+        }
+
+        // [features] — named capability bundles. `default` is the reserved
+        // activation list, every other key is a feature spec.
+        if (auto* feats = tbl["features"].as_table()) {
+            for (auto& [key, val] : *feats) {
+                std::string feat_name = std::string(key.str());
+                if (feat_name == "default") {
+                    if (!val.is_array()) {
+                        std::println(std::cerr,
+                            "bake: features key 'default' must be an array "
+                            "of feature names in {}",
+                            toml_path.string());
+                        return std::nullopt;
+                    }
+                    for (auto& elem : *val.as_array()) {
+                        if (auto s = elem.value<std::string>())
+                            m.default_features.push_back(*s);
+                    }
+                    continue;
+                }
+
+                auto* spec = val.as_table();
+                if (!spec) {
                     std::println(std::cerr,
-                                 "bake: option '{}' must be a boolean in {}",
-                                 opt_name, toml_path.string());
+                        "bake: feature '{}' must be a table in {}",
+                        feat_name, toml_path.string());
                     return std::nullopt;
                 }
+                FeatureSpec value;
+                if (auto* plats = (*spec)["platforms"].as_array()) {
+                    for (auto& elem : *plats) {
+                        if (auto s = elem.value<std::string>()) {
+                            if (!valid_target_pattern(*s)) {
+                                std::println(std::cerr,
+                                    "bake: feature '{}' platform '{}' is "
+                                    "not a valid triple pattern in {}",
+                                    feat_name, *s, toml_path.string());
+                                return std::nullopt;
+                            }
+                            value.platforms.push_back(*s);
+                        }
+                    }
+                }
+                if (auto* deps = (*spec)["dependencies"].as_table()) {
+                    for (auto& [dep_key, dep_val] : *deps) {
+                        auto parsed = parse_dependency_entry(
+                            std::string(dep_key.str()), dep_val);
+                        if (!parsed) return std::nullopt;
+                        value.dependencies[parsed->name] = std::move(*parsed);
+                    }
+                }
+                if (auto* arr = (*spec)["defines"].as_array()) {
+                    for (auto& elem : *arr)
+                        if (auto s = elem.value<std::string>())
+                            value.defines.push_back(*s);
+                }
+                if (auto* arr = (*spec)["conflicts"].as_array()) {
+                    for (auto& elem : *arr)
+                        if (auto s = elem.value<std::string>())
+                            value.conflicts.push_back(*s);
+                }
+                m.features[feat_name] = std::move(value);
             }
         }
 
@@ -567,18 +631,29 @@ namespace {
 
 bool same_definition(const Dependency& a, const Dependency& b) {
     return a.url == b.url && a.tag == b.tag && a.branch == b.branch &&
-           a.rev == b.rev && a.path == b.path && a.options == b.options;
+           a.rev == b.rev && a.path == b.path && a.features == b.features;
 }
 
 }  // namespace
 
-// Effective dependency set for a build triple: the global [dependencies]
-// plus every [target."<glob>".dependencies] table whose pattern matches the
-// triple, applied in declaration order. A repeated alias with an identical
-// definition deduplicates; a different definition is an error naming both
-// scopes. Scopes that do not match the triple are invisible.
+// A feature applies to a build triple when it declares no platforms or any
+// pattern matches.
+export bool feature_supports_target(const FeatureSpec& feature,
+                                    const std::string& triple) {
+    for (const auto& pattern : feature.platforms)
+        if (triple_matches(triple, pattern)) return true;
+    return feature.platforms.empty();
+}
+
+// Effective dependency set for a build triple: the global [dependencies],
+// every [target."<glob>".dependencies] table whose pattern matches the
+// triple, and the dependencies of every active feature. A repeated alias
+// with an identical definition deduplicates; a different definition is an
+// error naming both scopes. Scopes that do not match the triple are
+// invisible.
 export std::expected<std::map<std::string, Dependency>, std::string>
-effective_dependencies(const Manifest& manifest, const std::string& triple) {
+effective_dependencies(const Manifest& manifest, const std::string& triple,
+                       const std::set<std::string>& active_features) {
     std::map<std::string, Dependency> effective = manifest.dependencies;
     std::map<std::string, std::string> scope_of;
     for (auto& [alias, dep] : manifest.dependencies) {
@@ -586,11 +661,10 @@ effective_dependencies(const Manifest& manifest, const std::string& triple) {
         scope_of[alias] = "[dependencies]";
     }
 
-    for (const auto& condition : manifest.targets) {
-        if (!triple_matches(triple, condition.triple_pattern)) continue;
-        const std::string scope =
-            "[target.\"" + condition.triple_pattern + "\".dependencies]";
-        for (const auto& [alias, dep] : condition.dependencies) {
+    auto merge_scope = [&](const std::string& scope,
+                           const std::map<std::string, Dependency>& deps)
+            -> std::optional<std::string> {
+        for (const auto& [alias, dep] : deps) {
             auto existing = effective.find(alias);
             if (existing == effective.end()) {
                 effective.emplace(alias, dep);
@@ -598,11 +672,30 @@ effective_dependencies(const Manifest& manifest, const std::string& triple) {
                 continue;
             }
             if (same_definition(existing->second, dep)) continue;
-            return std::unexpected(
-                "dependency '" + alias +
-                "' has conflicting definitions in " + scope_of[alias] +
-                " and " + scope);
+            return "dependency '" + alias +
+                   "' has conflicting definitions in " + scope_of[alias] +
+                   " and " + scope;
         }
+        return std::nullopt;
+    };
+
+    for (const auto& condition : manifest.targets) {
+        if (!triple_matches(triple, condition.triple_pattern)) continue;
+        auto conflict = merge_scope(
+            "[target.\"" + condition.triple_pattern + "\".dependencies]",
+            condition.dependencies);
+        if (conflict) return std::unexpected(*conflict);
+    }
+    for (const auto& feature_name : active_features) {
+        auto it = manifest.features.find(feature_name);
+        if (it == manifest.features.end()) {
+            return std::unexpected(
+                "feature '" + feature_name + "' is not declared");
+        }
+        auto conflict = merge_scope(
+            "[features." + feature_name + ".dependencies]",
+            it->second.dependencies);
+        if (conflict) return std::unexpected(*conflict);
     }
     return effective;
 }

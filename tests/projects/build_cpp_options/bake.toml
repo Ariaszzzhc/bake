@@ -3,9 +3,9 @@ name = "option-app"
 version = "0.1.0"
 type = "executable"
 
-[options]
-diagnostics = false
-native-backend = false
+[features]
+diagnostics = {}
+native-backend = {}
 
 [profile.dev]
 opt = 2

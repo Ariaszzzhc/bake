@@ -6,8 +6,8 @@ type = "lib"
 [dependencies]
 base = { path = "../base" }
 
-[options]
-biased = false
+[features]
+biased = {}
 
 [language]
 cxx = "c++23"

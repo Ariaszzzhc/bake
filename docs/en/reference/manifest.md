@@ -17,9 +17,10 @@ cxx = "c++23"             # c++17 | c++20 | c++23
 c = "c17"                 # c11 | c17 | c23
 # C++20 or later is required for `import std;` and named modules.
 
-[options]                 # bool-only feature flags
-use_tls = false
-use_json = true
+[features]                # capability bundles: deps / defines / conflicts / platforms
+default = ["tls", "zlib"]
+tls = { dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } }, defines = ["USE_MBEDTLS"] }
+zlib = {}
 
 [dependencies]
 local = { path = "../local" }                                      # path dep
@@ -28,7 +29,7 @@ by_branch = { url = "https://github.com/org/repo", branch = "main" } # Git branc
 by_rev = { url = "https://github.com/org/repo", rev = "d5598e..." }  # exact Git revision
 head = { url = "https://github.com/org/head" }                     # default-branch HEAD
 archive = { url = "https://example.com/lib-1.0.tar.xz" }           # direct archive
-flagged = { path = "../x", options = ["use_tls"] }                # activate features
+flagged = { path = "../x", features = ["use-tls"] }              # activate features
 
 [link]                    # platform-agnostic system linking
 libraries = ["z"]         # -l flags
@@ -66,13 +67,35 @@ header_ext = [".h", ".hpp", ".hxx", ".hh"]
 
 `cxx` and `c` set the language standard for C++ and C sources respectively. Defaults: `c++17` / `c17`. (`bake init --std` writes this table for you.)
 
-## `[options]`
+## `[features]`
 
-Bool-only feature flags. Each becomes a preprocessor macro `BAKE_<MOID>_<OPTION>` set to `1` or `0` (macro names are upper-cased). Options are OR-merged across the dependency graph: if any package activates a dependency's option, it is on everywhere. CLI override:
+Named capability bundles. A feature can carry four things:
+
+```toml
+[features]
+default = ["tls-mbedtls", "zlib"]     # reserved: the activation set when nothing else is requested
+
+tls-mbedtls = {
+  platforms = ["*-apple-darwin", "*-linux-*"],   # applies only to these targets; omitted = all
+  dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } },  # same entry grammar as [dependencies]; resolved only when active
+  defines = ["USE_MBEDTLS"],                     # macros injected into this package's compiles ("NAME" or "NAME=VALUE")
+  conflicts = ["tls-openssl"],                   # mutually exclusive feature names
+}
+zlib = {}                             # macro-only feature: just BAKE_<MOID>_ZLIB
+```
+
+Activation semantics:
+
+- **Union unification**: a package's effective set is its own `default` ∪ all incoming edge activations ∪ CLI. `build.cpp` queries with `b.feature("zlib")`
+- Every declared feature yields the macro `BAKE_<MOID>_<FEATURE>` — `1` when active, `0` when not
+- **conflicts** are validated pairwise within the effective set at configure time, and the error names both activation origins
+- **platforms** is the applicability whitelist: a default-set feature that does not match the build target contributes nothing silently; an explicitly activated one (dependency edge or `--feature`) that does not match is an error
+- A feature's dependencies enter the graph, the lockfile, and the download queue only when active
+
+CLI activation (root moid only):
 
 ```bash
-bake build --option use_tls        # =true
-bake build --option use_tls=false
+bake build --feature tls-openssl
 ```
 
 Every moid also gets version macros:
@@ -96,7 +119,7 @@ Each alias in `[dependencies]` declares one dependency. The same entry syntax is
 | `tag` | Git ref | Select a tag. Mutually exclusive with `branch` and `rev`. |
 | `branch` | Git ref | Select a branch. Mutually exclusive with `tag` and `rev`. |
 | `rev` | Git ref | Select an exact Git revision. Mutually exclusive with `tag` and `branch`. |
-| `options` | any dependency | List of the dependency's `[options]` to activate. |
+| `features` | any dependency | List of the dependency's `[features]` to activate. |
 
 A Git dependency with no `tag`, `branch`, or `rev` resolves its default-branch `HEAD` at build time. Archive dependencies must not specify a ref. Tar archives are extracted with `tar`; ZIP archives use `unzip`.
 

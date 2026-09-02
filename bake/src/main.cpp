@@ -70,7 +70,7 @@ ParsedArgs parse_args(int argc, char *argv[]) {
   // Options that consume the next argument as a value
   auto takes_value = [](std::string_view opt) {
     return opt == "--tag" || opt == "--type" || opt == "--std" ||
-           opt == "--target" || opt == "--glibc-version" || opt == "--option" ||
+           opt == "--target" || opt == "--glibc-version" || opt == "--feature" ||
            opt == "--profile" || opt == "-j" || opt == "-p" || opt == "-t";
   };
 
@@ -111,70 +111,32 @@ ParsedArgs parse_args(int argc, char *argv[]) {
 
 namespace {
 
-struct OptionOverride {
-  std::string name;
-  std::optional<std::string> value;
-};
-
-std::optional<std::vector<OptionOverride>>
-parse_option_overrides(const ParsedArgs &args) {
-  std::vector<OptionOverride> overrides;
+std::optional<std::vector<std::string>>
+parse_feature_flags(const ParsedArgs &args) {
+  std::vector<std::string> names;
   for (const auto &option : args.options) {
-    if (!starts_with(option, "--option="))
+    if (!starts_with(option, "--feature="))
       continue;
 
-    const std::string declaration = option.substr(9);
-    if (declaration.empty()) {
+    const std::string name = option.substr(10);
+    if (name.empty()) {
       std::println(std::cerr,
-                   "bake: --option requires <name> or <name>=<value>");
+                   "bake: --feature requires a feature name");
       return std::nullopt;
     }
-
-    const std::size_t equals = declaration.find('=');
-    OptionOverride override;
-    override.name = declaration.substr(0, equals);
-    if (override.name.empty()) {
-      std::println(std::cerr, "bake: build option name cannot be empty");
-      return std::nullopt;
-    }
-    if (equals != std::string::npos) {
-      override.value = declaration.substr(equals + 1);
-    }
-    overrides.push_back(std::move(override));
+    names.push_back(name);
   }
-  return overrides;
+  return names;
 }
 
-std::optional<bool> parse_bool_option(std::string_view value) {
-  if (value == "true" || value == "1" || value == "on" || value == "yes")
-    return true;
-  if (value == "false" || value == "0" || value == "off" || value == "no")
-    return false;
-  return std::nullopt;
-}
-
-std::optional<BuildOption>
-parse_root_option_value(const OptionOverride &override,
-                        const BuildOption &declared) {
-  if (!override.value)
-    return BuildOption{true};
-  auto value = parse_bool_option(*override.value);
-  if (!value) {
-    std::println(std::cerr, "bake: option '{}' expects a boolean, got '{}'",
-                 override.name, *override.value);
+std::optional<std::vector<std::string>>
+parse_root_features(const Manifest &root, const ParsedArgs &args,
+                    const std::optional<std::string> &selected_member) {
+  auto names = parse_feature_flags(args);
+  if (!names)
     return std::nullopt;
-  }
-  return BuildOption{*value};
-}
-
-std::optional<std::map<std::string, BuildOption>>
-parse_root_options(const Manifest &root, const ParsedArgs &args,
-                   const std::optional<std::string> &selected_member) {
-  auto overrides = parse_option_overrides(args);
-  if (!overrides)
-    return std::nullopt;
-  if (overrides->empty())
-    return std::map<std::string, BuildOption>{};
+  if (names->empty())
+    return std::vector<std::string>{};
 
   std::vector<Manifest> selected_roots;
   if (root.is_workspace()) {
@@ -199,25 +161,19 @@ parse_root_options(const Manifest &root, const ParsedArgs &args,
   if (selected_roots.empty()) {
     std::println(
         std::cerr,
-        "bake: cannot apply build options without a selected root moid");
+        "bake: cannot apply features without a selected root moid");
     return std::nullopt;
   }
 
-  std::map<std::string, BuildOption> result;
-  for (const auto &override : *overrides) {
-    auto declared = selected_roots.front().options.find(override.name);
-    if (declared == selected_roots.front().options.end()) {
+  for (const auto &name : *names) {
+    if (!selected_roots.front().features.count(name)) {
       std::println(std::cerr,
-                   "bake: unknown build option '{}' (declare it in [options])",
-                   override.name);
+                   "bake: unknown feature '{}' (declare it in [features])",
+                   name);
       return std::nullopt;
     }
-    auto value = parse_root_option_value(override, declared->second);
-    if (!value)
-      return std::nullopt;
-    result[override.name] = std::move(*value);
   }
-  return result;
+  return names;
 }
 
 } // namespace
@@ -253,7 +209,7 @@ void print_help() {
       "    -h, --help      Print this help and exit\n"
       "\n"
       "BUILD OPTIONS:\n"
-      "    --option <name>[=value]  Override a [options] value from bake.toml\n"
+      "    --feature <name>        Activate a root [features] feature\n"
       "    --target=<triple>       Cross-compile target\n"
       "    --release               Build with release profile\n"
       "    --profile <name>        Use a specific build profile\n"
@@ -290,7 +246,7 @@ void print_command_help(std::string_view cmd) {
         "    bake build [options]\n"
         "\n"
         "OPTIONS:\n"
-        "    --option <name>[=value]  Override a [options] value\n"
+        "    --feature <name>        Activate a root feature\n"
         "    -j <n>                   Parallel job count\n"
         "    -p <member>              Build specific workspace member\n"
         "    --release                Build with release profile\n"
@@ -618,13 +574,13 @@ int cmd_build(const ParsedArgs &args) {
     return 1;
   }
 
-  auto root_options = parse_root_options(*manifest, args, *selected_member);
-  if (!root_options)
+  auto root_features = parse_root_features(*manifest, args, *selected_member);
+  if (!root_features)
     return 1;
 
   BuildSelection selection;
   selection.workspace_member = std::move(*selected_member);
-  selection.root_options = std::move(*root_options);
+  selection.root_features = std::move(*root_features);
   TargetSpec selection_target;
   if (auto t = args.get_option("target"))
     selection_target = parse_target(*t);
