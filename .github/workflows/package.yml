@@ -96,19 +96,26 @@ jobs:
       - name: Install Clang 19 + build tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build zip clang-19 libc++-19-dev libc++abi-19-dev
+          sudo apt-get install -y ninja-build zip clang-19 clang-tools-19 libc++-19-dev libc++abi-19-dev
           python3 -m pip install --user --break-system-packages "cmake>=3.30"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Stage 0 (host bake)
         run: |
-          # Debian/Ubuntu put libc++.modules.json at <prefix>/lib/, not the
-          # lib/c++/ layout bake's CMakeLists guesses — point CMake at it.
+          # Debian/Ubuntu layout fixes, both invisible to CMake's defaults:
+          #  - libc++.modules.json lives at <prefix>/lib/, not the lib/c++/
+          #    bake's CMakeLists guesses.
+          #  - clang-scan-deps ships unversioned only inside /usr/lib/llvm-19
+          #    (/usr/bin has the versioned name); CMake looks next to the
+          #    compiler and misses it.
           MODJSON="$(find /usr/lib/llvm-19 /usr/lib/c++ -name libc++.modules.json 2>/dev/null | head -1)"
           echo "libc++.modules.json: ${MODJSON:-<not found>}"
           ARGS=()
           if [ -n "$MODJSON" ]; then
             ARGS+=(-DCMAKE_CXX_STDLIB_MODULES_JSON="$MODJSON")
+          fi
+          if [ -x /usr/lib/llvm-19/bin/clang-scan-deps ]; then
+            ARGS+=(-DCMAKE_CXX_COMPILER_CLANG_SCAN_DEPS=/usr/lib/llvm-19/bin/clang-scan-deps)
           fi
           cmake -G Ninja -B build \
             -DCMAKE_C_COMPILER=clang-19 \
