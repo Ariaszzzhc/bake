@@ -47,6 +47,10 @@ default_branch = { url = "https://github.com/org/repo" }
 
 `tag`、`branch` 和 `rev` 互斥：一个条目至多包含其中一个。每个选定的 Git ref 都会在锁文件中解析为 commit，因此普通构建会持续使用该 commit，直到 `bake update` 移动它。
 
+取回方式：bake 优先通过托管方的源码归档端点（GitHub/GitLab 风格的
+`<仓库>/archive/<commit>.tar.gz`）按锁定的 commit 下载 Git 依赖；端点不存在或不可用时回退到完整
+`git clone` 并检出该 commit。两种取回方式产生同一棵内容寻址源码树，锁文件的完整性值不依赖取回方式。
+
 ### 归档依赖
 
 以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch` 或 `rev`；归档依赖带 ref 会报错。

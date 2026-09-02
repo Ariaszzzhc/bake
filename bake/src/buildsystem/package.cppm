@@ -259,6 +259,20 @@ private:
 
     // Compute tree SHA-256 (normalized hash of all files in directory)
     std::string compute_tree_hash(const Path& dir);
+
+    // Obtain a remote dependency's source tree in a fresh work directory
+    // under the cache. Archives download verbatim; git deps try the host's
+    // tarball endpoint (GitHub/GitLab style) first and fall back to a full
+    // `git clone` + checkout when the host has none. Returns the extracted
+    // directory; the caller moves it into the content cache.
+    std::optional<Path> fetch_sources(const std::string& url, bool is_archive,
+                                      const std::string& commit);
+
+    // Clone url and check out an exact commit into dest_dir. .git is
+    // transport detail — the cache holds bare sources, and dropping it
+    // keeps the tree identical to the tarball transport.
+    bool fetch_via_clone(const std::string& url, const std::string& commit,
+                         const Path& dest_dir);
 };
 
 // Tree hash of a source directory, used by the CLI layer's cache
@@ -479,7 +493,8 @@ inline std::optional<Path> Resolver::download_archive(const std::string& url,
 
     Path archive_path = dest_dir / file_name;
 
-    std::vector<std::string> cmd = {"curl", "-sL", "-o", archive_path.string(), url};
+    std::vector<std::string> cmd = {"curl", "-sL", "--fail", "-o",
+                                    archive_path.string(), url};
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
         std::println(std::cerr, "bake: failed to download {}", url);
@@ -892,6 +907,80 @@ inline std::string Resolver::compute_tree_hash(const Path& dir) {
     return compute_tree_sha256(dir);
 }
 
+inline bool Resolver::fetch_via_clone(const std::string& url,
+                                      const std::string& commit,
+                                      const Path& dest_dir) {
+    dest_dir.remove_all();
+
+    std::vector<std::string> clone = {"git", "clone", "--quiet", "--no-checkout",
+                                      url, dest_dir.string()};
+    if (!run_process(clone, Path(), true).success()) {
+        std::println(std::cerr, "bake: failed to clone {}", url);
+        dest_dir.remove_all();
+        return false;
+    }
+
+    auto checkout = [&]() {
+        return run_process({"git", "-C", dest_dir.string(), "checkout",
+                            "--quiet", "--detach", commit},
+                           Path(), true)
+            .success();
+    };
+
+    // The commit is normally reachable from a branch or tag in a standard
+    // clone. If it is not (deleted branch, uploaded-only object), ask the
+    // server for the SHA directly before giving up.
+    if (!checkout()) {
+        run_process({"git", "-C", dest_dir.string(), "fetch", "--quiet",
+                     "origin", commit},
+                    Path(), true);
+        if (!checkout()) {
+            std::println(std::cerr, "bake: commit {} not found in {}",
+                         commit, url);
+            dest_dir.remove_all();
+            return false;
+        }
+    }
+
+    (dest_dir / ".git").remove_all();
+    return true;
+}
+
+inline std::optional<Path> Resolver::fetch_sources(const std::string& url,
+                                                   bool is_archive,
+                                                   const std::string& commit) {
+    std::println("  Downloading {}",
+                 is_archive ? url.substr(url.find_last_of('/') + 1)
+                            : repo_name_from_url(url));
+
+    Path download_dir = cache_dir_ / ".downloads";
+    std::string download_url = url;
+    std::string file_name = SHA256::hex(url).substr(0, 24) +
+                            archive_extension(url);
+    if (!is_archive) {
+        download_url = build_archive_url(url, commit);
+        file_name = commit + ".tar.gz";
+    }
+
+    if (auto archive = download_archive(download_url, file_name, download_dir)) {
+        std::string transport_hash = file_hash(*archive);
+        Path extracted = cache_dir_ / (".work-" + transport_hash.substr(0, 12));
+        bool ok = extract_archive(*archive, extracted);
+        archive->remove();
+        if (ok) return extracted;
+    }
+
+    // Archives have no clone transport. Git deps fall back to a full clone
+    // when the host exposes no tarball endpoint.
+    if (is_archive) return std::nullopt;
+
+    std::println("  No tarball endpoint for {}; cloning", repo_name_from_url(url));
+    Path clone_dir = cache_dir_ / (".clone-" + commit.substr(0, 12));
+    if (!fetch_via_clone(url, commit, clone_dir)) return std::nullopt;
+    return clone_dir;
+}
+
+
 inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep) {
     if (!dep.is_remote()) return std::nullopt;  // path deps are manifest-only
 
@@ -899,17 +988,8 @@ inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep
     std::string ref_type = is_archive ? "archive" : "";
     std::string ref;
     std::string commit;
-    std::string download_url;
-    std::string file_name;
 
-    if (is_archive) {
-        std::string file_name_label = dep.url.substr(
-            dep.url.find_last_of('/') + 1);
-        std::println("  Downloading {}", file_name_label);
-        download_url = dep.url;
-        file_name =
-            SHA256::hex(dep.url).substr(0, 24) + archive_extension(dep.url);
-    } else {
+    if (!is_archive) {
         auto pair = dep.git_ref();
         ref_type = pair.first;
         ref = pair.second;
@@ -929,38 +1009,26 @@ inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep
             }
             commit = *resolved;
         }
-
-        download_url = build_archive_url(dep.url, commit);
-        file_name = commit + ".tar.gz";
     }
 
-    // Download, hash, extract, tree-hash, move into the content cache.
-    Path download_dir = cache_dir_ / ".downloads";
-    auto archive = download_archive(download_url, file_name, download_dir);
-    if (!archive) return std::nullopt;
+    // Download, extract, tree-hash, move into the content cache.
+    auto extracted = fetch_sources(dep.url, is_archive, commit);
+    if (!extracted) return std::nullopt;
 
-    std::string transport_hash = file_hash(*archive);
-
-    Path extracted_dir = cache_dir_ / (".work-" + transport_hash.substr(0, 12));
-    if (!extract_archive(*archive, extracted_dir)) return std::nullopt;
-
-    std::string tree_hash = compute_tree_hash(extracted_dir);
+    std::string tree_hash = compute_tree_hash(*extracted);
 
     Path final_dir = cache_dir_ / tree_hash;
     if (!final_dir.exists()) {
         final_dir.parent().mkdir_recursive();
-        std::filesystem::rename(extracted_dir.fs(), final_dir.fs());
+        std::filesystem::rename(extracted->fs(), final_dir.fs());
     } else {
-        extracted_dir.remove_all();
+        extracted->remove_all();
     }
 
     // Native sources carry their moid name as the lock annotation.
     std::string name;
     if (auto native = Manifest::load_moid(final_dir))
         name = native->moid->name;
-
-    // Clean up download
-    archive->remove();
 
     LockDep node;
     node.url = dep.url;
@@ -993,49 +1061,29 @@ inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig&
         Path cached = cache_dir_ / hash;
         if (cached.is_directory()) continue;  // already cached
 
+        // A git entry without a resolved commit cannot be fetched by
+        // identity; the next resolve re-locks it.
+        if (!dep.is_archive() && dep.commit.empty()) continue;
+
         // Download by locked identity (no ref re-resolution)
-        std::string url;
-        std::string file_name;
-        if (dep.is_archive()) {
-            url = dep.url;
-            file_name = SHA256::hex(dep.url).substr(0, 24) +
-                        archive_extension(dep.url);
-        } else {
-            if (dep.commit.empty()) continue;
-            url = build_archive_url(dep.url, dep.commit);
-            file_name = dep.commit + ".tar.gz";
-        }
-
-        std::println("  Downloading {}", display_name_for_key(key));
-
-        Path download_dir = cache_dir_ / ".downloads";
-        auto archive = download_archive(url, file_name, download_dir);
-        if (!archive) {
+        auto extracted = fetch_sources(dep.url, dep.is_archive(), dep.commit);
+        if (!extracted) {
             std::println(std::cerr, "bake: download failed for '{}'", key);
             return false;
         }
 
-        // Extract and verify tree hash
-        std::string transport_hash = file_hash(*archive);
-        Path extracted_dir = cache_dir_ / (".work-" + transport_hash.substr(0, 12));
-        if (!extract_archive(*archive, extracted_dir)) {
-            archive->remove();
-            return false;
-        }
-
-        std::string tree_hash = compute_tree_hash(extracted_dir);
+        // Verify the tree hash against the lock
+        std::string tree_hash = compute_tree_hash(*extracted);
         if (tree_hash != hash) {
             std::println(std::cerr, "bake: tree hash mismatch for '{}'", key);
-            extracted_dir.remove_all();
-            archive->remove();
+            extracted->remove_all();
             return false;
         }
 
         // Move to final cache location
         Path final_dir = cache_dir_ / tree_hash;
         final_dir.parent().mkdir_recursive();
-        std::filesystem::rename(extracted_dir.fs(), final_dir.fs());
-        archive->remove();
+        std::filesystem::rename(extracted->fs(), final_dir.fs());
     }
 
     return true;

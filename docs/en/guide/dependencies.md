@@ -47,6 +47,13 @@ default_branch = { url = "https://github.com/org/repo" }
 
 `tag`, `branch`, and `rev` are mutually exclusive: an entry may contain at most one of them. Each selected Git ref is resolved to a commit in the lockfile, so ordinary builds keep using that commit until `bake update` moves it.
 
+Fetching: bake first downloads a Git dependency through the host's source
+archive endpoint (GitHub/GitLab style `<repo>/archive/<commit>.tar.gz`) at
+the locked commit; when the host has no such endpoint it falls back to a
+full `git clone` checked out at that commit. Both transports produce the
+same content-addressed source tree, so the lockfile integrity never depends
+on which one was used.
+
 ### Archive dependencies
 
 A URL ending in `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, or `.zip` is recognized as a direct archive dependency. Do not specify `tag`, `branch`, or `rev` for an archive URL; a ref on an archive dependency is an error.
