@@ -336,19 +336,38 @@ void print_command_help(std::string_view cmd) {
 // ===== init command =====
 
 int cmd_init(const ParsedArgs &args) {
-  // Determine project name
+  // Determine project name. A positional argument may be a path:
+  // "bake init some/dir/hello" scaffolds at that path and names the project
+  // after the last component.
+  std::string given;
+  if (!args.positional.empty()) given = args.positional[0];
+
   std::string project_name;
-  if (!args.positional.empty()) {
-    project_name = args.positional[0];
+  if (!given.empty()) {
+    std::filesystem::path given_path(given);
+    if (given_path.filename().empty())  // trailing separator
+      given_path = given_path.parent_path();
+    project_name = given_path.filename().string();
   } else {
-    // Use current directory name
-    auto cwd = Path::current();
-    project_name = cwd.filename_string();
-    if (project_name.empty() || project_name == "/") {
-      std::println(std::cerr, "bake: could not determine project name. Please "
-                              "specify: bake init <name>");
-      return 1;
+    project_name = Path::current().filename_string();
+  }
+  if (project_name == "." || project_name == "..")
+    project_name.clear();
+  if (project_name.empty()) {
+    if (given.empty()) {
+      std::println(std::cerr, "bake: could not determine project name. "
+                              "Please specify: bake init <name>");
+    } else {
+      std::println(std::cerr, "bake: invalid project name '{}'", given);
     }
+    return 1;
+  }
+  if (!is_portable_name(project_name)) {
+    std::println(std::cerr,
+                 "bake: invalid project name '{}': expected a portable ASCII "
+                 "name matching [A-Za-z0-9][A-Za-z0-9._+@-]*",
+                 project_name);
+    return 1;
   }
 
   // Determine Moid type
@@ -371,12 +390,11 @@ int cmd_init(const ParsedArgs &args) {
   // Determine target directory
   Path target_dir;
   bool create_subdir = false;
-  if (!args.positional.empty()) {
-    target_dir = Path::current() / project_name;
+  if (!given.empty()) {
+    target_dir = Path::current() / given;
     create_subdir = true;
     if (target_dir.exists()) {
-      std::println(std::cerr, "bake: directory '{}' already exists",
-                   project_name);
+      std::println(std::cerr, "bake: directory '{}' already exists", given);
       return 1;
     }
   } else {
@@ -449,8 +467,8 @@ int cmd_init(const ParsedArgs &args) {
 
   // Print success
   if (create_subdir) {
-    std::println("Created project '{}' in ./{}", project_name, project_name);
-    std::println("  Next: cd {} && bake build", project_name);
+    std::println("Created project '{}' in ./{}", project_name, given);
+    std::println("  Next: cd {} && bake build", given);
   } else {
     std::println("Initialized project '{}' in current directory", project_name);
     std::println("  Next: bake build");

@@ -466,36 +466,7 @@ export MoidDeclaration declare_default_inputs(
 // the DAG builder consumes one MoidDeclaration and never distinguishes how its
 // inputs were described.
 
-namespace {
-
-Path resolve_path(const std::string& s, const Path& base) {
-    Path p(s);
-    if (!p.fs().is_absolute())
-        p = base / s;
-    return p.lexically_normal();
-}
-
-std::string moid_storage_key(std::string_view canonical_id) {
-    return SHA256::hex(canonical_id).substr(0, 24);
-}
-
-std::string action_id_for(std::string_view kind, std::string_view owner_key,
-                          std::string_view source_identity = {}) {
-    std::string id = std::string(kind) + ":" + std::string(owner_key);
-    if (!source_identity.empty())
-        id += ":" + std::string(source_identity);
-    return id;
-}
-
-std::string normalized_source_id(const Path& root, const Path& source) {
-    std::error_code ec;
-    auto rel = std::filesystem::relative(source.fs(), root.fs(), ec);
-    if (!ec && !rel.empty())
-        return rel.lexically_normal().generic_string();
-    return source.fs().lexically_normal().generic_string();
-}
-
-bool is_portable_terminal_name(std::string_view name) {
+export bool is_portable_name(std::string_view name) {
     auto is_ascii_alnum = [](unsigned char c) {
         return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                (c >= '0' && c <= '9');
@@ -523,6 +494,34 @@ bool is_portable_terminal_name(std::string_view name) {
         return false;
     }
     return true;
+}
+
+namespace {
+Path resolve_path(const std::string& s, const Path& base) {
+    Path p(s);
+    if (!p.fs().is_absolute())
+        p = base / s;
+    return p.lexically_normal();
+}
+
+std::string moid_storage_key(std::string_view canonical_id) {
+    return SHA256::hex(canonical_id).substr(0, 24);
+}
+
+std::string action_id_for(std::string_view kind, std::string_view owner_key,
+                          std::string_view source_identity = {}) {
+    std::string id = std::string(kind) + ":" + std::string(owner_key);
+    if (!source_identity.empty())
+        id += ":" + std::string(source_identity);
+    return id;
+}
+
+std::string normalized_source_id(const Path& root, const Path& source) {
+    std::error_code ec;
+    auto rel = std::filesystem::relative(source.fs(), root.fs(), ec);
+    if (!ec && !rel.empty())
+        return rel.lexically_normal().generic_string();
+    return source.fs().lexically_normal().generic_string();
 }
 
 std::optional<std::string> validate_terminal_relative_path(
@@ -1364,7 +1363,7 @@ export std::expected<BuildGraph, std::string> build_graph(
                     "' for moid '" + canonical_id +
                     "': expected a single filename component");
             }
-            if (!is_portable_terminal_name(decl.name)) {
+            if (!is_portable_name(decl.name)) {
                 return std::unexpected(
                     "invalid terminal output name '" + decl.name +
                     "' for moid '" + canonical_id +
