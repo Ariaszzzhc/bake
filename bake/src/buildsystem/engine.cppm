@@ -956,7 +956,7 @@ void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
   // Profile → flags / link_flags / defines
   auto profile = manifest.resolve_profile(profile_name);
   bool is_release = (profile_name == "release");
-  auto resolved = resolve_profile_flags(profile, is_release);
+  auto resolved = resolve_profile_flags(profile, is_release, target);
 
   decl.compile_flags = resolved.compile_flags;
   decl.link_flags = resolved.link_flags;

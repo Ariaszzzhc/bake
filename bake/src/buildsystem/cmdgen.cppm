@@ -184,7 +184,8 @@ export struct ResolvedProfile {
 };
 
 export ResolvedProfile resolve_profile_flags(const ProfileConfig& profile,
-                                              bool is_release) {
+                                              bool is_release,
+                                              const TargetSpec& target) {
     ResolvedProfile rp;
 
     // Optimization level
@@ -209,9 +210,13 @@ export ResolvedProfile resolve_profile_flags(const ProfileConfig& profile,
         rp.compile_flags.push_back("-flto");
     }
 
-    // Strip (link-time)
+    // Strip (link-time): drop debug info everywhere, and local symbols on
+    // the formats where ld has a flag for it. MinGW keeps symbol tables
+    // whole (its GNU-style -S already maps to the driver's strip_debug).
     if (profile.strip && *profile.strip) {
         rp.link_flags.push_back("-Wl,-S");
+        if (!target.is_windows_gnu())
+            rp.link_flags.push_back("-Wl,-x");
     }
 
     // Sanitizers

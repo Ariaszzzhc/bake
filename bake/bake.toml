@@ -3,6 +3,9 @@ name = "bake"
 version = "0.1.0"
 type = "executable"
 
+[profile.release]
+strip = true
+
 [dependencies]
 tomlplusplus = { path = "../third_party/tomlplusplus" }
 nlohmann_json = { path = "../third_party/nlohmann" }
