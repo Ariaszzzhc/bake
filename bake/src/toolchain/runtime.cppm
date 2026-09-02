@@ -425,15 +425,16 @@ export ModuleFileMap ensure_std_modules(
         cmd.push_back("-stdlib=libc++");
         cmd.push_back("-nostdinc++");
 
-        // Cross-compile: -target + family __config_site before libc++ headers
-        // (none for darwin — stock __config).
+        // Family __config_site before the libc++ headers (musl/linux and
+        // windows need it; darwin compiles against stock __config).
+        // -target only for actual cross compiles.
+        if (!config_subdir.empty()) {
+            cmd.push_back("-isystem");
+            cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
+        }
         if (!target.is_native()) {
             cmd.push_back("-target");
             cmd.push_back(target.triple_with_version());
-            if (!config_subdir.empty()) {
-                cmd.push_back("-isystem");
-                cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
-            }
         }
 
         cmd.push_back("-isystem");
@@ -460,13 +461,13 @@ export ModuleFileMap ensure_std_modules(
         cmd.push_back("-stdlib=libc++");
         cmd.push_back("-nostdinc++");
 
+        if (!config_subdir.empty()) {
+            cmd.push_back("-isystem");
+            cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
+        }
         if (!target.is_native()) {
             cmd.push_back("-target");
             cmd.push_back(target.triple_with_version());
-            if (!config_subdir.empty()) {
-                cmd.push_back("-isystem");
-                cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
-            }
         }
 
         cmd.push_back("-isystem");

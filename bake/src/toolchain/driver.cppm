@@ -1180,16 +1180,22 @@ static int clang_main(int Argc, const char **Argv,
       break;
     }
   }
-  if (target_triple.empty())
-    target_triple = default_triple;
+  // No explicit -target: native compile. The policy points below (musl
+  // link filtering, header injection) resolve the family from bake's own
+  // host detection — NOT from LLVM's build-time default triple, a gnu
+  // flavor baked in by the cmake host probe. A libc++-built bake resolves
+  // native linux to musl and needs the vendored musl chain, or musl's
+  // headers dangle against the system glibc tree.
+  bake::TargetSpec resolved = g_explicit_target.triple_.empty()
+      ? bake::detect_host_target()
+      : g_explicit_target;
 
-
-  // String matching on canonical triples is more reliable than llvm::Triple
-  // for musl detection (the Triple parser mishandles 3-component triples).
-  if (StringRef(target_triple).contains("musl"))
+  if (resolved.is_linux_musl())
     filter_musl_link_flags(Args, Saver);
 
   // IsCxx was determined at line 650 from the invocation (cc vs c++).
+  // target_triple stays empty for native — inject_vendored_headers
+  // normalizes it the same way.
   inject_vendored_headers(Args, Saver, target_triple, IsCxx);
 
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));
