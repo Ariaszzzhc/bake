@@ -121,7 +121,7 @@ git clone --recursive <bake-repo-url> bake
 cd bake
 
 # Stage 0: bootstrap with the system compiler.
-# Needs CMake >= 3.30, Ninja, Clang >= 19 with libc++.
+# Needs CMake >= 3.30, Ninja, Clang >= 22 with libc++.
 cmake -G Ninja -B build && cmake --build build
 
 # Stage 1: bake builds itself.

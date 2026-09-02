@@ -30,7 +30,7 @@ instincts, these rules win:
 ## Build & Test
 
 ```bash
-# Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 19 + libc++)
+# Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 22 + libc++)
 cmake -G Ninja -B build && cmake --build build
 
 # Run the test suite (66 end-to-end tests)

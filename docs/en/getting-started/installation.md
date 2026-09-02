@@ -6,7 +6,7 @@ Bootstrapping bake from source requires:
 
 - CMake ≥ 3.30
 - Ninja
-- Clang ≥ 19 with libc++
+- Clang ≥ 22 with libc++
 
 These are only needed once: the bootstrap compiler builds stage 0, and stage 0 builds everything after that. The resulting bake binary has no external toolchain dependencies — it embeds LLVM/Clang/LLD and vendors libc++, libc++abi, libunwind, compiler-rt, musl, and MinGW-w64.
 

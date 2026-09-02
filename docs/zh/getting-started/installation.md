@@ -6,7 +6,7 @@
 
 - CMake ≥ 3.30
 - Ninja
-- 带有 libc++ 的 Clang ≥ 19
+- 带有 libc++ 的 Clang ≥ 22
 
 这些工具只需使用一次：引导编译器构建 stage 0，随后由 stage 0 构建其余所有内容。生成的 bake binary 不依赖外部工具链——它嵌入 LLVM/Clang/LLD，并内置 libc++、libc++abi、libunwind、compiler-rt、musl 和 MinGW-w64。
 

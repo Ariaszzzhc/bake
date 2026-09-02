@@ -114,7 +114,7 @@ git clone --recursive <bake-repo-url> bake
 cd bake
 
 # Stage 0：用系统编译器自举。
-# 需要 CMake >= 3.30、Ninja、Clang >= 19（libc++）。
+# 需要 CMake >= 3.30、Ninja、Clang >= 22（libc++）。
 cmake -G Ninja -B build && cmake --build build
 
 # Stage 1：bake 构建自己。
