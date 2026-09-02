@@ -264,7 +264,7 @@ void print_help() {
       "    -p <member>             Build a specific workspace member\n"
       "    -j <n>                  Parallel job count\n"
       "\n"
-      "For more information, visit: https://github.com/arias/bake",
+      "Run 'bake <command> --help' for command details.",
       BAKE_VERSION);
 }
 
