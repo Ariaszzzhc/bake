@@ -38,6 +38,7 @@ frameworks = ["Foundation"]
 
 [target."*-linux-musl"]
 libraries = ["pthread", "dl"]
+defines = ["Z_HAVE_UNISTD_H"]   # upstream feature macros (target tables only)
 
 [target."*-apple-darwin".dependencies]
 metal_cpp = { url = "https://example.com/metal-cpp-1.0.0.zip" }
@@ -116,7 +117,13 @@ BAKE_MYAPP_VERSION_PATCH = 0
 - `libraries` — 要链接的系统库（`-l`）
 - `frameworks` — macOS framework
 
-匹配的节会与 `[link]` 及彼此合并。
+`[target."<glob>"]` 节额外接受：
+
+- `defines` — 本包编译时传入的预处理器宏（`"NAME"` 或 `"NAME=VALUE"`）
+- `flags` — 追加到编译命令的 flags
+- `include_dirs` — 追加的 include 路径
+
+匹配的节会与 `[link]` 及彼此合并。目标表是把上游库的平台差异（configure 本该探测的特性宏）声明化的地方——例如 zlib 的移植在非 Windows 目标上只需 `defines = ["Z_HAVE_UNISTD_H"]`。
 
 ## `[profile.<name>]`
 

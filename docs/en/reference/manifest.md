@@ -38,6 +38,7 @@ frameworks = ["Foundation"]
 
 [target."*-linux-musl"]
 libraries = ["pthread", "dl"]
+defines = ["Z_HAVE_UNISTD_H"]   # upstream feature macros (target tables only)
 
 [target."*-apple-darwin".dependencies]
 metal_cpp = { url = "https://example.com/metal-cpp-1.0.0.zip" }
@@ -116,7 +117,13 @@ The lockfile records every non-path dependency. Git keys are `git:<url>@<commit>
 - `libraries` — system libraries to link (`-l`)
 - `frameworks` — macOS frameworks
 
-Matching sections merge with `[link]` and each other.
+`[target."<glob>"]` sections additionally accept:
+
+- `defines` — preprocessor macros passed when compiling this package (`"NAME"` or `"NAME=VALUE"`)
+- `flags` — extra compiler flags appended to compile commands
+- `include_dirs` — extra include paths
+
+Matching sections merge with `[link]` and each other. Target tables are where platform differences of an upstream library — feature macros its `configure` would otherwise detect — get declared. Porting zlib to non-Windows targets is just `defines = ["Z_HAVE_UNISTD_H"]`.
 
 ## `[profile.<name>]`
 
