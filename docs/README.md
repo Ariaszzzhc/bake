@@ -1,6 +1,7 @@
-# bake 文档
+# bake 文档 / Documentation
 
-bake 是一体化的 C/C++ 构建系统和编译器工具链——将“面向 C++ 的 Cargo”与 `zig cc` 融于一体。
+bake 是一体化的 C/C++ 构建系统、包管理器与编译器工具链。
+bake is an all-in-one C/C++ build system, package manager, and compiler toolchain.
 
-- [英文书](en/README.md)
-- [中文文档](zh/README.md)
+- [中文手册](zh/README.md)
+- [English book](en/README.md)

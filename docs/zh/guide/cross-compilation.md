@@ -18,7 +18,7 @@ bake build -t aarch64-apple-darwin
 | `*-linux-gnu` | glibc（源码子集 + 按版本合成的链接存根） | x86_64、aarch64 |
 | `*-windows-gnu` | MinGW-w64 v14（供应商提供的源代码） | x86_64、aarch64 |
 
-某个目标的首次构建会从源代码编译供应商提供的 libc 并将其缓存；后续构建与其他所有内容一样是增量式的。`import std;` 和 C++ 模块在每个目标上的工作方式完全相同——`std.pcm` 与 libc++ 对象会按目标在缓存中构建。
+某个目标的首次构建会从源代码编译自带的 libc 并缓存；后续构建与其他所有内容一样是增量式的。`import std;` 和 C++ 模块在每个目标上的工作方式完全相同——`std` 模块与 libc++ 对象会按目标在缓存中构建。musl 与 windows 目标默认静态链接；gnu 目标始终动态链接。
 
 ## glibc 目标（`*-linux-gnu`）
 
@@ -31,23 +31,13 @@ bake build -t x86_64-linux-gnu.2.36     # 显式版本
 
 版本后缀同时决定**链接面**与**头文件面**：随附头文件取自最新版 glibc，编译时 `__GLIBC__`/`__GLIBC_MINOR__` 被钉到目标版本，`__GLIBC_PREREQ` 门控随目标开合——`.2.36` 目标可以直接使用 `gettid()`（glibc 2.30 引入）并链接到 `gettid@GLIBC_2.30`，`.2.28` 目标则在编译期就拒绝它。
 
-实现方式：crt 与 `libc_nonshared.a` 从随附的 glibc 源码子集编译；libc 本体从不构建——链接期依据随附的 `abilists` 符号/版本表，为所选版本合成存根 `.so`，靠 `--as-needed` 只保留实际用到的库（hello world 的 `DT_NEEDED` 只有 `libc.so.6`）。静态链接在 gnu 目标上被拒绝（glibc 静态模式 dlopen/NSS 有已知缺陷），静态场景请使用 musl 目标。
+只有实际用到的库会进入 `DT_NEEDED`（hello world 只链 `libc.so.6`）。静态链接在 gnu 目标上被拒绝（glibc 静态模式 dlopen/NSS 有已知缺陷），静态场景请使用 musl 目标。
 
 ## Sanitizer 支持
 
-`bake cc` / `bake c++` 与 `bake build`（`[profile.*] sanitize = [...]`）支持 `-fsanitize=address` 与 `-fsanitize=undefined`：runtime 从随附的 compiler-rt 源码按目标现编（首次链接时，进入全局缓存），各平台采用官方默认形态——linux-gnu / linux-musl 为静态归档（asan 以 whole-archive 链入）；macos 为动态 dylib（`@rpath` 安装名，链接时注入缓存目录 rpath，与官方 clang 布局一致）；windows-gnu 为 ubsan 静态归档 + asan DLL（依上游仅 x86_64，DLL 自动复制到产物旁）。sanitizer 是本机开发工具：只承诺 native 构建（本机实测报告），交叉产物不做验证。其他 sanitizer（tsan、msan 等）未随附：纯编译（`-c`）仍可插桩，链接会被拒绝并给出明确提示。
+`bake cc` / `bake c++` 与 `bake build`（`[profile.*] sanitize = [...]`）支持 `-fsanitize=address` 与 `-fsanitize=undefined`。runtime 由 bake 自带的 compiler-rt 构建，按目标在首次使用时进入缓存。macos 上 runtime 是动态库，运行时从缓存目录加载——带 sanitizer 的二进制依赖缓存目录存在；linux 上静态链入。windows-gnu 上 ubsan 静态链接，asan 仅 x86_64，运行库自动复制到产物旁。
 
-
-## 工作原理
-
-所有所需内容均嵌入 bake binary：
-
-1. 从目标三元组解析 libc 家族（`resolve_libc_family`）。
-2. 准备运行时：Darwin 使用随附的 `libSystem.tbd` 存根（无需 Xcode）；musl 与 MinGW-w64 CRT + winpthreads 从供应商提供的源代码编译为静态归档文件；gnu 编译 crt/`libc_nonshared.a` 并合成存根库。
-3. 使用正确的 sysroot 和驱动风格生成按目标划分的编译/链接命令；在进程内调用 LLD（Darwin、COFF/MinGW 或 GNU 风格）。
-4. 按需从 `.def` 文件生成 MinGW 导入库——仅为你实际通过 `-l` 引用的库生成。
-
-musl 与 MinGW 链接优先使用静态归档文件；gnu 目标始终动态链接。
+sanitizer 是本机开发工具：只承诺 native 构建，交叉产物不做验证。其他 sanitizer（tsan、msan 等）不支持——纯编译（`-c`）仍可插桩，链接会被拒绝并给出明确提示。
 
 ## `bake.toml` 中按目标划分的配置
 

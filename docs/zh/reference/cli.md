@@ -50,6 +50,7 @@ bake init [name] [--type <executable|lib|dylib>] [--std <standard>]
 
 - `--type` — moid 类型，默认为 `executable`。
 - `--std` — `c11|c17|c23|c++17|c++20|c++23`，默认为 `c++20`；C 标准会生成包含 C 源文件的脚手架。
+- `name` 可以是路径：项目在该路径创建，名字取最后一段（`bake init tools/hello` → `tools/hello/`，`name = "hello"`）。项目名必须是可移植文件名——`[A-Za-z0-9][A-Za-z0-9._+@-]*`，不能以点结尾，不能用 `CON` 这类保留设备名。
 - 未指定 `name` 时，在当前目录中生成脚手架。
 - 创建 `bake.toml`、`src/`、`public/`、`tests/`、`.gitignore`；`lib` 脚手架还会添加 `public/<name>/<name>.hpp`。
 

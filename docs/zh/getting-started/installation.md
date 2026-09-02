@@ -40,11 +40,13 @@ bake audit
 
 ## 交叉编译 bake 本身
 
-`bootstrap/` 目录包含用于将 bake 交叉编译至任意受支持目标的 stage-0 脚本。为另一平台生成 bake binary 的日常方式是使用 bake 自身：
+`bootstrap/build` 可以为任意受支持目标生成 bake binary。它先用 bake 自己的编译器为目标平台交叉编译 LLVM/Clang/LLD，再基于其构建 bake：
 
 ```bash
-bake build -t x86_64-linux-musl
+./bootstrap/build x86_64-linux-musl
 ```
+
+直接 `bake build -t <triple>` 链接的是按宿主机构建的 LLVM 归档；只有在 `BAKE_LLVM_DIR` 指向目标平台 LLVM 安装时才能工作——`bootstrap/build` 会负责准备。
 
 ## 更新
 

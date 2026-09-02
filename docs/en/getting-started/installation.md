@@ -40,11 +40,13 @@ bake audit
 
 ## Cross-compiling bake itself
 
-The `bootstrap/` directory contains the stage-0 script used to cross-compile bake to any of its supported targets. The everyday way to produce a bake binary for another platform is bake itself:
+`bootstrap/build` produces a bake binary for any supported target. It first cross-compiles LLVM/Clang/LLD for the target using bake's own compiler, then builds bake against the result:
 
 ```bash
-bake build -t x86_64-linux-musl
+./bootstrap/build x86_64-linux-musl
 ```
+
+Plain `bake build -t <triple>` links the host-built LLVM archives; it only works with `BAKE_LLVM_DIR` pointing at a target LLVM install — which `bootstrap/build` arranges.
 
 ## Updating
 

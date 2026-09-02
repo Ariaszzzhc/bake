@@ -50,6 +50,7 @@ bake init [name] [--type <executable|lib|dylib>] [--std <standard>]
 
 - `--type` — moid type, default `executable`
 - `--std` — `c11|c17|c23|c++17|c++20|c++23`, default `c++20`; C standards scaffold C sources
+- `name` may be a path: the project is created there and named after the last component (`bake init tools/hello` → `tools/hello/` with `name = "hello"`). Project names must be portable file names — `[A-Za-z0-9][A-Za-z0-9._+@-]*`, no trailing dot, no reserved device names like `CON`.
 - Without `name`, scaffolds in the current directory
 - Creates `bake.toml`, `src/`, `public/`, `tests/`, `.gitignore`; a `lib` scaffold adds `public/<name>/<name>.hpp`
 

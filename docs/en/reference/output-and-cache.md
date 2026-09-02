@@ -11,27 +11,26 @@ out/
 │   ├── lib/                   # lib → .a, dylib → .dylib/.so/.dll
 │   ├── .obj/                  # object files
 │   ├── .bmi/                  # module PCM files
-│   └── .bake/                 # declarations, fingerprints, graph.json
+│   └── .bake/                 # declarations, fingerprints
 └── .bake/                     # host-level artifacts (compiled build.cpp scripts)
 ```
 
 - `bin/` holds the moid's executable plus every `b.binary()` target.
 - `lib/` holds `lib<name>.a` for libs and the shared library for dylibs. Dependents link the archive and receive its public headers/modules.
-- `.bake/` inside a triple stores the resolved `MoidDeclaration` JSON per moid, content fingerprints, and the action graph — this is what makes rebuilds incremental. Deleting it forces re-resolution (not recompilation of sources whose objects still fingerprint clean).
+- `.bake/` inside a triple stores the resolved build declarations, content fingerprints, and the action graph — this is what makes rebuilds incremental. Deleting it forces re-resolution (not recompilation of sources whose objects still fingerprint clean).
 
 `bake clean` removes `out/` entirely.
 
 ## Global cache: `~/.cache/bake/`
 
-Shared across projects, keyed by toolchain/content:
+Shared across projects, keyed by target and content:
 
 | Path | Contents |
 |---|---|
-| `~/.cache/bake/<key>/std/` | Pre-built `std.pcm` per (target, std version) for `import std;` |
-| `~/.cache/bake/libcxx-objects/` | Static libc++ / libc++abi / libunwind objects, per target |
-| (package cache) | Fetched remote dependencies (git checkouts) |
+| `~/.cache/bake/<triple>/` | Toolchain products for that target: C runtime objects, the `std` module, libc++ objects, sanitizer runtimes — all content-addressed |
+| `~/.cache/bake/src/` | Fetched remote dependency sources (git checkouts, extracted archives) |
 
-Cross-target libc builds (musl CRT, MinGW-w64 CRT + winpthreads) are also cached per target under the same scheme, so the first `bake build -t x86_64-linux-musl` pays the runtime cost once.
+The first `bake build -t <triple>` pays the runtime build cost once; every later build — in any project — reuses the cached products. Targets with a version suffix (`x86_64-linux-gnu.2.36`) get their own cache entry, separate from the unsuffixed triple.
 
 ## Fingerprinting and incrementality
 
