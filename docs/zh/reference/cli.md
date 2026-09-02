@@ -13,8 +13,9 @@ bake <subcommand> --help
 | `bake build` | 构建项目（或工作区） |
 | `bake run [args…]` | 构建后运行可执行文件；末尾参数传递给程序 |
 | `bake test [name]` | 构建并运行已注册的测试 |
-| `bake add <url> --tag <tag> [name]` | 向 `bake.toml` 添加远程依赖 |
-| `bake update [dep]` | 重新解析 tag → commit，并更新 `bake.lock` |
+| `bake add <url> [--tag <tag> \| --branch <branch> \| --rev <rev>] [name] [--target <glob>]` | 添加 Git 或归档依赖 |
+| `bake remove <name> [--target <glob>]` | 删除依赖声明 |
+| `bake update [dep]` | 重新解析一个依赖；省略时重新解析全部依赖 |
 | `bake clean` | 删除 `out/` |
 | `bake cc` / `bake c++` / `bake ar` | 直接调用内嵌的 Clang/LLVM 工具（`zig cc` 风格） |
 | `bake audit` | 验证工具链的自包含性 |
@@ -51,6 +52,37 @@ bake init [name] [--type <executable|lib|dylib>] [--std <standard>]
 - `--std` — `c11|c17|c23|c++17|c++20|c++23`，默认为 `c++20`；C 标准会生成包含 C 源文件的脚手架。
 - 未指定 `name` 时，在当前目录中生成脚手架。
 - 创建 `bake.toml`、`src/`、`public/`、`tests/`、`.gitignore`；`lib` 脚手架还会添加 `public/<name>/<name>.hpp`。
+
+## `bake add`
+
+```
+bake add <url> [--tag <tag> | --branch <branch> | --rev <rev>] [name] [--target <glob>]
+```
+
+- `--tag`、`--branch` 和 `--rev` 选择 Git ref，且三者互斥。
+- 以受支持归档后缀结尾的 URL 会自动作为直接归档依赖添加；归档依赖不能带 ref。
+- `[name]` 覆盖从 URL 推导的名称。绝对本地路径会规范化为 `file://` URL。
+- `--target <glob>` 写入 `[target."<glob>".dependencies]`；非法 glob 会立即被拒绝。
+- 在所选作用域中，完全相同的已有声明会被跳过，并提示运行 `bake update`；不同声明会被替换。对 manifest 的修改会保留注释。
+
+## `bake remove`
+
+```
+bake remove <name> [--target <glob>]
+```
+
+- 使用 `--target` 时，从 `[target."<glob>".dependencies]` 删除声明。
+- 未指定时，先检查 `[dependencies]`，再检查目标依赖表。若名称出现在多个作用域，bake 会列出匹配作用域并要求 `--target`。
+- 删除不再被任何依赖作用域引用的锁条目。已下载内容保留在缓存中。
+
+## `bake update`
+
+```
+bake update [dep]
+```
+
+- `bake update <dep>` 只强制解析该依赖的 URL；其他依赖未变的条目会被原样搬运。
+- 不带名称的 `bake update` 重新解析全部依赖。它是唯一可能移动所有已锁定 ref 的命令。
 
 ## `bake test`
 

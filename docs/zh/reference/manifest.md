@@ -22,9 +22,13 @@ use_tls = false
 use_json = true
 
 [dependencies]
-local = { path = "../local" }                                  # path dep
-remote = { url = "https://github.com/org/repo", tag = "v1.0" } # remote dep
-flagged = { path = "../x", options = ["use_tls"] }             # activate features
+local = { path = "../local" }                                      # 路径依赖
+by_tag = { url = "https://github.com/org/repo", tag = "v1.0" }   # Git 标签
+by_branch = { url = "https://github.com/org/repo", branch = "main" } # Git 分支
+by_rev = { url = "https://github.com/org/repo", rev = "d5598e..." }  # 确切 Git revision
+head = { url = "https://github.com/org/head" }                     # 默认分支 HEAD
+archive = { url = "https://example.com/lib-1.0.tar.xz" }           # 直接归档
+flagged = { path = "../x", options = ["use_tls"] }                # 激活特性
 
 [link]                    # platform-agnostic system linking
 libraries = ["z"]         # -l flags
@@ -34,6 +38,9 @@ frameworks = ["Foundation"]
 
 [target."*-linux-musl"]
 libraries = ["pthread", "dl"]
+
+[target."*-apple-darwin".dependencies]
+metal_cpp = { url = "https://example.com/metal-cpp-1.0.0.zip" }
 
 [profile.release]         # override the built-in release profile
 opt = 3
@@ -79,12 +86,28 @@ BAKE_MYAPP_VERSION_PATCH = 0
 
 ## `[dependencies]`
 
+`[dependencies]` 中的每个 alias 声明一个依赖。`[target."<glob>".dependencies]` 使用相同的条目语法。
+
 | 键 | 种类 | 含义 |
 |---|---|---|
-| `path` | 路径依赖 | 包含 `bake.toml` 的相对目录（或不含该文件的供应商源码树——参见[依赖](../guide/dependencies.md)） |
-| `url` | 远程 | Git URL |
-| `tag` | 远程 | 用于固定版本的标签；解析为锁文件（`bake.lock`）中的提交 |
-| `options` | 任意 | 要启用的依赖 `[options]` 列表 |
+| `path` | 路径依赖 | 本地目录。每次构建都从磁盘解析，且永不写入 `bake.lock`。 |
+| `url` | Git 或归档依赖 | Git URL，除非其以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz` 或 `.zip` 结尾；这些后缀声明直接归档依赖。 |
+| `tag` | Git ref | 选择标签。与 `branch`、`rev` 互斥。 |
+| `branch` | Git ref | 选择分支。与 `tag`、`rev` 互斥。 |
+| `rev` | Git ref | 选择确切的 Git revision。与 `tag`、`branch` 互斥。 |
+| `options` | 任意依赖 | 要激活的依赖 `[options]` 列表。 |
+
+不带 `tag`、`branch` 或 `rev` 的 Git 依赖会在构建时解析其默认分支 `HEAD`。归档依赖不得指定 ref。tar 归档由 `tar` 提取；ZIP 归档使用 `unzip`。
+
+## `[target."<glob>".dependencies]`
+
+目标依赖表使用与 `[dependencies]` 相同的 alias 条目。对某个构建目标，bake 使用全局依赖与 glob 匹配当前目标三元组的每个目标依赖表的并集。锁文件覆盖所有作用域的并集，而图解析只使用当前目标的有效集。
+
+不要在两个作用域中以不同方式定义同一 alias：bake 会报错并点名两个冲突的表。命令与解析行为参见[依赖](../guide/dependencies.md)。
+
+## `bake.lock`
+
+锁文件记录所有非路径依赖。Git 键为 `git:<url>@<commit>`，归档键为 `archive:<url>`。每个条目包含 `url`、`ref`、`ref_type`、`commit` 和 `integrity`；可选的 `name` 记录解析出的原生包的 `[package].name`。增量解析会原样搬运 URL/ref 相同的条目，不会再次远程查询或下载。
 
 ## `[link]` 和 `[target."…"]`
 

@@ -1,71 +1,140 @@
 # 依赖
 
-依赖在 `bake.toml` 的 `[dependencies]` 表中声明。依赖分为两种：路径依赖和远程依赖。
+依赖在 `[dependencies]` 中声明；需要按目标区分时，则在目标专属依赖表中声明。依赖可以是本地路径、Git 仓库或直接下载的归档文件。
 
 ```toml
 [dependencies]
-# Path dependency: a local moid, resolved from disk
+# 本地路径依赖
 mylib = { path = "../mylib" }
 
-# Remote dependency: fetched from a git URL, pinned to a tag
-json = { url = "https://github.com/nlohmann/json", tag = "v3.11.3" }
+# Git 依赖：至多选择一种 ref 类型
+fmt = { url = "https://github.com/fmtlib/fmt", tag = "11.0.2" }
+catch2 = { url = "https://github.com/catchorg/Catch2", branch = "devel" }
+fixed = { url = "https://github.com/org/repo", rev = "d5598e0f03e13c0b" }
 
-# Feature activation: turn on the dependency's [options]
-curl = { path = "../curl", options = ["use_tls"] }
+# 归档 URL 是直接归档依赖；不带 ref。
+headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
 ```
 
-## 路径依赖
+## 路径依赖与裸源码包
 
-路径依赖指向包含 `bake.toml` 的目录。每次构建都会从磁盘解析它们，并完全绕过包缓存——编辑依赖会使它作为构建的一部分重新构建。这是工作区成员彼此依赖的方式（参见[工作区](workspaces.md)）。
+路径依赖指向本地目录，并在每次构建时从磁盘解析。它们绕过包缓存，因此对依赖的编辑会立即参与下一次构建。这是工作区成员彼此依赖的方式；参见[工作区](workspaces.md)。路径依赖永不写入 `bake.lock`。
 
-不含 `bake.toml` 的路径依赖会被视为供应商提供的头文件/源代码库：其 `public/` 目录会加入 include 路径，且其 `src/` 下任何可编译的源文件都会直接编译到你的 moid 中。这是使用普通检出库时无需额外配置的方式。
+不带 `[package]` 声明的路径或已获取依赖是*裸源码包*。在 `build.cpp` 中通过 `b.dep_src_dir(alias)` 使用其源码目录：
 
-## 远程依赖
+```cpp
+auto source_dir = b.dep_src_dir("headers");
+```
 
-远程依赖是由 `tag` 固定的 git 仓库：
+这样由构建脚本决定如何使用检出的源码。如果一个已声明的裸源码依赖从未通过 `dep_src_dir` 查询，bake 会在 configure 阶段发出包含 `never consumed` 的警告。
+
+## Git 依赖
+
+Git 依赖条目使用 `url`，并且可以选择一个 ref：
 
 ```toml
-fmt = { url = "https://github.com/fmtlib/fmt", tag = "10.2.1" }
+[dependencies]
+by_tag = { url = "https://github.com/fmtlib/fmt", tag = "11.0.2" }
+by_branch = { url = "https://github.com/catchorg/Catch2", branch = "devel" }
+by_revision = { url = "https://github.com/org/repo", rev = "d5598e0f03e13c0b" }
+default_branch = { url = "https://github.com/org/repo" }
 ```
 
-`bake add` 会为你写入此条目：
+- `tag` 选择标签。
+- `branch` 选择分支。
+- `rev` 选择确切的 Git revision。
+- 不带 ref 时，bake 会在构建时解析远端默认分支的 `HEAD`。
 
-```bash
-bake add https://github.com/fmtlib/fmt --tag 10.2.1
+`tag`、`branch` 和 `rev` 互斥：一个条目至多包含其中一个。每个选定的 Git ref 都会在锁文件中解析为 commit，因此普通构建会持续使用该 commit，直到 `bake update` 移动它。
+
+### 归档依赖
+
+以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch` 或 `rev`；归档依赖带 ref 会报错。
+
+归档提取使用外部工具：tar 归档使用 `tar`，ZIP 归档使用 `unzip`。归档 URL 按 URL 锁定，已下载内容会记录完整性值。
+
+## 目标专属依赖
+
+使用 `[target."<triple-glob>".dependencies]` 为匹配的目标三元组声明专属依赖。其条目形式与 `[dependencies]` 完全相同：
+
+```toml
+[dependencies]
+fmt = { url = "https://github.com/fmtlib/fmt", tag = "11.0.2" }
+
+[target."*-apple-darwin".dependencies]
+metal_cpp = { url = "https://example.com/metal-cpp-1.0.0.zip" }
+
+[target."*-linux-musl".dependencies]
+musl_helpers = { url = "https://github.com/org/musl-helpers", branch = "main" }
 ```
 
-依赖名称默认是仓库名称（会移除 `.git` 后缀）；传入显式名称可覆盖它：`bake add <url> --tag <tag> my-fmt`。
+对某个构建目标而言，有效依赖集是 `[dependencies]` 与 glob 匹配该目标三元组的每个目标依赖表的并集。依赖图从这个有效集解析。
 
-## 锁文件：`bake.lock`
+一个 alias 不能在不同作用域中具有不同定义。例如 `[dependencies]` 与 `[target."*-linux-musl".dependencies]` 都以不同方式定义 `fmt` 时，bake 会失败并点名两个冲突的表。不过锁文件覆盖所有作用域中依赖的并集，而不只覆盖主机目标。
 
-首次解析远程依赖的构建会写入 `bake.lock`，记录每个 tag 所解析到的确切提交：
+## 解析与 `bake.lock`
+
+`bake.lock` 记录所有非路径依赖的解析结果。Git 条目的键形式为 `git:<url>@<commit>`；归档条目的键形式为 `archive:<url>`。每个条目都记录 `url`、`ref`、`ref_type`、`commit` 和 `integrity`；当解析出的原生包声明 `[package].name` 时，还会包含 `name`。
 
 ```json
 {
-    "fmt": {
-        "url": "https://github.com/fmtlib/fmt",
-        "ref": "d5598e0f03e13c0b1b1b1e...",
-        "ref_type": "tag"
-    }
+  "git:https://github.com/fmtlib/fmt@d5598e0f03e13c0b1b1b1e...": {
+    "url": "https://github.com/fmtlib/fmt",
+    "ref": "11.0.2",
+    "ref_type": "tag",
+    "commit": "d5598e0f03e13c0b1b1b1e...",
+    "integrity": "sha256-...",
+    "name": "fmt"
+  },
+  "archive:https://example.com/headers-1.2.0.tar.gz": {
+    "url": "https://example.com/headers-1.2.0.tar.gz",
+    "ref": "",
+    "ref_type": "archive",
+    "commit": "",
+    "integrity": "sha256-..."
+  }
 }
 ```
 
-此后：
+### 增量解析
 
-- **`bake build` 永不移动已锁定的 tag。** 构建可复现：会使用记录的提交，直到你显式更新。
-- **`bake update [name]`** 会将 tag 重新解析为提交，并重写 `bake.lock`。指定名称参数时，仅更新该依赖；未指定时，更新所有远程依赖。路径依赖会被跳过（没有可解析的内容）。
+当构建或更新需要刷新锁文件时，URL 和 ref 未变的已有条目会原样搬运。bake 不会再次运行 `git ls-remote`，也不会再次下载它。只有新增或变更的依赖，以及由 `bake update <dep>` 显式选中的依赖，才需要网络解析或下载。
 
-## Locked、offline、frozen
+`bake update` 是唯一会移动已锁定 ref 的命令。不带依赖名称时，它会重新解析所有依赖，并可能移动所有已锁定 ref；`bake build` 不会移动已锁定的 ref。
+
+### Locked、offline、frozen
 
 | 标志 | 含义 |
 |---|---|
-| `--locked` | 若 `bake.lock` 缺失或已过期（`bake.toml` 中的 tag 未在锁文件中），则失败 |
-| `--offline` | 绝不访问网络；若某项内容尚未在本地缓存中，则失败 |
-| `--frozen` | 同时启用上述两项——适用于 CI 的配置 |
+| `--locked` | 若 `bake.lock` 缺失或已过期，则失败。 |
+| `--offline` | 绝不访问网络；若所需内容尚未在本地可用，则失败。 |
+| `--frozen` | 同时启用上述两项——适用于 CI 的配置。 |
 
 ```bash
-bake build --frozen     # exactly what the lock says, no network, no surprises
+bake build --frozen     # 完全遵从锁文件，不访问网络，不出意外
 ```
+
+## 管理依赖
+
+添加依赖：
+
+```bash
+bake add <url> [--tag <tag> | --branch <branch> | --rev <rev>] [name] [--target <glob>]
+```
+
+可选 ref 标志选择 Git ref；归档 URL 会自动识别，且不得带 ref。绝对本地路径会规范化为 `file://` URL。名称默认从 URL 推导，也可显式提供 `[name]`。`--target <glob>` 会将声明插入 `[target."<glob>".dependencies]`；非法 glob 会立即失败。bake 通过保留注释的文本插入完成修改。
+
+若所选作用域已有该名称，完全相同的声明会被跳过，并提示运行 `bake update`；不同的声明会替换原声明。
+
+删除依赖：
+
+```bash
+bake remove <name> [--target <glob>]
+```
+
+未指定 `--target` 时，bake 会先检查 `[dependencies]`，再检查目标依赖表。若一个名称在多个作用域中出现，会报错并列出所有匹配作用域，要求提供 `--target`。删除会剪除不再被任何作用域引用的锁条目，但绝不从缓存删除已下载内容。
+
+要刷新一个依赖的已解析 URL，运行 `bake update <dep>`；它只强制解析该依赖，并原样搬运其他未变条目。运行不带名称的 `bake update` 则重新解析全部依赖。
 
 ## 使用者如何使用你的库
 
