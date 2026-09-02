@@ -2,7 +2,7 @@
 # bootstrap/build — produce a bake binary for any target platform.
 #
 # Usage: ./bootstrap/build <target> [mcpu]
-#   target:  aarch64-linux-musl | x86_64-linux-musl | aarch64-macos | ...
+#   target:  aarch64-linux-musl | x86_64-linux-musl | aarch64-apple-darwin | ...
 #   mcpu:    baseline (default) | native | <specific cpu>
 #
 # Host dependencies: CMake ≥ 3.30, Ninja, Clang with libc++ (stage 0).
@@ -147,8 +147,7 @@ fi
 
 # ── Step 3: Cross-compile bake ──
 echo "=== Step 3: Cross-compiling bake for $TARGET ==="
-rm -rf out/.bake out/bin-$TARGET out/lib-$TARGET out/.obj out/.bmi
 BAKE_LLVM_DIR="$PREFIX" "$BAKE" build --target="$TARGET"
 
-echo "=== Done: out/bin-$TARGET/bake ==="
-file "out/bin-$TARGET/bake"
+echo "=== Done: out/$TARGET/bin/bake ==="
+file "out/$TARGET/bin/bake"
