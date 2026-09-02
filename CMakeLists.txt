@@ -100,12 +100,28 @@ file(GLOB BAKE_LLVM_STATIC_LIBS  "${LLVM_PREFIX}/lib/libLLVM*.a")
 file(GLOB BAKE_CLANG_STATIC_LIBS "${LLVM_PREFIX}/lib/libclang*.a")
 file(GLOB BAKE_LLD_STATIC_LIBS   "${LLVM_PREFIX}/lib/liblld*.a")
 
-target_link_libraries(bake PRIVATE
-    tomlplusplus nlohmann_json
-    ${BAKE_CLANG_STATIC_LIBS}
-    ${BAKE_LLD_STATIC_LIBS}
-    ${BAKE_LLVM_STATIC_LIBS}
-)
+# The LLVM archives have cyclic interdependencies and the alphabetical glob
+# order satisfies neither GNU ld nor lld's single-pass archive scan
+# (libclangAST.a precedes libclangCodeGen.a, whose AST refs then dangle).
+# Group them so resolution order doesn't matter; ld64 iterates to a closure
+# on its own and rejects the flag.
+if(APPLE)
+    target_link_libraries(bake PRIVATE
+        tomlplusplus nlohmann_json
+        ${BAKE_CLANG_STATIC_LIBS}
+        ${BAKE_LLD_STATIC_LIBS}
+        ${BAKE_LLVM_STATIC_LIBS}
+    )
+else()
+    target_link_libraries(bake PRIVATE
+        tomlplusplus nlohmann_json
+        -Wl,--start-group
+        ${BAKE_CLANG_STATIC_LIBS}
+        ${BAKE_LLD_STATIC_LIBS}
+        ${BAKE_LLVM_STATIC_LIBS}
+        -Wl,--end-group
+    )
+endif()
 
 # Vendored static compression libraries (built from git submodules).
 # No system dependency — fully reproducible.
