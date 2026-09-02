@@ -54,6 +54,10 @@ jobs:
           python3 -m pip install --user --break-system-packages "cmake>=3.30"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Init submodules (vendored zlib/zstd/LLVM sources)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: git submodule update --init --recursive --depth 1
+
       - name: Build host LLVM/Clang/LLD
         if: steps.cache.outputs.cache-hit != 'true'
         run: scripts/build-llvm.sh
