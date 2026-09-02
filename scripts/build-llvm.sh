@@ -29,7 +29,8 @@ echo "==> Building zlib (static, from source)"
 cmake -G Ninja -S "$SRC_ZLIB" -B "$BUILD_ZLIB" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$INSTALL_ZLIB" \
-  -DBUILD_SHARED_LIBS=OFF
+  -DBUILD_SHARED_LIBS=OFF \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 cmake --build "$BUILD_ZLIB" --parallel "$NPROC"
 cmake --install "$BUILD_ZLIB" --strip
 rm -rf "$BUILD_ZLIB"
@@ -43,7 +44,8 @@ cmake -G Ninja -S "$SRC_ZSTD/build/cmake" -B "$BUILD_ZSTD" \
   -DZSTD_BUILD_STATIC=ON \
   -DZSTD_BUILD_PROGRAMS=OFF \
   -DZSTD_BUILD_CONTRIB=OFF \
-  -DZSTD_BUILD_TESTS=OFF
+  -DZSTD_BUILD_TESTS=OFF \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 cmake --build "$BUILD_ZSTD" --parallel "$NPROC"
 cmake --install "$BUILD_ZSTD" --strip
 rm -rf "$BUILD_ZSTD"
@@ -80,7 +82,10 @@ cmake -G Ninja -S "$SRC_LLVM/llvm" -B "$BUILD_LLVM" \
   -DLLD_BUILD_TOOLS=OFF \
   -DLLVM_BUILD_LLVM_DYLIB=OFF \
   -DLLVM_LINK_LLVM_DYLIB=OFF \
-  -DCLANG_BUILD_CLANG_DYLIB=OFF
+  -DCLANG_BUILD_CLANG_DYLIB=OFF \
+  -DCLANG_LINK_CLANG_DYLIB=OFF \
+  -DCLANG_BUILD_TOOLS=OFF \
+  -DLIBCLANG_BUILD_STATIC=ON
 
 echo "==> Building LLVM ($NPROC jobs)"
 cmake --build "$BUILD_LLVM" --parallel "$NPROC"
