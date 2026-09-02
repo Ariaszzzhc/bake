@@ -2,6 +2,7 @@ export module bake.buildsystem.project;
 
 import std;
 import bake.util;
+import bake.toolchain.target;
 import tomlplusplus;
 import nlohmann.json;
 
@@ -45,19 +46,45 @@ export struct BuildOption {
     bool operator==(const BuildOption&) const = default;
 };
 
-export std::string format_build_option(const BuildOption& option) {
-    return option.value ? "true" : "false";
+// ===== Dependency =====
+
+// Direct-archive URL detection — the extension discriminates archive
+// dependencies (tarball/zip fetched verbatim) from git dependencies.
+export std::string archive_extension(std::string_view url) {
+    constexpr std::string_view extensions[] = {
+        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".zip",
+    };
+    for (auto extension : extensions)
+        if (ends_with(url, extension)) return std::string(extension);
+    return {};
 }
 
-// ===== Dependency =====
+export bool is_archive_url(std::string_view url) {
+    return !archive_extension(url).empty();
+}
 
 export struct Dependency {
     std::string name;
-    std::string url;           // git URL (empty for path deps)
-    std::string tag;           // git tag/branch (empty for path deps)
-    std::string path;          // relative path (for path deps)
+    std::string url;      // git repo URL or direct archive URL (empty for path deps)
+    std::string tag;      // git ref: tag    (at most one ref key; none = default branch)
+    std::string branch;   // git ref: branch
+    std::string rev;      // git ref: commit
+    std::string path;     // relative path (for path deps)
     bool is_path_dep = false;
     std::vector<std::string> options;  // feature names to enable
+
+    bool is_remote() const { return !url.empty(); }
+    // Direct archive dependency — recognized by URL extension.
+    bool is_archive() const { return is_remote() && is_archive_url(url); }
+
+    // The single git ref of this dependency: {"tag"|"branch"|"rev", value},
+    // or {"head", ""} when unset (default branch HEAD).
+    std::pair<std::string, std::string> git_ref() const {
+        if (!tag.empty()) return {"tag", tag};
+        if (!branch.empty()) return {"branch", branch};
+        if (!rev.empty()) return {"rev", rev};
+        return {"head", ""};
+    }
 };
 
 export std::string normalize_dependency_url(std::string_view raw_url) {
@@ -114,7 +141,26 @@ export struct TargetCondition {
     std::vector<std::string> defines;
     std::vector<std::string> flags;
     std::vector<std::string> include_dirs;
+    // Target-scoped dependencies: merged into the effective dependency set
+    // of matching build triples ([target."<glob>".dependencies]).
+    std::map<std::string, Dependency> dependencies;
 };
+
+// A target pattern is valid when every '*' spans a whole '-'-delimited
+// segment ("*-linux-musl" yes, "x86*-linux" no).
+export bool valid_target_pattern(std::string_view pattern) {
+    std::size_t start = 0;
+    for (std::size_t i = 0; i <= pattern.size(); ++i) {
+        if (i == pattern.size() || pattern[i] == '-') {
+            auto segment = pattern.substr(start, i - start);
+            if (segment.find('*') != std::string_view::npos &&
+                segment != "*")
+                return false;
+            start = i + 1;
+        }
+    }
+    return true;
+}
 
 export struct LinkConfig {
     std::vector<std::string> libraries;
@@ -183,6 +229,56 @@ export struct Manifest {
         return SourceExtConfig{};
     }
 
+    // Load a manifest if and only if the source declares a moid ([package]).
+    // The single is-moid judgment shared by the resolver (lock identity)
+    // and graph resolution (graph node vs. consumer source_deps).
+    static std::optional<Manifest> load_moid(const Path& dir) {
+        auto manifest = load(dir);
+        if (!manifest || !manifest->has_moid()) return std::nullopt;
+        return manifest;
+    }
+
+    // Whether the whole dependency closure (following path deps into their
+    // manifests) declares no remote dependency. Lock resolution can be
+    // skipped entirely in that case.
+    static bool has_only_path_deps(const Manifest& manifest) {
+        std::set<Path> visited;
+        return closure_has_only_path_deps(manifest, visited);
+    }
+
+  private:
+    static bool closure_has_only_path_deps(const Manifest& manifest,
+                                           std::set<Path>& visited) {
+        // Every declared scope (global + all [target.*] tables) counts.
+        std::vector<const std::map<std::string, Dependency>*> scopes;
+        scopes.push_back(&manifest.dependencies);
+        for (const auto& condition : manifest.targets)
+            scopes.push_back(&condition.dependencies);
+
+        for (auto* scope : scopes) {
+            for (auto& [name, dep] : *scope) {
+                (void)name;
+                if (dep.is_remote()) return false;
+                Path dep_dir = (manifest.project_dir / dep.path.c_str())
+                                   .lexically_normal();
+                Path dep_toml = dep_dir / "bake.toml";
+                if (!dep_toml.is_regular_file()) continue;
+                auto canonical = dep_dir.absolute();
+                if (visited.insert(canonical).second) {
+                    auto sub = Manifest::load(dep_dir);
+                    if (sub && sub->has_moid()) {
+                        sub->project_dir = dep_dir;
+                        if (!closure_has_only_path_deps(*sub, visited))
+                            return false;
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+  public:
+
     // Try to load bake.toml from the given directory.
     // Returns nullopt if no bake.toml exists.
     static std::optional<Manifest> load(const Path& dir) {
@@ -219,6 +315,73 @@ export struct Manifest {
                 }
             }
             return result;
+        };
+
+
+        // Parse one dependency entry — shared by the global [dependencies]
+        // and every [target."<glob>".dependencies] scope.
+        auto parse_dependency_entry =
+            [&](const std::string& name, const toml::node& val)
+                -> std::optional<Dependency> {
+            auto* t = val.as_table();
+            if (!t) {
+                std::println(std::cerr,
+                             "bake: dependency '{}' must be a table in {}",
+                             name, toml_path.string());
+                return std::nullopt;
+            }
+            Dependency d;
+            d.name = name;
+            if (auto v = (*t)["url"].value<std::string>())    d.url = *v;
+            if (auto v = (*t)["tag"].value<std::string>())    d.tag = *v;
+            if (auto v = (*t)["branch"].value<std::string>()) d.branch = *v;
+            if (auto v = (*t)["rev"].value<std::string>())    d.rev = *v;
+            if (auto v = (*t)["path"].value<std::string>()) {
+                d.path = *v;
+                d.is_path_dep = true;
+            }
+            if (auto* opts = (*t)["options"].as_array()) {
+                for (auto& elem : *opts) {
+                    if (auto s = elem.value<std::string>())
+                        d.options.push_back(*s);
+                }
+            }
+
+            if (d.is_path_dep) {
+                if (d.path.empty() || !d.url.empty() ||
+                    !d.tag.empty() || !d.branch.empty() || !d.rev.empty()) {
+                    std::println(std::cerr,
+                        "bake: path dependency '{}' must not mix "
+                        "url/tag/branch/rev in {}",
+                        name, toml_path.string());
+                    return std::nullopt;
+                }
+                return d;
+            }
+
+            if (d.url.empty()) {
+                std::println(std::cerr,
+                    "bake: dependency '{}' requires url or path in {}",
+                    name, toml_path.string());
+                return std::nullopt;
+            }
+
+            const int ref_count = (!d.tag.empty()) + (!d.branch.empty()) +
+                                  (!d.rev.empty());
+            if (ref_count > 1) {
+                std::println(std::cerr,
+                    "bake: dependency '{}' in {} uses more than one of "
+ "tag/branch/rev", name, toml_path.string());
+                return std::nullopt;
+            }
+            if (is_archive_url(d.url) && ref_count > 0) {
+                std::println(std::cerr,
+                    "bake: archive dependency '{}' in {} must not use "
+                    "tag/branch/rev (the URL pins the content)",
+                    name, toml_path.string());
+                return std::nullopt;
+            }
+            return d;
         };
 
         // [workspace]
@@ -274,23 +437,10 @@ export struct Manifest {
         // [dependencies]
         if (auto* deps = tbl["dependencies"].as_table()) {
             for (auto& [key, val] : *deps) {
-                Dependency d;
-                d.name = key.str();
-                if (auto* t = val.as_table()) {
-                    if (auto v = (*t)["url"].value<std::string>())  d.url = *v;
-                    if (auto v = (*t)["tag"].value<std::string>())  d.tag = *v;
-                    if (auto v = (*t)["path"].value<std::string>()) {
-                        d.path = *v;
-                        d.is_path_dep = true;
-                    }
-                    if (auto* opts = (*t)["options"].as_array()) {
-                        for (auto& elem : *opts) {
-                            if (auto s = elem.value<std::string>())
-                                d.options.push_back(*s);
-                        }
-                    }
-                }
-                m.dependencies[d.name] = std::move(d);
+                auto parsed =
+                    parse_dependency_entry(std::string(key.str()), val);
+                if (!parsed) return std::nullopt;
+                m.dependencies[parsed->name] = std::move(*parsed);
             }
         }
 
@@ -351,21 +501,7 @@ export struct Manifest {
                 TargetCondition tc;
                 tc.triple_pattern = std::string(tgt_key.str());
 
-                // Validate: * must be a whole segment, not part of one
-                auto validate_pattern = [](std::string_view pattern) -> bool {
-                    std::size_t start = 0;
-                    for (std::size_t i = 0; i <= pattern.size(); ++i) {
-                        if (i == pattern.size() || pattern[i] == '-') {
-                            auto seg = pattern.substr(start, i - start);
-                            if (seg.find('*') != std::string_view::npos &&
-                                seg != "*")
-                                return false;
-                            start = i + 1;
-                        }
-                    }
-                    return true;
-                };
-                if (!validate_pattern(tc.triple_pattern)) {
+                if (!valid_target_pattern(tc.triple_pattern)) {
                     std::println(std::cerr,
                         "bake: invalid target pattern '{}': "
                         "'*' must match a whole segment",
@@ -387,6 +523,14 @@ export struct Manifest {
                 if (auto* incs = (*tt)["include_dirs"].as_array())
                     for (auto& e : *incs)
                         if (auto s = e.value<std::string>()) tc.include_dirs.push_back(*s);
+                if (auto* tdeps = (*tt)["dependencies"].as_table()) {
+                    for (auto& [key, val] : *tdeps) {
+                        auto parsed =
+                            parse_dependency_entry(std::string(key.str()), val);
+                        if (!parsed) return std::nullopt;
+                        tc.dependencies[parsed->name] = std::move(*parsed);
+                    }
+                }
                 m.targets.push_back(std::move(tc));
             }
         }
@@ -418,6 +562,50 @@ export struct Manifest {
         return m;
     }
 };
+
+namespace {
+
+bool same_definition(const Dependency& a, const Dependency& b) {
+    return a.url == b.url && a.tag == b.tag && a.branch == b.branch &&
+           a.rev == b.rev && a.path == b.path && a.options == b.options;
+}
+
+}  // namespace
+
+// Effective dependency set for a build triple: the global [dependencies]
+// plus every [target."<glob>".dependencies] table whose pattern matches the
+// triple, applied in declaration order. A repeated alias with an identical
+// definition deduplicates; a different definition is an error naming both
+// scopes. Scopes that do not match the triple are invisible.
+export std::expected<std::map<std::string, Dependency>, std::string>
+effective_dependencies(const Manifest& manifest, const std::string& triple) {
+    std::map<std::string, Dependency> effective = manifest.dependencies;
+    std::map<std::string, std::string> scope_of;
+    for (auto& [alias, dep] : manifest.dependencies) {
+        (void)dep;
+        scope_of[alias] = "[dependencies]";
+    }
+
+    for (const auto& condition : manifest.targets) {
+        if (!triple_matches(triple, condition.triple_pattern)) continue;
+        const std::string scope =
+            "[target.\"" + condition.triple_pattern + "\".dependencies]";
+        for (const auto& [alias, dep] : condition.dependencies) {
+            auto existing = effective.find(alias);
+            if (existing == effective.end()) {
+                effective.emplace(alias, dep);
+                scope_of[alias] = scope;
+                continue;
+            }
+            if (same_definition(existing->second, dep)) continue;
+            return std::unexpected(
+                "dependency '" + alias +
+                "' has conflicting definitions in " + scope_of[alias] +
+                " and " + scope);
+        }
+    }
+    return effective;
+}
 
 // ===== Default source layout =====
 //
@@ -454,215 +642,6 @@ export std::optional<Path> find_project_root(const Path& start = Path::current()
         dir = parent;
     }
     return std::nullopt;
-}
-
-// ===== Lockfile (JSON, flat identity-keyed entries) =====
-//
-// Format:
-// {
-//   "deps": {
-//     "<key>": { "path": "../relative" },                          // path dep
-//     "<key>": { "url": "...", "ref": "...", "ref_type": "tag",
-//                "commit": "...", "integrity": "sha256-..." },      // git dep
-//     "<key>": { "url": "...", "integrity": "sha256-..." }          // archive dep
-//   }
-// }
-//
-// Identity rules (lock key):
-//   Moid package (has bake.toml):   key = [package].name
-//   Non-Moid git package:           key = "git:<url>@<commit>"
-//   Non-Moid archive package:        key = "archive:<url>@<content-sha256>"
-//   Non-Moid path package:           key = "path:<relative-path>"
-
-export struct LockDep {
-    std::string key;          // identity key
-    // path dep
-    std::string path;
-    // git dep
-    std::string url;
-    std::string ref;          // tag / branch / commit value
-    std::string ref_type;     // "tag" | "branch" | "commit"
-    std::string commit;
-    // git + archive dep
-    std::string integrity;    // "sha256-<hex>"
-
-    bool is_path_dep() const { return !path.empty(); }
-    bool is_remote() const { return !url.empty(); }
-    bool is_git() const { return !commit.empty(); }
-    bool is_archive() const { return is_remote() && !is_git(); }
-
-    // Extract the bare hex hash from "sha256-<hex>".
-    std::string cache_hash() const {
-        if (integrity.empty()) return {};
-        auto pos = integrity.find('-');
-        return pos == std::string::npos ? integrity : integrity.substr(pos + 1);
-    }
-};
-
-export struct Lockfile {
-    std::map<std::string, LockDep> deps;   // identity key → dep
-    Path lock_path;
-
-    static std::optional<Lockfile> load(const Path& path) {
-        if (!path.is_regular_file()) return std::nullopt;
-
-        auto content = read_file(path);
-        if (!content) return std::nullopt;
-
-        Lockfile lf;
-        lf.lock_path = path;
-
-        nlohmann::json doc;
-        try {
-            doc = nlohmann::json::parse(*content);
-        } catch (...) {
-            return std::nullopt;
-        }
-
-        if (!doc.is_object()) return std::nullopt;
-        auto deps_it = doc.find("deps");
-        if (deps_it == doc.end() || !deps_it->is_object()) return std::nullopt;
-
-        for (const auto& item : deps_it->items()) {
-            const auto& val = item.value();
-            if (!val.is_object()) continue;
-            LockDep dep;
-            dep.key = item.key();
-            if (auto v = val.value("path", ""); !v.empty()) dep.path = v;
-            if (auto v = val.value("url", ""); !v.empty()) dep.url = v;
-            if (auto v = val.value("ref", ""); !v.empty()) dep.ref = v;
-            if (auto v = val.value("ref_type", ""); !v.empty()) dep.ref_type = v;
-            if (auto v = val.value("commit", ""); !v.empty()) dep.commit = v;
-            if (auto v = val.value("integrity", ""); !v.empty()) dep.integrity = v;
-            lf.deps[dep.key] = std::move(dep);
-        }
-
-        return lf;
-    }
-
-    bool save(const Path& path) const {
-        nlohmann::json doc = nlohmann::json::object();
-        nlohmann::json deps_obj = nlohmann::json::object();
-
-        for (auto& [key, dep] : deps) {
-            nlohmann::json entry = nlohmann::json::object();
-            if (dep.is_path_dep()) {
-                entry["path"] = dep.path;
-            } else if (dep.is_archive()) {
-                entry["url"] = dep.url;
-                entry["integrity"] = dep.integrity;
-            } else {
-                // git dep
-                entry["url"] = dep.url;
-                entry["ref"] = dep.ref;
-                entry["ref_type"] = dep.ref_type;
-                entry["commit"] = dep.commit;
-                entry["integrity"] = dep.integrity;
-            }
-            deps_obj[key] = std::move(entry);
-        }
-
-        doc["deps"] = std::move(deps_obj);
-
-        std::string content = doc.dump(2) + "\n";
-        return atomic_write_file(path, content);
-    }
-
-    // Find a remote dep entry matching the given URL and ref (tag).
-    // Returns nullptr if no match.
-    const LockDep* find_remote(const std::string& dep_url,
-                                const std::string& dep_ref) const {
-        std::string norm = normalize_dependency_url(dep_url);
-        for (auto& [key, dep] : deps) {
-            if (!dep.is_remote()) continue;
-            if (normalize_dependency_url(dep.url) == norm &&
-                dep.ref == dep_ref) {
-                return &dep;
-            }
-        }
-        return nullptr;
-    }
-
-    // Recursively check staleness: walk all manifests in the dependency
-    // closure (following path deps), and verify every remote dep has a
-    // matching lock entry with non-empty commit + integrity.
-    bool is_consistent(const Manifest& manifest, const Path& root) const {
-        std::set<Path> visited;
-        return check_consistency(manifest, root, visited);
-    }
-
-  private:
-    bool check_consistency(const Manifest& manifest, const Path& root,
-                           std::set<Path>& visited) const {
-        for (auto& [alias, dep] : manifest.dependencies) {
-            if (dep.is_path_dep) {
-                // Recurse into path dep manifests
-                Path dep_dir = (manifest.project_dir / dep.path.c_str())
-                                   .lexically_normal();
-                Path dep_toml = dep_dir / "bake.toml";
-                if (!dep_toml.is_regular_file()) continue;
-                auto canonical = dep_dir.absolute();
-                if (visited.insert(canonical).second) {
-                    auto sub = Manifest::load(dep_dir);
-                    if (sub && sub->has_moid()) {
-                        sub->project_dir = dep_dir;
-                        if (!check_consistency(*sub, root, visited))
-                            return false;
-                    }
-                }
-                continue;
-            }
-
-            // Remote dep: must have a lock entry with matching url+ref
-            const LockDep* locked = find_remote(dep.url, dep.tag);
-            if (!locked) return false;
-            if (locked->commit.empty()) return false;
-            if (locked->integrity.empty()) return false;
-        }
-        return true;
-    }
-
-  public:
-    static bool has_only_path_deps(const Manifest& manifest) {
-        std::set<Path> visited;
-        return closure_has_only_path_deps(manifest, visited);
-    }
-
-  private:
-    static bool closure_has_only_path_deps(const Manifest& manifest,
-                                            std::set<Path>& visited) {
-        for (auto& [name, dep] : manifest.dependencies) {
-            if (!dep.is_path_dep) return false;
-            // Recurse into path dep manifests
-            Path dep_dir = (manifest.project_dir / dep.path.c_str())
-                               .lexically_normal();
-            Path dep_toml = dep_dir / "bake.toml";
-            if (!dep_toml.is_regular_file()) continue;
-            auto canonical = dep_dir.absolute();
-            if (visited.insert(canonical).second) {
-                auto sub = Manifest::load(dep_dir);
-                if (sub && sub->has_moid()) {
-                    sub->project_dir = dep_dir;
-                    if (!closure_has_only_path_deps(*sub, visited))
-                        return false;
-                }
-            }
-        }
-        return true;
-    }
-};
-
-// Get the global source cache directory
-export Path get_cache_dir() {
-#ifdef _WIN32
-    const char* home = std::getenv("LOCALAPPDATA");
-    if (!home) home = "C:\\";
-    return Path(home) / "bake" / "src";
-#else
-    const char* home = std::getenv("HOME");
-    if (!home) home = "/tmp";
-    return Path(home) / ".cache" / "bake" / "src";
-#endif
 }
 
 } // namespace bake

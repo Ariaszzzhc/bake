@@ -11,11 +11,205 @@ import nlohmann.json;
 
 namespace bake {
 
+// ===== Lockfile (JSON, flat identity-keyed entries) =====
+//
+// Format:
+// {
+//   "deps": {
+//     "git:<url>@<commit>":     { "url": "...", "ref": "...", "ref_type": "tag",
+//                                 "commit": "...", "integrity": "sha256-...",
+//                                 "name": "fmt" },
+//     "archive:<url>":          { "url": "...", "ref_type": "archive",
+//                                 "integrity": "sha256-..." }
+//   }
+// }
+//
+// Identity rules (lock key): uniform locator identity —
+//   git dep:     "git:<normalized-url>@<commit>"
+//   archive dep: "archive:<normalized-url>"
+// "name" is a display annotation ([package].name of native sources), not
+// part of identity. Path dependencies are manifest-only and never locked.
+
+export struct LockDep {
+    std::string key;          // identity key
+    std::string name;         // display annotation ([package].name, native only)
+    std::string url;          // as declared
+    std::string ref;          // ref value (tag/branch/commit; "" = default branch)
+    std::string ref_type;     // "tag" | "branch" | "rev" | "head" | "archive"
+    std::string commit;       // resolved commit (git deps only)
+    std::string integrity;    // "sha256-<tree-hash>"
+
+    bool is_remote() const { return !url.empty(); }
+    bool is_archive() const { return ref_type == "archive"; }
+
+    // Extract the bare hex hash from "sha256-<hex>".
+    std::string cache_hash() const {
+        if (integrity.empty()) return {};
+        auto pos = integrity.find('-');
+        return pos == std::string::npos ? integrity : integrity.substr(pos + 1);
+    }
+};
+
+export struct Lockfile {
+    std::map<std::string, LockDep> deps;   // identity key → dep
+
+    static std::optional<Lockfile> load(const Path& path) {
+        if (!path.is_regular_file()) return std::nullopt;
+
+        auto content = read_file(path);
+        if (!content) return std::nullopt;
+
+        Lockfile lf;
+
+        nlohmann::json doc;
+        try {
+            doc = nlohmann::json::parse(*content);
+        } catch (...) {
+            return std::nullopt;
+        }
+
+        if (!doc.is_object()) return std::nullopt;
+        auto deps_it = doc.find("deps");
+        if (deps_it == doc.end() || !deps_it->is_object()) return std::nullopt;
+
+        for (const auto& item : deps_it->items()) {
+            const auto& val = item.value();
+            if (!val.is_object()) continue;
+            LockDep dep;
+            dep.key = item.key();
+            if (auto v = val.value("url", ""); !v.empty()) dep.url = v;
+            if (auto v = val.value("ref", ""); !v.empty()) dep.ref = v;
+            if (auto v = val.value("ref_type", ""); !v.empty()) dep.ref_type = v;
+            if (auto v = val.value("commit", ""); !v.empty()) dep.commit = v;
+            if (auto v = val.value("integrity", ""); !v.empty()) dep.integrity = v;
+            if (auto v = val.value("name", ""); !v.empty()) dep.name = v;
+            // Entries without a URL (pre-rename path entries) are dropped;
+            // the next resolve rebuilds the lock without them.
+            if (!dep.is_remote()) continue;
+            lf.deps[dep.key] = std::move(dep);
+        }
+
+        return lf;
+    }
+
+    bool save(const Path& path) const {
+        nlohmann::json doc = nlohmann::json::object();
+        nlohmann::json deps_obj = nlohmann::json::object();
+
+        for (auto& [key, dep] : deps) {
+            nlohmann::json entry = nlohmann::json::object();
+            entry["url"] = dep.url;
+            if (dep.is_archive()) {
+                entry["ref_type"] = "archive";
+                entry["integrity"] = dep.integrity;
+            } else {
+                entry["ref"] = dep.ref;
+                entry["ref_type"] = dep.ref_type;
+                entry["commit"] = dep.commit;
+                entry["integrity"] = dep.integrity;
+            }
+            if (!dep.name.empty()) entry["name"] = dep.name;
+            deps_obj[key] = std::move(entry);
+        }
+
+        doc["deps"] = std::move(deps_obj);
+
+        std::string content = doc.dump(2) + "\n";
+        return atomic_write_file(path, content);
+    }
+
+    // Find a locked remote dep by normalized URL + ref identity
+    // (ref_type + ref value; archives match on URL alone).
+    const LockDep* find_remote(const std::string& dep_url,
+                               const std::string& ref_type,
+                               const std::string& ref) const {
+        std::string norm = normalize_dependency_url(dep_url);
+        for (auto& [key, dep] : deps) {
+            if (!dep.is_remote()) continue;
+            if (normalize_dependency_url(dep.url) == norm &&
+                dep.ref_type == ref_type && dep.ref == ref) {
+                return &dep;
+            }
+        }
+        return nullptr;
+    }
+
+    // Recursively check staleness across every declared scope (global and
+    // all [target.*] tables): every remote dep in the closure must have a
+    // matching lock entry with a resolved commit (git) and integrity.
+    // Orphan entries are not staleness — the next resolve rebuilds the lock
+    // from the closure and prunes them (remove also prunes explicitly).
+    bool is_consistent(const Manifest& manifest, const Path& root) const {
+        std::set<Path> visited;
+        return check_consistency(manifest, root, visited);
+    }
+
+  private:
+    bool check_consistency(const Manifest& manifest, const Path& root,
+                           std::set<Path>& visited) const {
+        std::vector<const std::map<std::string, Dependency>*> scopes;
+        scopes.push_back(&manifest.dependencies);
+        for (const auto& condition : manifest.targets)
+            scopes.push_back(&condition.dependencies);
+
+        for (auto* scope : scopes) {
+            for (auto& [alias, dep] : *scope) {
+                (void)alias;
+                if (dep.is_path_dep) {
+                    // Recurse into path dep manifests
+                    Path dep_dir = (manifest.project_dir / dep.path.c_str())
+                                       .lexically_normal();
+                    Path dep_toml = dep_dir / "bake.toml";
+                    if (!dep_toml.is_regular_file()) continue;
+                    auto canonical = dep_dir.absolute();
+                    if (visited.insert(canonical).second) {
+                        auto sub = Manifest::load(dep_dir);
+                        if (sub && sub->has_moid()) {
+                            sub->project_dir = dep_dir;
+                            if (!check_consistency(*sub, root, visited))
+                                return false;
+                        }
+                    }
+                    continue;
+                }
+
+                // Remote dep: must have a lock entry with full identity.
+                std::string ref_type = dep.is_archive() ? "archive" : "";
+                std::string ref;
+                if (ref_type.empty()) {
+                    auto pair = dep.git_ref();
+                    ref_type = pair.first;
+                    ref = pair.second;
+                }
+                const LockDep* locked = find_remote(dep.url, ref_type, ref);
+                if (!locked) return false;
+                if (locked->integrity.empty()) return false;
+                if (!dep.is_archive() && locked->commit.empty()) return false;
+            }
+        }
+        return true;
+    }
+
+
+};
+
+// Get the global source cache directory
+export Path get_cache_dir() {
+#ifdef _WIN32
+    const char* home = std::getenv("LOCALAPPDATA");
+    if (!home) home = "C:\\";
+    return Path(home) / "bake" / "src";
+#else
+    const char* home = std::getenv("HOME");
+    if (!home) home = "/tmp";
+    return Path(home) / ".cache" / "bake" / "src";
+#endif
+}
+
 // ===== Resolver configuration =====
 
 export struct ResolverConfig {
     bool offline = false;
-    bool locked = false;
     bool frozen = false;
 };
 
@@ -25,43 +219,52 @@ export class Resolver {
 public:
     Resolver(Path cache_dir = get_cache_dir()) : cache_dir_(std::move(cache_dir)) {}
 
-    // Resolve all dependencies from manifest (recursive closure).
-    // Returns a Lockfile with flat identity-keyed entries.
-    std::optional<Lockfile> resolve(const Manifest& manifest, const ResolverConfig& config);
+    // Resolve the remote dependency closure from every declared scope of
+    // the manifest (global + all [target.*] tables). Existing lock entries
+    // matching a declared url+ref are carried over verbatim — the network
+    // is only touched for new or changed dependencies. Returns a fresh
+    // lockfile covering exactly the closure (orphan entries pruned).
+    std::optional<Lockfile> resolve(const Manifest& manifest,
+                                    const ResolverConfig& config,
+                                    const Lockfile* hints = nullptr);
 
-    // Resolve a single dependency: tag → commit → download → hash → extract
-    // Returns the lock dep entry.
+    // Resolve a single remote dependency (network): ref → commit →
+    // download → extract → tree hash. Returns the lock entry.
     std::optional<LockDep> resolve_dependency(const Dependency& dep);
 
-    // Re-download cached sources for all lock entries using existing locked commits.
-    // Does NOT re-resolve tags. Used when cache is missing/corrupted but lock is valid.
+    // Re-download cached sources for all lock entries using existing locked
+    // commits/URLs. Does NOT re-resolve refs. Used when cache is
+    // missing/corrupted but lock is valid.
     bool redownload(const Lockfile& lockfile, const ResolverConfig& config);
 
 private:
     Path cache_dir_;
 
-    // tag → commit via git ls-remote
-    std::optional<std::string> resolve_tag(const std::string& url, const std::string& tag);
+    // ref → commit via git ls-remote. "rev" passes through verbatim,
+    // "head" resolves the remote's HEAD.
+    std::optional<std::string> resolve_ref(const std::string& url,
+                                           const std::string& ref_type,
+                                           const std::string& ref);
 
-    // Download archive by commit, returns path to downloaded file
-    std::optional<Path> download_archive(const std::string& url, const std::string& commit,
-                                          const Path& dest_dir);
+    // Download an archive URL verbatim to dest_dir/<file_name>.
+    std::optional<Path> download_archive(const std::string& url,
+                                         const std::string& file_name,
+                                         const Path& dest_dir);
 
     // Compute SHA-256 of a file
     std::string file_hash(const Path& file);
 
-    // Safely extract tarball to directory (strips top-level prefix)
+    // Safely extract a tarball/zip to a directory (strips top-level prefix)
     bool extract_archive(const Path& archive, const Path& dest_dir);
 
     // Compute tree SHA-256 (normalized hash of all files in directory)
     std::string compute_tree_hash(const Path& dir);
 };
 
-// compute_tree_sha256 is exported below (as a free function) for use by
-// the CLI layer's cache verification. It lives here because bake.buildsystem.engine
-// does NOT import bake.buildsystem.package, so new exports here don't trigger the
-// clang 22 module deserialization crash in self-bootstrap.
-
+// Tree hash of a source directory, used by the CLI layer's cache
+// verification. (engine intentionally never imports this module — the
+// build side consumes remote sources through the SourceIndex injected by
+// the composition root, never through the package domain.)
 export inline std::string compute_tree_sha256(const Path& dir) {
     std::vector<std::pair<std::string, std::string>> entries;
 
@@ -184,19 +387,31 @@ export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache
 
 // ===== Implementation =====
 
-inline std::optional<std::string> Resolver::resolve_tag(const std::string& url, const std::string& tag) {
-    // Query both the tag ref and its peeled form (^{}).
-    // For annotated tags, ^{} gives the commit SHA; for lightweight tags
-    // (which point directly at commits) only the plain ref appears.
-    std::vector<std::string> cmd = {
-        "git", "ls-remote", url,
-        "refs/tags/" + tag,
-        "refs/tags/" + tag + "^{}"
-    };
+inline std::optional<std::string> Resolver::resolve_ref(
+        const std::string& url, const std::string& ref_type,
+        const std::string& ref) {
+    // A pinned commit resolves to itself.
+    if (ref_type == "rev") return ref;
+
+    // Build the ls-remote refspecs:
+    //   tag    → the tag ref and its peeled form (^{} gives the commit for
+    //            annotated tags; lightweight tags only have the plain ref)
+    //   branch → the branch ref
+    //   head   → the remote's default branch
+    std::vector<std::string> cmd = {"git", "ls-remote", url};
+    if (ref_type == "tag") {
+        cmd.push_back("refs/tags/" + ref);
+        cmd.push_back("refs/tags/" + ref + "^{}");
+    } else if (ref_type == "branch") {
+        cmd.push_back("refs/heads/" + ref);
+    } else {
+        cmd.push_back("HEAD");
+    }
+
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) return std::nullopt;
 
-    // Prefer the peeled (^{}) entry; fall back to the plain ref.
+    // Prefer the peeled (^{}) entry; fall back to the first plain ref.
     std::string commit;
     std::string fallback_commit;
 
@@ -209,13 +424,14 @@ inline std::optional<std::string> Resolver::resolve_tag(const std::string& url, 
         if (eol == std::string::npos) eol = out.size();
 
         std::string sha = out.substr(pos, tab - pos);
-        std::string ref = out.substr(tab + 1, eol - tab - 1);
+        std::string found_ref = out.substr(tab + 1, eol - tab - 1);
 
         // Trim whitespace
-        while (!sha.empty() && (sha.back() == '\n' || sha.back() == '\r' || sha.back() == ' '))
+        while (!sha.empty() &&
+               (sha.back() == '\n' || sha.back() == '\r' || sha.back() == ' '))
             sha.pop_back();
 
-        if (ref.find("^{}") != std::string::npos) {
+        if (found_ref.find("^{}") != std::string::npos) {
             commit = sha;  // peeled commit — always prefer
         } else if (fallback_commit.empty()) {
             fallback_commit = sha;
@@ -257,17 +473,16 @@ inline std::string build_archive_url(const std::string& url, const std::string& 
 }
 
 inline std::optional<Path> Resolver::download_archive(const std::string& url,
-                                                       const std::string& commit,
+                                                       const std::string& file_name,
                                                        const Path& dest_dir) {
     dest_dir.mkdir_recursive();
 
-    std::string archive_url = build_archive_url(url, commit);
-    Path archive_path = dest_dir / (commit + ".tar.gz");
+    Path archive_path = dest_dir / file_name;
 
-    std::vector<std::string> cmd = {"curl", "-sL", "-o", archive_path.string(), archive_url};
+    std::vector<std::string> cmd = {"curl", "-sL", "-o", archive_path.string(), url};
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
-        std::println(std::cerr, "bake: failed to download {}", archive_url);
+        std::println(std::cerr, "bake: failed to download {}", url);
         return std::nullopt;
     }
 
@@ -508,13 +723,98 @@ inline bool prescan_archive(const Path& archive, std::size_t& out_file_count,
     return true;
 }
 
+// Pre-scan a zip archive's entry list via `unzip -l` BEFORE extracting.
+// Same protections as the tar pre-scan: absolute paths, path traversal,
+// and count/size limits (zip bombs). Zip listings do not expose symlink
+// targets or modes — symlink escapes are caught by the post-extraction
+// tree validation.
+inline bool prescan_zip(const Path& archive, std::size_t& out_file_count,
+                        std::uintmax_t& out_total_size) {
+    const std::size_t MAX_FILES = 100'000;
+    const std::uintmax_t MAX_TOTAL_SIZE = 1ULL * 1024 * 1024 * 1024;  // 1 GB
+
+    auto result = run_process(
+        {"unzip", "-l", archive.string()}, Path(), true);
+    if (!result.success()) {
+        std::println(std::cerr, "bake: failed to list zip entries");
+        return false;
+    }
+
+    std::size_t file_count = 0;
+    std::uintmax_t total_size = 0;
+
+    // Entry lines look like:
+    //       123  2024-01-01 12:00   path/name
+    // Header/dashed/summary lines fail the numeric-length parse and are
+    // skipped ("Length ..." header, "----" separators, "N files" summary).
+    const auto& listing = result.stdout_output;
+    std::size_t pos = 0;
+    while (pos < listing.size()) {
+        std::size_t eol = listing.find('\n', pos);
+        if (eol == std::string::npos) eol = listing.size();
+        std::string line = listing.substr(pos, eol - pos);
+        pos = eol + 1;
+
+        std::istringstream iss(line);
+        std::uintmax_t length = 0;
+        std::string date, time, name;
+        if (!(iss >> length >> date >> time)) continue;
+        std::getline(iss, name);
+        std::size_t first = name.find_first_not_of(" \t");
+        if (first == std::string::npos) continue;
+        name = name.substr(first);
+        for (auto& c : name) {
+            if (c == '\\') c = '/';
+        }
+        while (!name.empty() && (name.back() == '\r' || name.back() == ' '))
+            name.pop_back();
+        if (name.empty()) continue;
+
+        if (name.front() == '/') {
+            std::println(std::cerr,
+                "bake: rejecting zip entry with absolute path: {}", name);
+            return false;
+        }
+        std::size_t dotdot = 0;
+        while ((dotdot = name.find("..", dotdot)) != std::string::npos) {
+            bool left_ok = (dotdot == 0 || name[dotdot - 1] == '/');
+            bool right_ok = (dotdot + 2 >= name.size() || name[dotdot + 2] == '/');
+            if (left_ok && right_ok) {
+                std::println(std::cerr,
+                    "bake: rejecting path traversal in zip: {}", name);
+                return false;
+            }
+            dotdot += 2;
+        }
+
+        file_count++;
+        total_size += length;
+
+        if (file_count > MAX_FILES) {
+            std::println(std::cerr,
+                "bake: zip exceeds file count limit ({} entries)", MAX_FILES);
+            return false;
+        }
+        if (total_size > MAX_TOTAL_SIZE) {
+            std::println(std::cerr, "bake: zip exceeds size limit (1 GB)");
+            return false;
+        }
+    }
+
+    out_file_count = file_count;
+    out_total_size = total_size;
+    return true;
+}
+
 inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir) {
     // Pre-scan archive entries BEFORE extraction.
     // This prevents malicious archives from writing to the filesystem
     // before safety checks can run.
+    const bool is_zip = ends_with(archive.string(), ".zip");
     std::size_t file_count = 0;
     std::uintmax_t total_size = 0;
-    if (!prescan_archive(archive, file_count, total_size)) {
+    if (is_zip ? !prescan_zip(archive, file_count, total_size)
+               : !prescan_archive(archive, file_count, total_size)) {
         return false;
     }
 
@@ -531,19 +831,23 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     tmp_dir.remove_all();
     tmp_dir.mkdir_recursive();
 
-    // Extract with tar.
-    // POSIX: strip ownership/permissions with flags supported by both GNU tar
-    // and BSD tar. Extraction always targets a new, empty temp directory, so
-    // GNU tar's non-portable --no-overwrite-dir is unnecessary.
-    // Windows: plain extraction (Windows tar.exe doesn't support those flags).
-    std::vector<std::string> cmd = {
-        "tar", "xf", archive.string(),
-        "-C", tmp_dir.string()
-    };
+    // Extract. Zip archives go through unzip; everything else through tar.
+    //
+    // tar: POSIX strip ownership/permissions with flags supported by both
+    // GNU tar and BSD tar. Extraction always targets a new, empty temp
+    // directory, so GNU tar's non-portable --no-overwrite-dir is
+    // unnecessary. Windows: plain extraction (Windows tar.exe doesn't
+    // support those flags).
+    std::vector<std::string> cmd;
+    if (is_zip) {
+        cmd = {"unzip", "-q", archive.string(), "-d", tmp_dir.string()};
+    } else {
+        cmd = {"tar", "xf", archive.string(), "-C", tmp_dir.string()};
 #ifndef _WIN32
-    cmd.push_back("--no-same-owner");
-    cmd.push_back("--no-same-permissions");
+        cmd.push_back("--no-same-owner");
+        cmd.push_back("--no-same-permissions");
 #endif
+    }
     auto result = run_process(cmd, Path(), true);
     if (!result.success()) {
         std::println(std::cerr, "bake: failed to extract {}", archive.string());
@@ -589,37 +893,59 @@ inline std::string Resolver::compute_tree_hash(const Path& dir) {
 }
 
 inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep) {
-    if (dep.is_path_dep) {
-        LockDep node;
-        node.key = "path:" + dep.path;
-        node.path = dep.path;
-        return node;
+    if (!dep.is_remote()) return std::nullopt;  // path deps are manifest-only
+
+    const bool is_archive = dep.is_archive();
+    std::string ref_type = is_archive ? "archive" : "";
+    std::string ref;
+    std::string commit;
+    std::string download_url;
+    std::string file_name;
+
+    if (is_archive) {
+        std::string file_name_label = dep.url.substr(
+            dep.url.find_last_of('/') + 1);
+        std::println("  Downloading {}", file_name_label);
+        download_url = dep.url;
+        file_name =
+            SHA256::hex(dep.url).substr(0, 24) + archive_extension(dep.url);
+    } else {
+        auto pair = dep.git_ref();
+        ref_type = pair.first;
+        ref = pair.second;
+
+        if (ref_type == "rev") {
+            commit = ref;  // pinned commit resolves to itself
+        } else {
+            std::println("  Resolving {} of {}",
+                         ref_type == "head" ? "default branch" : ref_type + " '" + ref + "'",
+                         repo_name_from_url(dep.url));
+            auto resolved = resolve_ref(dep.url, ref_type, ref);
+            if (!resolved) {
+                std::println(std::cerr,
+                    "bake: failed to resolve {} '{}' for {}",
+                    ref_type, ref, dep.url);
+                return std::nullopt;
+            }
+            commit = *resolved;
+        }
+
+        download_url = build_archive_url(dep.url, commit);
+        file_name = commit + ".tar.gz";
     }
 
-    std::println("  Downloading {}", repo_name_from_url(dep.url));
-
-    // Step 1: tag → commit
-    auto commit = resolve_tag(dep.url, dep.tag);
-    if (!commit) {
-        std::println(std::cerr, "bake: failed to resolve tag '{}' for {}",
-                     dep.tag, dep.url);
-        return std::nullopt;
-    }
-
-    // Step 2: compute transport hash by downloading
+    // Download, hash, extract, tree-hash, move into the content cache.
     Path download_dir = cache_dir_ / ".downloads";
-    auto archive = download_archive(dep.url, *commit, download_dir);
+    auto archive = download_archive(download_url, file_name, download_dir);
     if (!archive) return std::nullopt;
 
     std::string transport_hash = file_hash(*archive);
 
-    // Step 3: extract to a unique temp dir and compute tree hash
-    Path extracted_dir = cache_dir_ / (".work-" + *commit);
+    Path extracted_dir = cache_dir_ / (".work-" + transport_hash.substr(0, 12));
     if (!extract_archive(*archive, extracted_dir)) return std::nullopt;
 
     std::string tree_hash = compute_tree_hash(extracted_dir);
 
-    // Move to final cache location
     Path final_dir = cache_dir_ / tree_hash;
     if (!final_dir.exists()) {
         final_dir.parent().mkdir_recursive();
@@ -628,31 +954,24 @@ inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep
         extracted_dir.remove_all();
     }
 
-    // Check if extracted dir has bake.toml (bake-native)
-    bool native = (final_dir / "bake.toml").is_regular_file();
+    // Native sources carry their moid name as the lock annotation.
+    std::string name;
+    if (auto native = Manifest::load_moid(final_dir))
+        name = native->moid->name;
 
     // Clean up download
     archive->remove();
 
-    // Generate identity key: Moid package uses moid name, non-Moid uses source identity
-    std::string key;
-    if (native) {
-        auto manifest = Manifest::load(final_dir);
-        if (manifest && manifest->has_moid()) {
-            key = manifest->moid->name;
-        }
-    }
-    if (key.empty()) {
-        key = "git:" + normalize_dependency_url(dep.url) + "@" + *commit;
-    }
-
     LockDep node;
-    node.key = std::move(key);
     node.url = dep.url;
-    node.ref = dep.tag;
-    node.ref_type = "tag";
-    node.commit = *commit;
+    node.ref = is_archive ? "" : ref;
+    node.ref_type = ref_type;
+    node.commit = is_archive ? "" : commit;
     node.integrity = "sha256-" + tree_hash;
+    node.name = std::move(name);
+    node.key = is_archive
+        ? "archive:" + normalize_dependency_url(dep.url)
+        : "git:" + normalize_dependency_url(dep.url) + "@" + commit;
 
     return node;
 }
@@ -667,7 +986,6 @@ inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig&
 
     for (auto& [key, dep] : lockfile.deps) {
         if (!dep.is_remote()) continue;
-        if (dep.commit.empty()) continue;
 
         std::string hash = dep.cache_hash();
         if (hash.empty()) continue;
@@ -675,18 +993,31 @@ inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig&
         Path cached = cache_dir_ / hash;
         if (cached.is_directory()) continue;  // already cached
 
+        // Download by locked identity (no ref re-resolution)
+        std::string url;
+        std::string file_name;
+        if (dep.is_archive()) {
+            url = dep.url;
+            file_name = SHA256::hex(dep.url).substr(0, 24) +
+                        archive_extension(dep.url);
+        } else {
+            if (dep.commit.empty()) continue;
+            url = build_archive_url(dep.url, dep.commit);
+            file_name = dep.commit + ".tar.gz";
+        }
+
         std::println("  Downloading {}", display_name_for_key(key));
 
-        // Download by locked commit (no tag re-resolution)
         Path download_dir = cache_dir_ / ".downloads";
-        auto archive = download_archive(dep.url, dep.commit, download_dir);
+        auto archive = download_archive(url, file_name, download_dir);
         if (!archive) {
             std::println(std::cerr, "bake: download failed for '{}'", key);
             return false;
         }
 
         // Extract and verify tree hash
-        Path extracted_dir = cache_dir_ / (".work-" + dep.commit);
+        std::string transport_hash = file_hash(*archive);
+        Path extracted_dir = cache_dir_ / (".work-" + transport_hash.substr(0, 12));
         if (!extract_archive(*archive, extracted_dir)) {
             archive->remove();
             return false;
@@ -710,7 +1041,9 @@ inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig&
     return true;
 }
 
-inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const ResolverConfig& config) {
+inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
+                                                 const ResolverConfig& config,
+                                                 const Lockfile* hints) {
     if (config.offline || config.frozen) {
         std::println(std::cerr, "bake: cannot resolve dependencies in offline/frozen mode");
         return std::nullopt;
@@ -720,27 +1053,42 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
 
     Lockfile lockfile;
 
-    // BFS queue: (dep, parent_manifest_dir for relative path resolution)
+    // BFS queue: (dep, parent manifest dir for relative path resolution).
+    // Every declared scope (global + all [target.*] tables) participates.
     struct QueueEntry {
         Dependency dep;
         Path manifest_dir;
     };
     std::vector<QueueEntry> queue;
 
-    // Seed with root manifest dependencies (including path deps)
-    for (auto& [name, dep] : manifest.dependencies) {
-        queue.push_back({dep, manifest.project_dir});
-    }
+    auto enqueue_scopes = [&](const Manifest& m) {
+        std::vector<const std::map<std::string, Dependency>*> scopes;
+        scopes.push_back(&m.dependencies);
+        for (const auto& condition : m.targets)
+            scopes.push_back(&condition.dependencies);
+        for (auto* scope : scopes)
+            for (auto& [name, dep] : *scope)
+                queue.push_back({dep, m.project_dir});
+    };
+    enqueue_scopes(manifest);
 
-    // Track resolved remote deps by normalized URL to avoid duplicate downloads
-    std::map<std::string, std::string> url_to_commit;   // normalized_url → commit
+    // Dedupe by normalized url + ref identity within this run.
+    std::set<std::string> seen_refs;
+    auto dedup_key = [](const Dependency& dep) {
+        if (dep.is_archive())
+            return normalize_dependency_url(dep.url) + "\narchive\n";
+        auto pair = dep.git_ref();
+        return normalize_dependency_url(dep.url) + "\n" + pair.first + "\n" +
+               pair.second;
+    };
 
     const std::size_t MAX_ENTRIES = 256;
     std::size_t entry_count = 0;
 
     while (!queue.empty()) {
         if (entry_count >= MAX_ENTRIES) {
-            std::println(std::cerr, "bake: dependency graph exceeds limit ({} entries)", MAX_ENTRIES);
+            std::println(std::cerr, "bake: dependency graph exceeds limit ({} entries)",
+                         MAX_ENTRIES);
             return std::nullopt;
         }
 
@@ -748,81 +1096,119 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest, const
         queue.erase(queue.begin());
 
         if (dep.is_path_dep) {
-            // Record path dep in lock
+            // Path deps are manifest-only (never locked); recurse into
+            // native ones to reach their remote dependencies.
             Path dep_dir = (manifest_dir / dep.path.c_str()).lexically_normal();
             Path dep_toml = dep_dir / "bake.toml";
-            std::string key;
             if (dep_toml.is_regular_file()) {
-                auto sub_manifest = Manifest::load(dep_dir);
-                if (sub_manifest && sub_manifest->has_moid()) {
-                    key = sub_manifest->moid->name;
-                    // Recurse into native path dep
+                auto sub_manifest = Manifest::load_moid(dep_dir);
+                if (sub_manifest) {
                     sub_manifest->project_dir = dep_dir;
-                    for (auto& [sub_name, sub_dep] : sub_manifest->dependencies) {
-                        queue.push_back({sub_dep, dep_dir});
-                    }
+                    enqueue_scopes(*sub_manifest);
                 }
             }
-            if (key.empty()) {
-                key = "path:" + dep.path;
-            }
-
-            if (lockfile.deps.count(key)) continue;  // already recorded
-            LockDep entry;
-            entry.key = key;
-            entry.path = dep.path;
-            lockfile.deps[key] = std::move(entry);
-            entry_count++;
             continue;
         }
 
-        // Remote dep: check if already resolved
-        std::string norm_url = normalize_dependency_url(dep.url);
-        auto url_it = url_to_commit.find(norm_url);
-        if (url_it != url_to_commit.end()) {
-            // Already resolved — verify the tag resolves to the same commit
-            auto commit = resolve_tag(dep.url, dep.tag);
-            if (!commit) {
-                std::println(std::cerr, "bake: failed to resolve tag '{}' for {}",
-                             dep.tag, dep.url);
-                return std::nullopt;
-            }
-            if (*commit != url_it->second) {
-                std::println(std::cerr,
-                    "bake: conflict — {} resolved to commit {}, but same URL was already at {}",
-                    dep.url, *commit, url_it->second);
-                return std::nullopt;
-            }
-            continue;  // already in lock
+        if (!seen_refs.insert(dedup_key(dep)).second) continue;  // done this run
+
+        std::string ref_type = dep.is_archive() ? "archive" : "";
+        std::string ref;
+        if (ref_type.empty()) {
+            auto pair = dep.git_ref();
+            ref_type = pair.first;
+            ref = pair.second;
         }
 
-        // Resolve the dependency
+        // Locked-as-hints: url+ref unchanged → carry the entry verbatim.
+        // No ls-remote, no download. The transitive closure of a carried
+        // entry was locked together with it and is covered by other hints.
+        if (hints) {
+            const LockDep* hint = hints->find_remote(dep.url, ref_type, ref);
+            if (hint && !hint->integrity.empty() &&
+                (dep.is_archive() || !hint->commit.empty())) {
+                if (lockfile.deps.emplace(hint->key, *hint).second)
+                    entry_count++;
+                continue;
+            }
+        }
+
+        // Resolve the dependency (network).
         auto lock_dep = resolve_dependency(dep);
         if (!lock_dep) return std::nullopt;
-
-        url_to_commit[norm_url] = lock_dep->commit;
 
         lockfile.deps[lock_dep->key] = *lock_dep;
         entry_count++;
 
-        // Recursive: if bake-native, load its bake.toml and enqueue its deps
+        // Recurse into native cached sources for transitive deps.
         std::string hash = lock_dep->cache_hash();
         if (!hash.empty()) {
             Path dep_cache = cache_dir_ / hash;
-            Path dep_toml = dep_cache / "bake.toml";
-            if (dep_toml.is_regular_file()) {
-                auto sub_manifest = Manifest::load(dep_cache);
-                if (sub_manifest) {
-                    sub_manifest->project_dir = dep_cache;
-                    for (auto& [sub_name, sub_dep] : sub_manifest->dependencies) {
-                        queue.push_back({sub_dep, dep_cache});
-                    }
-                }
+            if (auto sub_manifest = Manifest::load_moid(dep_cache)) {
+                sub_manifest->project_dir = dep_cache;
+                enqueue_scopes(*sub_manifest);
             }
         }
     }
 
     return lockfile;
 }
+
+// Rebuild a lockfile restricted to the entries reachable from the
+// manifest's declared closure (every scope). Zero network: reachability
+// walks path-dep manifests and cached native sources through lock entries.
+// Used by `bake remove` to drop entries the manifest no longer references.
+export Lockfile prune_lock(const Manifest& manifest, const Lockfile& lock) {
+    Lockfile pruned;
+
+    std::set<Path> visited;
+    std::function<void(const Manifest&)> walk = [&](const Manifest& m) {
+        std::vector<const std::map<std::string, Dependency>*> scopes;
+        scopes.push_back(&m.dependencies);
+        for (const auto& condition : m.targets)
+            scopes.push_back(&condition.dependencies);
+        for (auto* scope : scopes) {
+            for (auto& [alias, dep] : *scope) {
+                (void)alias;
+                if (dep.is_path_dep) {
+                    Path dep_dir = (m.project_dir / dep.path.c_str())
+                                       .lexically_normal();
+                    if ((dep_dir / "bake.toml").is_regular_file() &&
+                        visited.insert(dep_dir.absolute()).second) {
+                        if (auto sub = Manifest::load_moid(dep_dir)) {
+                            sub->project_dir = dep_dir;
+                            walk(*sub);
+                        }
+                    }
+                    continue;
+                }
+
+                std::string ref_type = dep.is_archive() ? "archive" : "";
+                std::string ref;
+                if (ref_type.empty()) {
+                    auto pair = dep.git_ref();
+                    ref_type = pair.first;
+                    ref = pair.second;
+                }
+                const LockDep* entry = lock.find_remote(dep.url, ref_type, ref);
+                if (!entry) continue;  // lock was already stale here
+                pruned.deps.emplace(entry->key, *entry);
+
+                // Recurse into cached native sources for transitive reach.
+                Path cache_dir = get_cache_dir() / entry->cache_hash();
+                if (cache_dir.is_directory() &&
+                    visited.insert(cache_dir.absolute()).second) {
+                    if (auto sub = Manifest::load_moid(cache_dir)) {
+                        sub->project_dir = cache_dir;
+                        walk(*sub);
+                    }
+                }
+            }
+        }
+    };
+    walk(manifest);
+    return pruned;
+}
+
 
 } // namespace bake

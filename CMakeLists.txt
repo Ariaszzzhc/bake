@@ -186,6 +186,7 @@ target_sources(graph_test
             third_party/nlohmann/public/nlohmann.json.cppm
             third_party/tomlplusplus/public/tomlplusplus.cppm
             bake/src/util.cppm
+            bake/src/toolchain/target.cppm
             bake/src/buildsystem/project.cppm
             bake/src/buildsystem/moid.cppm
             bake/src/buildsystem/graph.cppm

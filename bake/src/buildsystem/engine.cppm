@@ -34,6 +34,53 @@ import nlohmann.json;
 // ============================================================
 
 namespace bake {
+export enum class ArtifactKind {
+    Object,
+    Module,
+    StaticLibrary,
+    SharedLibrary,
+    Executable,
+};
+
+export struct ArtifactRef {
+    ArtifactKind kind;
+    Path path;
+    std::string producer_action;
+
+    auto operator<=>(const ArtifactRef& other) const {
+        if (kind != other.kind) return kind <=> other.kind;
+        const std::string normalized =
+            path.fs().lexically_normal().generic_string();
+        const std::string other_normalized =
+            other.path.fs().lexically_normal().generic_string();
+        if (normalized != other_normalized)
+            return normalized <=> other_normalized;
+        return producer_action <=> other.producer_action;
+    }
+
+    bool operator==(const ArtifactRef& other) const {
+        return (*this <=> other) == 0;
+    }
+};
+
+export struct CompileUsage {
+    std::vector<Path> include_dirs;
+    std::vector<std::string> defines;
+    std::map<std::string, ArtifactRef> modules;
+};
+
+export struct LinkInterface {
+    std::vector<ArtifactRef> objects;
+    std::vector<ArtifactRef> libraries;
+    std::vector<std::string> system_libraries;
+    std::vector<std::string> frameworks;
+};
+
+export struct MoidExports {
+    CompileUsage compile;
+    LinkInterface link;
+    std::optional<ArtifactRef> terminal;
+};
 
 // ===== Source discovery =====
 
@@ -1137,6 +1184,23 @@ configure_moid_graph(MoidGraph &graph, const TargetSpec& target, const Path &out
       return std::unexpected(written.error());
 
     node.declaration = std::move(declaration);
+
+    // 5b. A declared source dependency nothing consumes was downloaded and
+    // locked for nothing — default discovery has no way to use one, and a
+    // build.cpp that never queries dep_src_dir() left it idle.
+    if (!node.source_deps.empty()) {
+      for (const auto& [alias, dir] : node.source_deps) {
+        (void)dir;
+        if (std::ranges::find(node.declaration.used_source_deps, alias) ==
+            node.declaration.used_source_deps.end()) {
+          std::println(std::cerr,
+                       "bake: warning: '{}' declares source dependency '{}' "
+                       "that is never consumed (query it in build.cpp via "
+                       "dep_src_dir)",
+                       node.declaration.name, alias);
+        }
+      }
+    }
 
     // Executable moids cannot be dependencies
     if (node.declaration.type != MoidType::Executable)
@@ -2346,7 +2410,9 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
         }
     }
 
-    // Shared ready queue with Moid-level progress gate.
+    // Shared ready queue: degree-based scheduling over the flat action DAG —
+    // moid-level and intra-moid parallelism are both just "no edge, no
+    // order" here.
     std::deque<std::size_t> ready_queue;
     std::mutex queue_mutex;
     std::condition_variable queue_cv;

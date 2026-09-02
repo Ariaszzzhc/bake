@@ -1276,7 +1276,8 @@ TestResult test_lock_consistency() {
     return {};
 }
 
-// bake add must reject duplicate dependency names.
+// bake add with an identical existing entry skips with a hint
+// (OverwriteIfExplicit); it never duplicates or errors.
 TestResult test_add_duplicate() {
     auto dir = make_temp_dir("add_duplicate");
     copy_fixture("simple_app", dir);
@@ -1285,24 +1286,30 @@ TestResult test_add_duplicate() {
     auto r1 = run_bake("add https://github.com/fmtlib/fmt --tag 10.2.1 fmt", dir);
     CHECK(r1.success(), "first add failed: " + r1.stdout);
 
-    // Second add should fail
+    // Identical re-add skips with a hint
     auto r2 = run_bake("add https://github.com/fmtlib/fmt --tag 10.2.1 fmt", dir);
-    CHECK(!r2.success(), "duplicate add should have failed");
-    CHECK(r2.stdout.find("already exists") != std::string::npos,
-          "expected 'already exists' message: " + r2.stdout);
+    CHECK(r2.success(), "identical duplicate add should skip, not fail");
+    CHECK(r2.stdout.find("already a dependency") != std::string::npos,
+          "expected 'already a dependency' message: " + r2.stdout);
+    auto manifest = read_file(dir / "bake.toml");
+    CHECK(manifest.find("fmtlib/fmt") != std::string::npos,
+          "dependency should still be present");
 
     return {};
 }
 
-// bake add --tag with no value must error (not silently write tag="true").
+// A ref flag without a value is treated as unset: the dependency pins the
+// remote's default branch (resolved at first build).
 TestResult test_add_no_tag() {
     auto dir = make_temp_dir("add_no_tag");
     copy_fixture("simple_app", dir);
 
     auto r = run_bake("add https://github.com/fmtlib/fmt --tag", dir);
-    CHECK(!r.success(), "add with empty --tag should have failed");
-    CHECK(r.stdout.find("requires --tag") != std::string::npos,
-          "expected 'requires --tag' error: " + r.stdout);
+    CHECK(r.success(), "add with empty --tag should add a default-branch dep");
+    auto manifest = read_file(dir / "bake.toml");
+    CHECK(manifest.find("fmt = { url = \"https://github.com/fmtlib/fmt\" }") !=
+              std::string::npos,
+          "default-branch entry should carry no ref: " + manifest);
 
     return {};
 }
@@ -1468,8 +1475,8 @@ TestResult test_standalone_path_dep_locked() {
     return {};
 }
 
-// Duplicate add detection must work with compact TOML syntax too.
-// Previously, "name = " text search missed "name={url=...}" compact form.
+// Duplicate detection works with compact TOML syntax too: an identical
+// entry ("fmt={url=...}") is recognized as already present and skipped.
 TestResult test_add_duplicate_compact() {
     auto dir = make_temp_dir("add_dup_compact");
     copy_fixture("simple_app", dir);
@@ -1486,11 +1493,14 @@ TestResult test_add_duplicate_compact() {
     );
     write_file(dir / "src" / "main.cpp", "int main() { return 0; }\n");
 
-    // Adding "fmt" again should fail
+    // Adding "fmt" again with the same definition skips
     auto r = run_bake("add https://github.com/fmtlib/fmt --tag 10.2.1 fmt", dir);
-    CHECK(!r.success(), "duplicate add with compact TOML should have failed");
-    CHECK(r.stdout.find("already exists") != std::string::npos,
-          "expected 'already exists' for compact TOML: " + r.stdout);
+    CHECK(r.success(), "identical add over compact TOML should skip");
+    CHECK(r.stdout.find("already a dependency") != std::string::npos,
+          "expected 'already a dependency' for compact TOML: " + r.stdout);
+    auto manifest = read_file(dir / "bake.toml");
+    CHECK(manifest.find("fmt={url=") != std::string::npos,
+          "existing compact entry must be untouched");
 
     return {};
 }
@@ -2894,6 +2904,502 @@ TestResult test_remote_archive_extract() {
 #endif
 }
 
+// A direct archive dependency (.tar.gz) whose content declares a moid:
+// download, safe extraction, tree hash, graph node, exports — the full
+// pipeline through file:// so no network is needed.
+TestResult test_archive_dependency_tar() {
+#ifdef _WIN32
+    return {};
+#else
+    auto dir = make_temp_dir("archive_dependency_tar");
+    auto project = dir / "project";
+    auto test_home = dir / "home";
+    auto staging = dir / "staging";
+    auto lib = staging / "fixture-archive-lib";
+
+    fs::create_directories(lib / "public");
+    fs::create_directories(lib / "src");
+    fs::create_directories(test_home);
+    copy_fixture("simple_app", project);
+
+    write_file(lib / "bake.toml",
+        "[package]\n"
+        "name = \"fixture-archive-lib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\ncxx = \"c++17\"\n");
+    write_file(lib / "public" / "fixture_archive.hpp",
+        "#pragma once\nint fixture_archive_value();\n");
+    write_file(lib / "src" / "lib.cpp",
+        "#include <fixture_archive.hpp>\n"
+        "int fixture_archive_value() { return 7; }\n");
+
+    auto archive = dir / "fixture-archive-lib.tar.gz";
+    auto pack = run_cmd("tar czf " + archive.string() + " -C " +
+                            staging.string() + " fixture-archive-lib",
+                        dir);
+    CHECK(pack.success(), "failed to pack fixture archive: " + pack.stdout);
+
+    write_file(project / "bake.toml",
+        "[package]\n"
+        "name = \"archive-dep-app\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++17\"\n\n"
+        "[dependencies]\n"
+        "fixture = { url = \"file://" + archive.string() + "\" }\n");
+    write_file(project / "src" / "main.cpp",
+        "#include <fixture_archive.hpp>\n"
+        "int main() { return fixture_archive_value() == 7 ? 0 : 1; }\n");
+
+    auto build = run_bake("build", project, "HOME=" + test_home.string());
+    CHECK(build.success(), "archive dependency build failed: " + build.stdout);
+    CHECK(fs::exists(project / "bake.lock"),
+          "archive dependency build did not write bake.lock");
+    auto lock = read_file(project / "bake.lock");
+    CHECK(lock.find("archive:") != std::string::npos,
+          "lock entry for archive dep should use the archive: locator key");
+
+    return {};
+#endif
+}
+
+// Zip archives take the unzip path (prescan via `unzip -l`, extract via
+// `unzip`); skipped when the host lacks zip tooling.
+TestResult test_archive_dependency_zip() {
+#ifdef _WIN32
+    return {};
+#else
+    auto dir = make_temp_dir("archive_dependency_zip");
+    if (!run_cmd("which zip", dir).success()) return {};
+
+    auto project = dir / "project";
+    auto test_home = dir / "home";
+    auto staging = dir / "staging";
+    auto lib = staging / "fixture-zip-lib";
+
+    fs::create_directories(lib / "public");
+    fs::create_directories(lib / "src");
+    fs::create_directories(test_home);
+    copy_fixture("simple_app", project);
+
+    write_file(lib / "bake.toml",
+        "[package]\n"
+        "name = \"fixture-zip-lib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\ncxx = \"c++17\"\n");
+    write_file(lib / "public" / "fixture_zip.hpp",
+        "#pragma once\nint fixture_zip_value();\n");
+    write_file(lib / "src" / "lib.cpp",
+        "#include <fixture_zip.hpp>\n"
+        "int fixture_zip_value() { return 9; }\n");
+
+    auto archive = dir / "fixture-zip-lib.zip";
+    auto pack = run_cmd("zip -q -r " + archive.string() + " fixture-zip-lib",
+                        staging);
+    CHECK(pack.success(), "failed to pack fixture zip: " + pack.stdout);
+
+    write_file(project / "bake.toml",
+        "[package]\n"
+        "name = \"zip-dep-app\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++17\"\n\n"
+        "[dependencies]\n"
+        "fixture = { url = \"file://" + archive.string() + "\" }\n");
+    write_file(project / "src" / "main.cpp",
+        "#include <fixture_zip.hpp>\n"
+        "int main() { return fixture_zip_value() == 9 ? 0 : 1; }\n");
+
+    auto build = run_bake("build", project, "HOME=" + test_home.string());
+    CHECK(build.success(), "zip dependency build failed: " + build.stdout);
+
+    return {};
+#endif
+}
+
+// Locked-as-hints: an unchanged archive dependency must be carried over
+// verbatim on re-resolve (no re-download), while a newly added dependency
+// downloads for the first time.
+TestResult test_incremental_lock_carry() {
+#ifdef _WIN32
+    return {};
+#else
+    auto dir = make_temp_dir("incremental_lock_carry");
+    auto project = dir / "project";
+    auto test_home = dir / "home";
+    auto staging = dir / "staging";
+
+    fs::create_directories(test_home);
+    fs::create_directories(staging);
+    copy_fixture("simple_app", project);
+
+    auto make_archive_dep = [&](const std::string& name, int value) {
+        std::string ident = name;
+        std::replace(ident.begin(), ident.end(), '-', '_');
+        auto lib = staging / name;
+        fs::create_directories(lib / "public");
+        fs::create_directories(lib / "src");
+        write_file(lib / "bake.toml",
+            "[package]\n"
+            "name = \"" + name + "-lib\"\n"
+            "version = \"0.1.0\"\n"
+            "type = \"lib\"\n"
+            "[language]\ncxx = \"c++17\"\n");
+        write_file(lib / "public" / (name + ".hpp"),
+            "#pragma once\nint " + ident + "_value();\n");
+        write_file(lib / "src" / "lib.cpp",
+            "#include <" + name + ".hpp>\n"
+            "int " + ident + "_value() { return " +
+                std::to_string(value) + "; }\n");
+        auto archive = dir / (name + ".tar.gz");
+        auto pack = run_cmd("tar czf " + archive.string() + " -C " +
+                                staging.string() + " " + name,
+                            dir);
+        if (!pack.success()) return std::string();
+        return archive.string();
+    };
+
+    auto first = make_archive_dep("fixture-carry-a", 3);
+    CHECK(!first.empty(), "failed to pack fixture-carry-a");
+    auto second = make_archive_dep("fixture-carry-b", 4);
+    CHECK(!second.empty(), "failed to pack fixture-carry-b");
+
+    write_file(project / "bake.toml",
+        "[package]\n"
+        "name = \"carry-app\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++17\"\n\n"
+        "[dependencies]\n"
+        "a = { url = \"file://" + first + "\" }\n");
+    write_file(project / "src" / "main.cpp",
+        "#include <fixture-carry-a.hpp>\n"
+        "int main() { return fixture_carry_a_value() == 3 ? 0 : 1; }\n");
+
+    std::string home_env = "HOME=" + test_home.string();
+    auto build1 = run_bake("build", project, home_env);
+    CHECK(build1.success(), "first build failed: " + build1.stdout);
+    CHECK(build1.stdout.find("Downloading fixture-carry-a") !=
+              std::string::npos,
+          "first build should download the archive dependency");
+
+    // Add a second dependency; the first must be carried from the lock.
+    std::string manifest = read_file(project / "bake.toml");
+    manifest += "b = { url = \"file://" + second + "\" }\n";
+    write_file(project / "bake.toml", manifest);
+
+    auto build2 = run_bake("build", project, home_env);
+    CHECK(build2.success(), "second build failed: " + build2.stdout);
+    CHECK(build2.stdout.find("Downloading fixture-carry-a") ==
+              std::string::npos,
+          "unchanged dependency must be carried from the lock, not "
+          "re-downloaded: " + build2.stdout);
+    CHECK(build2.stdout.find("Downloading fixture-carry-b") !=
+              std::string::npos,
+          "new dependency must be resolved: " + build2.stdout);
+
+    auto lock = read_file(project / "bake.lock");
+    CHECK(lock.find("fixture-carry-a") == std::string::npos ||
+              lock.find("archive:") != std::string::npos,
+          "lock should use archive: locator keys");
+
+    return {};
+#endif
+}
+
+// bake remove drops the entry from the right scope, prunes orphaned lock
+// entries, leaves the content cache untouched, and preserves manifest
+// comments. add --target writes target-scoped entries with table creation.
+TestResult test_add_remove_commands() {
+#ifdef _WIN32
+    return {};
+#else
+    auto dir = make_temp_dir("add_remove_commands");
+    auto project = dir / "project";
+    auto test_home = dir / "home";
+    auto staging = dir / "staging";
+    fs::create_directories(test_home);
+    fs::create_directories(staging);
+    copy_fixture("simple_app", project);
+
+    write_file(project / "bake.toml",
+        "[package]\n"
+        "name = \"remove-app\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++17\"\n\n"
+        "# favored deps live here\n"
+        "[dependencies]\n");
+    write_file(project / "src" / "main.cpp", "int main() { return 0; }\n");
+
+    auto make_archive = [&](const std::string& name) {
+        std::string ident = name;
+        std::replace(ident.begin(), ident.end(), '-', '_');
+        auto lib = staging / name;
+        fs::create_directories(lib / "public");
+        fs::create_directories(lib / "src");
+        write_file(lib / "bake.toml",
+            "[package]\n"
+            "name = \"" + name + "-lib\"\n"
+            "version = \"0.1.0\"\n"
+            "type = \"lib\"\n"
+            "[language]\ncxx = \"c++17\"\n");
+        write_file(lib / "public" / (name + ".hpp"),
+            "#pragma once\nint " + ident + "_value();\n");
+        write_file(lib / "src" / "lib.cpp",
+            "#include <" + name + ".hpp>\n"
+            "int " + ident + "_value() { return 1; }\n");
+        auto archive = dir / (name + ".tar.gz");
+        auto pack = run_cmd("tar czf " + archive.string() + " -C " +
+                                staging.string() + " " + name,
+                            dir);
+        if (!pack.success()) return std::string();
+        return archive.string();
+    };
+
+    auto first = make_archive("fixture-rm-a");
+    CHECK(!first.empty(), "failed to pack fixture-rm-a");
+    auto second = make_archive("fixture-rm-b");
+    CHECK(!second.empty(), "failed to pack fixture-rm-b");
+    std::string home_env = "HOME=" + test_home.string();
+
+    // Flag validation.
+    CHECK(!run_bake("add " + first + " --tag v1 --branch main", project)
+              .success(),
+          "conflicting ref flags must be rejected");
+    CHECK(!run_bake("add " + first + " --tag v1", project).success(),
+          "archive with a ref flag must be rejected");
+    CHECK(!run_bake("add https://example.com/x.git --tag v1 --target "
+                    "\"x86*-linux\"",
+                    project)
+              .success(),
+          "invalid --target glob must be rejected");
+
+    // Global add + target-scoped add (creates the table).
+    auto add_a = run_bake("add " + first, project);
+    CHECK(add_a.success(), "add archive failed: " + add_a.stdout);
+    auto add_b = run_bake("add " + second + " --target \"*-linux-musl\"",
+                          project);
+    CHECK(add_b.success(), "target-scoped add failed: " + add_b.stdout);
+
+    auto manifest = read_file(project / "bake.toml");
+    CHECK(manifest.find("# favored deps live here") != std::string::npos,
+          "manifest comment must survive adds: " + manifest);
+    CHECK(manifest.find("[target.\"*-linux-musl\".dependencies]") !=
+              std::string::npos,
+          "target-scoped add must create the table: " + manifest);
+    CHECK(manifest.find("fixture-rm-b = { url = ") != std::string::npos,
+          "target-scoped entry must be written: " + manifest);
+
+    // Build: lock covers the union of scopes (both entries), even though
+    // the native build graph never sees the musl-scoped one.
+    auto build = run_bake("build", project, home_env);
+    CHECK(build.success(), "build with archive deps failed: " + build.stdout);
+    auto lock_text = read_file(project / "bake.lock");
+    CHECK(lock_text.find("fixture-rm-a.tar.gz") != std::string::npos ||
+              lock_text.find("archive:") != std::string::npos,
+          "lock should contain archive entries");
+
+    // Remember the cache directories before removal.
+    auto cache_root = test_home / ".cache" / "bake" / "src";
+    std::size_t cache_entries_before = 0;
+    for (auto it = fs::directory_iterator(cache_root);
+         it != fs::directory_iterator(); ++it)
+        if (it->is_directory()) ++cache_entries_before;
+    CHECK(cache_entries_before >= 2,
+          "both archives should be cached before remove");
+
+    // Remove the target-scoped entry with the scope pin-pointed.
+    auto rm_b = run_bake("remove fixture-rm-b --target \"*-linux-musl\"",
+                         project);
+    CHECK(rm_b.success(), "target-scoped remove failed: " + rm_b.stdout);
+    manifest = read_file(project / "bake.toml");
+    CHECK(manifest.find("fixture-rm-b") == std::string::npos,
+          "removed entry must be gone from the manifest");
+    CHECK(manifest.find("fixture-rm-a") != std::string::npos,
+          "other entries must survive");
+    CHECK(manifest.find("# favored deps live here") != std::string::npos,
+          "manifest comment must survive remove");
+
+    // The lock was pruned of the removed entry's reach.
+    lock_text = read_file(project / "bake.lock");
+    CHECK(lock_text.find("fixture-rm-b") == std::string::npos,
+          "lock must be pruned of removed entries");
+
+    // Removing an ambiguous/unknown alias errors with guidance.
+    CHECK(!run_bake("remove no-such-dep", project).success(),
+          "removing an unknown dependency must fail");
+    CHECK(!run_bake("remove fixture-rm-b", project).success(),
+          "removing an already-removed dependency must fail");
+
+    // Cache is untouched by removals.
+    std::size_t cache_entries_after = 0;
+    for (auto it = fs::directory_iterator(cache_root);
+         it != fs::directory_iterator(); ++it)
+        if (it->is_directory()) ++cache_entries_after;
+    CHECK(cache_entries_after == cache_entries_before,
+          "remove must never touch the content cache");
+
+    // Build still works after removal.
+    auto rebuild = run_bake("build", project, home_env);
+    CHECK(rebuild.success(), "build after remove failed: " + rebuild.stdout);
+
+    return {};
+#endif
+}
+
+// Target-scoped dependencies are visible only to matching build triples:
+// a musl-scoped lib dep makes the native build fail (header missing) and
+// the musl cross build succeed, and only the matching graph contains it.
+TestResult test_target_scoped_dependency() {
+    auto dir = make_temp_dir("target_scoped_dependency");
+    auto project = dir / "project";
+    auto test_home = dir / "home";
+    auto staging = dir / "staging";
+    auto lib = staging / "fixture-scope-lib";
+
+    fs::create_directories(lib / "public");
+    fs::create_directories(lib / "src");
+    fs::create_directories(test_home);
+    copy_fixture("simple_app", project);
+
+    write_file(lib / "bake.toml",
+        "[package]\n"
+        "name = \"fixture-scope-lib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\ncxx = \"c++17\"\n");
+    write_file(lib / "public" / "fixture_scope.hpp",
+        "#pragma once\nint fixture_scope_value();\n");
+    write_file(lib / "src" / "lib.cpp",
+        "#include <fixture_scope.hpp>\n"
+        "int fixture_scope_value() { return 5; }\n");
+
+    auto archive = dir / "fixture-scope-lib.tar.gz";
+    auto pack = run_cmd("tar czf " + archive.string() + " -C " +
+                            staging.string() + " fixture-scope-lib",
+                        dir);
+    CHECK(pack.success(), "failed to pack scope fixture: " + pack.stdout);
+
+    write_file(project / "bake.toml",
+        "[package]\n"
+        "name = \"scope-app\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++17\"\n\n"
+        "[target.\"*-linux-musl\".dependencies]\n"
+        "fixture = { url = \"file://" + archive.string() + "\" }\n");
+    write_file(project / "src" / "main.cpp",
+        "#include <fixture_scope.hpp>\n"
+        "int main() { return fixture_scope_value() == 5 ? 0 : 1; }\n");
+
+    std::string home_env = "HOME=" + test_home.string();
+
+    // Native build: the musl-scoped dependency is filtered out, so the
+    // header cannot resolve.
+    auto native = run_bake("build", project, home_env);
+    CHECK(!native.success(),
+          "native build must not see the musl-scoped dependency");
+    CHECK(native.stdout.find("fixture_scope.hpp") != std::string::npos,
+          "native failure should be the missing header: " + native.stdout);
+
+    // Cross build for musl: the dependency enters the graph and the build
+    // succeeds.
+    auto musl = run_bake("build -t x86_64-linux-musl", project, home_env);
+    CHECK(musl.success(),
+          "musl build must see the scoped dependency: " + musl.stdout);
+    CHECK(fs::exists(project / "out" / "x86_64-linux-musl" / "bin" /
+                     "scope-app"),
+          "musl binary missing");
+
+    return {};
+}
+
+// Declaring a raw source dependency and never consuming it draws a
+// configure-time warning; consuming it via dep_src_dir silences the warning.
+TestResult test_unused_source_dep_warning() {
+#ifdef _WIN32
+    return {};
+#else
+    auto dir = make_temp_dir("unused_source_dep");
+    auto unused_project = dir / "unused";
+    auto used_project = dir / "used";
+    auto test_home = dir / "home";
+    auto staging = dir / "staging" / "fixture-raw-src";
+
+    fs::create_directories(staging / "src");
+    fs::create_directories(test_home);
+    fs::create_directories(unused_project / "src");
+    fs::create_directories(used_project);
+
+    // A raw source package: no bake.toml, just sources.
+    write_file(staging / "src" / "raw_main.c",
+        "int raw_served_main(void) { return 0; }\n");
+    auto archive = dir / "fixture-raw-src.tar.gz";
+    auto pack = run_cmd("tar czf " + archive.string() + " -C " +
+                            (dir / "staging").string() + " fixture-raw-src",
+                        dir);
+    CHECK(pack.success(), "failed to pack raw source fixture: " + pack.stdout);
+
+    std::string dep_url = "file://" + archive.string();
+
+    // Unused: default discovery has no way to consume a source dependency.
+    write_file(unused_project / "bake.toml",
+        "[package]\n"
+        "name = \"unused-src-dep\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++17\"\n\n"
+        "[dependencies]\n"
+        "raw = { url = \"" + dep_url + "\" }\n");
+    write_file(unused_project / "src" / "main.cpp",
+        "int main() { return 0; }\n");
+
+    std::string home_env = "HOME=" + test_home.string();
+    auto unused_build = run_bake("build", unused_project, home_env);
+    CHECK(unused_build.success(),
+          "unused source dep build should still succeed: " +
+              unused_build.stdout);
+    CHECK(unused_build.stdout.find("'raw'") != std::string::npos &&
+              unused_build.stdout.find("never consumed") !=
+                  std::string::npos,
+          "expected unused-source-dep warning: " + unused_build.stdout);
+
+    // Consumed: build.cpp pulls the raw sources in via dep_src_dir.
+    write_file(used_project / "bake.toml",
+        "[package]\n"
+        "name = \"used-src-dep\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"executable\"\n"
+        "[language]\ncxx = \"c++17\"\n\n"
+        "[dependencies]\n"
+        "raw = { url = \"" + dep_url + "\" }\n");
+    write_file(used_project / "build.cpp",
+        "import bake.build;\n"
+        "import std;\n"
+        "int main() {\n"
+        "    bake::Builder b;\n"
+        "    std::string dir(b.dep_src_dir(\"raw\"));\n"
+        "    if (dir.empty()) return 1;\n"
+        "    b.sources(\"src/main.cpp\");\n"
+        "    b.sources(dir + \"/src/raw_main.c\");\n"
+        "    return b.build();\n"
+        "}\n");
+    write_file(used_project / "src" / "main.cpp",
+        "int main() { return 0; }\n");
+
+    auto used_build = run_bake("build", used_project, home_env);
+    CHECK(used_build.success(),
+          "consumed source dep build failed: " + used_build.stdout);
+    CHECK(used_build.stdout.find("never consumed") == std::string::npos,
+          "no warning expected when dep_src_dir is used: " + used_build.stdout);
+
+    return {};
+#endif
+}
+
 
 // A Lib moid with module interfaces must include the module interface objects
 // in its archive action's inputs and depends_on, alongside regular source
@@ -3785,6 +4291,12 @@ static std::vector<TestCase> all_tests = {
     {"std_compat_build_cpp",          test_std_compat_build_cpp},
     {"cache_sharing",                 test_cache_sharing},
     {"remote_archive_extract",        test_remote_archive_extract},
+    {"archive_dependency_tar",        test_archive_dependency_tar},
+    {"archive_dependency_zip",        test_archive_dependency_zip},
+    {"incremental_lock_carry",        test_incremental_lock_carry},
+    {"add_remove_commands",          test_add_remove_commands},
+    {"target_scoped_dependency",      test_target_scoped_dependency},
+    {"unused_source_dep_warning",     test_unused_source_dep_warning},
     {"module_archive_edges",          test_module_archive_edges},
     {"graph_json_round_trip",         test_graph_json_round_trip},
     {"profile_configuration",         test_profile_configuration},

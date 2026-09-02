@@ -390,8 +390,12 @@ public:
     std::string_view build_dir() const { return build_dir_; }
     std::string_view target() const { return target_; }
 
-    std::string_view dep_src_dir(std::string_view name) const {
-        auto it = dep_dirs_.find(std::string(name));
+    std::string_view dep_src_dir(std::string_view name) {
+        std::string key(name);
+        auto it = dep_dirs_.find(key);
+        // Every query counts as consumption, including misses — configure
+        // warns about declared source dependencies nothing ever asks for.
+        used_source_deps_.insert(key);
         return it != dep_dirs_.end() ? std::string_view(it->second) : "";
     }
 
@@ -469,6 +473,12 @@ private:
         }
         json += tests_.empty() ? "]\n" : "\n  ]\n";
 
+        json += ",\n";
+        json += "  \"used_source_deps\": " +
+                json_array(std::vector<std::string>(
+                    used_source_deps_.begin(), used_source_deps_.end())) +
+                "\n";
+
         json += "}\n";
         return json;
     }
@@ -493,6 +503,7 @@ private:
     std::vector<TestRegistration> tests_;
     std::map<std::string, std::string> options_;
     std::map<std::string, std::string> dep_dirs_;
+    std::set<std::string> used_source_deps_;
 };
 
 } // namespace bake

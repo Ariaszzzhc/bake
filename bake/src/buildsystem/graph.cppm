@@ -33,62 +33,58 @@ export struct MoidGraph {
     std::vector<MoidId> roots;
 };
 
-export enum class ArtifactKind {
-    Object,
-    Module,
-    StaticLibrary,
-    SharedLibrary,
-    Executable,
-};
-
-export struct ArtifactRef {
-    ArtifactKind kind;
-    Path path;
-    std::string producer_action;
-
-    auto operator<=>(const ArtifactRef& other) const {
-        if (kind != other.kind) return kind <=> other.kind;
-        const std::string normalized =
-            path.fs().lexically_normal().generic_string();
-        const std::string other_normalized =
-            other.path.fs().lexically_normal().generic_string();
-        if (normalized != other_normalized)
-            return normalized <=> other_normalized;
-        return producer_action <=> other.producer_action;
-    }
-
-    bool operator==(const ArtifactRef& other) const {
-        return (*this <=> other) == 0;
-    }
-};
-
-export struct CompileUsage {
-    std::vector<Path> include_dirs;
-    std::vector<std::string> defines;
-    std::map<std::string, ArtifactRef> modules;
-};
-
-export struct LinkInterface {
-    std::vector<ArtifactRef> objects;
-    std::vector<ArtifactRef> libraries;
-    std::vector<std::string> system_libraries;
-    std::vector<std::string> frameworks;
-};
-
-export struct MoidExports {
-    CompileUsage compile;
-    LinkInterface link;
-    std::optional<ArtifactRef> terminal;
-};
 
 export struct BuildSelection {
     std::optional<std::string> workspace_member;
     std::map<std::string, BuildOption> root_options;
+    // Build triple used to filter target-scoped dependencies. Native
+    // builds carry the detected host triple.
+    std::string target_triple;
 };
 
 export struct ResolvePolicy {
-    bool locked = false;
     bool offline = false;
+};
+
+// A remote source pre-resolved from the lockfile and content cache.
+// graph does not read bake.lock — the caller resolves lock entries into
+// concrete source directories and injects them here.
+export struct LockedSource {
+    std::string url;        // normalized URL
+    std::string ref;        // git ref value ("" for archive deps)
+    std::string ref_type;   // "tag" | "branch" | "rev" | "head" | "archive"
+    std::string commit;     // resolved commit (git deps only)
+    std::string integrity;  // "sha256-<tree-hash>"
+    std::string cache_hash; // bare hex tree hash
+    Path cache_dir;         // content-addressed source directory
+
+    // Canonical moid identity for a native source from this location.
+    std::string identity() const {
+        if (ref_type == "archive")
+            return "archive:" + url + ":" + cache_hash;
+        return "git:" + url + "#" + commit + ":" + cache_hash;
+    }
+};
+
+export struct SourceIndex {
+    std::vector<LockedSource> entries;
+
+    const LockedSource* find(const std::string& normalized_url,
+                             const std::string& ref_type,
+                             const std::string& ref) const {
+        for (const auto& entry : entries)
+            if (entry.url == normalized_url && entry.ref_type == ref_type &&
+                entry.ref == ref)
+                return &entry;
+        return nullptr;
+    }
+
+    const LockedSource* find(const Dependency& dep) const {
+        if (dep.is_archive())
+            return find(normalize_dependency_url(dep.url), "archive", "");
+        auto [type, value] = dep.git_ref();
+        return find(normalize_dependency_url(dep.url), type, value);
+    }
 };
 
 namespace {
@@ -328,10 +324,11 @@ configuration_topological_moids(const MoidGraph& graph) {
 // Build a resolved MoidGraph from a root manifest.
 //
 // Walks the dependency closure recursively:
-//   workspace members → path deps → remote deps (from lockfile)
+//   workspace members → path deps → remote deps (via SourceIndex)
 // Each node gets a canonical identity (workspace:path, path:<hash>,
-// git:<url>#<commit>). Non-moid sources (no bake.toml) are recorded as
-// source_deps for build.cpp access but don't become graph nodes.
+// git:<url>#<commit>, archive:<url>:<hash>). Non-moid sources (no bake.toml)
+// are recorded as source_deps for build.cpp access but don't become graph
+// nodes.
 //
 // Build options are resolved after the graph structure is complete:
 // each option request is validated against the target package's declared
@@ -339,7 +336,8 @@ configuration_topological_moids(const MoidGraph& graph) {
 export std::expected<MoidGraph, std::string>
 resolve_moid_graph(const Manifest& root,
                    const BuildSelection& selection,
-                   const ResolvePolicy& policy) {
+                   const ResolvePolicy& policy,
+                   const SourceIndex& sources) {
     auto root_path = canonical_source_root(root.project_dir);
     if (!root_path) return std::unexpected(root_path.error());
 
@@ -349,7 +347,7 @@ resolve_moid_graph(const Manifest& root,
     };
 
     MoidGraph graph;
-    std::map<MoidId, SourceRecord> sources;
+    std::map<MoidId, SourceRecord> source_records;
     std::vector<MoidId> worklist;
     std::map<std::string, MoidId> workspace_ids;
     std::map<std::string, std::string> workspace_member_spellings;
@@ -359,8 +357,8 @@ resolve_moid_graph(const Manifest& root,
                                std::string source_key,
                                Manifest manifest)
             -> std::expected<bool, std::string> {
-        auto existing = sources.find(id);
-        if (existing != sources.end()) {
+        auto existing = source_records.find(id);
+        if (existing != source_records.end()) {
             if (existing->second.source_key != source_key) {
                 return std::unexpected(
                     "duplicate moid id '" + id.value + "' for '" +
@@ -380,7 +378,7 @@ resolve_moid_graph(const Manifest& root,
         node.id = id;
         node.declaration = manifest_declaration(manifest, id, source_root);
         graph.nodes.emplace(id, std::move(node));
-        sources.emplace(
+        source_records.emplace(
             id, SourceRecord{std::move(source_key), std::move(manifest)});
         worklist.push_back(id);
         return true;
@@ -458,15 +456,15 @@ resolve_moid_graph(const Manifest& root,
         return std::unexpected("project does not declare a [package] or [workspace]");
     }
 
-    auto lockfile = Lockfile::load(*root_path / "bake.lock");
-    const Path cache_dir = get_cache_dir();
-
     for (std::size_t index = 0; index < worklist.size(); ++index) {
         const MoidId source_id = worklist[index];
-        const SourceRecord source = sources.at(source_id);
+        const SourceRecord source = source_records.at(source_id);
         auto& source_node = graph.nodes.at(source_id);
 
-        for (const auto& [alias, dependency] : source.manifest.dependencies) {
+        auto effective =
+            effective_dependencies(source.manifest, selection.target_triple);
+        if (!effective) return std::unexpected(effective.error());
+        for (const auto& [alias, dependency] : *effective) {
             std::optional<MoidId> target_id;
             std::optional<Manifest> target_manifest;
             std::string source_key;
@@ -508,46 +506,39 @@ resolve_moid_graph(const Manifest& root,
                     source_key = path_key;
                 }
             } else {
-                // Remote dep: flat lock search by url + ref
-                if (!lockfile) {
-                    return std::unexpected(
-                        "remote dependency '" + alias +
-                        "' is not resolved: lockfile is missing");
-                }
-                const LockDep* locked =
-                    lockfile->find_remote(dependency.url, dependency.tag);
+                // Remote dep: pre-resolved by the caller into SourceIndex.
+                const LockedSource* locked = sources.find(dependency);
                 if (!locked) {
                     return std::unexpected(
-                        "locked dependency '" + alias +
-                        "' is not resolved (no lock entry matching URL/tag)");
+                        "remote dependency '" + alias +
+                        "' is not resolved (no lock entry matching "
+                        "URL/ref) — run 'bake update'");
                 }
-                if (locked->commit.empty() || locked->integrity.empty()) {
+                if (locked->integrity.empty() ||
+                    (locked->ref_type != "archive" && locked->commit.empty())) {
                     return std::unexpected(
                         "locked dependency '" + alias +
                         "' is missing canonical hashes");
                 }
-
-                std::string hash = locked->cache_hash();
-                const Path dependency_root = cache_dir / hash;
-                if (!dependency_root.is_directory()) {
+                if (!locked->cache_dir.is_directory()) {
                     return std::unexpected(
                         std::string(policy.offline ? "offline cache" : "cache") +
                         " for dependency '" + alias + "' is missing at " +
-                        dependency_root.string());
+                        locked->cache_dir.string());
                 }
 
-                auto manifest = Manifest::load(dependency_root);
-                if (!manifest || !manifest->has_moid()) {
+                auto manifest = Manifest::load_moid(locked->cache_dir);
+                if (!manifest) {
                     // Non-native remote dep — source-only, no graph node.
                     // Record its source dir for build.cpp access.
-                    source_node.source_deps[alias] = dependency_root.string();
+                    source_node.source_deps[alias] =
+                        locked->cache_dir.string();
                     continue;
                 }
-                manifest->project_dir = dependency_root;
+                manifest->project_dir = locked->cache_dir;
                 target_manifest = std::move(*manifest);
 
-                source_key = "git:" + normalize_dependency_url(locked->url) +
-                    "#" + locked->commit + ":" + hash;
+                source_key = locked->identity();
                 target_id = MoidId{source_key};
             }
 
@@ -579,7 +570,7 @@ resolve_moid_graph(const Manifest& root,
     //   3. Apply CLI overrides (root_options) last
 
     for (auto& [id, node] : graph.nodes) {
-        auto effective = sources.at(id).manifest.options;
+        auto effective = source_records.at(id).manifest.options;
 
         // Collect feature activations from all dependency edges targeting this moid
         for (auto& [_, src_node] : graph.nodes) {

@@ -55,6 +55,9 @@ export struct MoidDeclaration {
     std::vector<BinaryDeclaration> binaries;
     // Named test mappings onto declared binaries
     std::vector<TestRegistration> tests;
+    // Source-dependency aliases the build script consumed via
+    // dep_src_dir() — lets configure warn about declared-but-unused ones.
+    std::vector<std::string> used_source_deps;
 };
 
 // Persisted-declaration store: out_dir/.bake/<identity-key>.moid.json.
@@ -296,6 +299,8 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
         });
     }
 
+    document["used_source_deps"] = declaration.used_source_deps;
+
     return document;
 }
 
@@ -530,6 +535,15 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
 
             declaration.tests.push_back(std::move(test));
         }
+    }
+
+    // Optional: source deps consumed by the build script (declarations
+    // written before this field existed parse as empty).
+    if (auto used = document.find("used_source_deps");
+        used != document.end()) {
+        auto aliases = string_array(*used, "used_source_deps");
+        if (!aliases) return std::unexpected(aliases.error());
+        declaration.used_source_deps = std::move(*aliases);
     }
 
     return declaration;

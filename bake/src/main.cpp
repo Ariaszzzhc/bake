@@ -238,6 +238,7 @@ void print_help() {
       "    init [name]     Create a new project scaffold\n"
       "    build           Build the project\n"
       "    add <url>       Add a dependency to bake.toml\n"
+        "    remove <name>   Remove a dependency from bake.toml and bake.lock\n"
       "    update [dep]    Re-resolve dependencies and update bake.lock\n"
       "    run             Build and run the executable\n"
       "    test            Build and run tests\n"
@@ -458,6 +459,38 @@ int cmd_init(const ParsedArgs &args) {
   return 0;
 }
 
+// Resolve the lockfile and content cache into the SourceIndex consumed by
+// graph resolution: every locked remote dep keyed by normalized URL + ref,
+// mapped to its content-addressed cache directory. The bridge between the
+// dependency domain (package) and the graph.
+SourceIndex build_source_index(const Path &root) {
+  SourceIndex index;
+  auto lockfile = Lockfile::load(root / "bake.lock");
+  if (!lockfile) return index;
+  const Path cache_dir = get_cache_dir();
+  for (auto &[key, dep] : lockfile->deps) {
+    if (!dep.is_remote()) continue;
+    LockedSource source;
+    source.url = normalize_dependency_url(dep.url);
+    source.ref = dep.is_archive() ? "" : dep.ref;
+    source.ref_type = dep.is_archive() ? "archive" : dep.ref_type;
+    source.commit = dep.commit;
+    source.integrity = dep.integrity;
+    source.cache_hash = dep.cache_hash();
+    source.cache_dir = cache_dir / source.cache_hash;
+    index.entries.push_back(std::move(source));
+  }
+  return index;
+}
+
+
+// The triple used for target-scoped dependency filtering — same convention
+// as the engine's target-condition matching: native builds carry the
+// detected host triple.
+std::string selection_triple(const TargetSpec &target) {
+  return target.is_native() ? detect_host_target().triple_ : target.triple_;
+}
+
 // ===== Lock enforcement =====
 
 // Check and resolve the lockfile before building. Returns 0 if the lock is
@@ -470,11 +503,20 @@ int cmd_init(const ParsedArgs &args) {
 // Normal: resolve if needed, verify/redownload cache.
 int enforce_lock(const Path &root, const Manifest &manifest,
                  const ParsedArgs &args) {
-  if (Lockfile::has_only_path_deps(manifest))
+  if (Manifest::has_only_path_deps(manifest))
     return 0;
 
-  bool offline = args.has_option("offline") || args.has_option("frozen");
-  bool locked = args.has_option("locked") || args.has_option("frozen");
+  // Lock usage policy, named after the CLI flags:
+  //   Update — check consistency; resolve/redownload as needed (default)
+  //   Locked — require a fresh lock and intact cache; never write
+  //   Frozen — Locked plus a hard network ban (--offline implies the rest)
+  enum class LockUsage { Update, Locked, Frozen };
+  const LockUsage usage = args.has_option("frozen")   ? LockUsage::Frozen
+                          : args.has_option("locked") ? LockUsage::Locked
+                                                      : LockUsage::Update;
+  const bool offline =
+      args.has_option("offline") || usage == LockUsage::Frozen;
+  const bool locked = usage != LockUsage::Update;
 
   Path lock_path = root / "bake.lock";
   auto lockfile = Lockfile::load(lock_path);
@@ -514,9 +556,12 @@ int enforce_lock(const Path &root, const Manifest &manifest,
     return 0;
   }
 
-  // Normal build, lock missing/stale: resolve dependencies.
+  // Normal build, lock missing/stale: resolve dependencies. Entries whose
+  // url+ref still match the stale lock are carried over — only new or
+  // changed dependencies touch the network.
   Resolver resolver;
-  auto new_lock = resolver.resolve(manifest, ResolverConfig{});
+  auto new_lock = resolver.resolve(
+      manifest, ResolverConfig{}, lockfile ? &*lockfile : nullptr);
   if (!new_lock) {
     std::println(std::cerr, "bake: failed to resolve dependencies");
     return 1;
@@ -562,12 +607,18 @@ int cmd_build(const ParsedArgs &args) {
   BuildSelection selection;
   selection.workspace_member = std::move(*selected_member);
   selection.root_options = std::move(*root_options);
+  TargetSpec selection_target;
+  if (auto t = args.get_option("target"))
+    selection_target = parse_target(*t);
+  else if (auto t = args.get_option("t"))
+    selection_target = parse_target(*t);
+  selection.target_triple = selection_triple(selection_target);
 
   ResolvePolicy policy;
-  policy.locked = args.has_option("locked") || args.has_option("frozen");
   policy.offline = args.has_option("offline") || args.has_option("frozen");
 
-  auto outer_graph = resolve_moid_graph(*manifest, selection, policy);
+  auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
+                          build_source_index(*root));
   if (!outer_graph) {
     std::println(std::cerr, "bake: {}", outer_graph.error());
     return 1;
@@ -812,9 +863,9 @@ int cmd_run(const ParsedArgs &args) {
   BuildSelection selection;
   selection.workspace_member = std::move(*selected_member);
   ResolvePolicy policy;
-  policy.locked = args.has_option("locked") || args.has_option("frozen");
   policy.offline = args.has_option("offline") || args.has_option("frozen");
-  auto outer_graph = resolve_moid_graph(*manifest, selection, policy);
+  auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
+                          build_source_index(*root));
   if (!outer_graph) {
     std::println(std::cerr, "bake: {}", outer_graph.error());
     return 1;
@@ -828,6 +879,7 @@ int cmd_run(const ParsedArgs &args) {
     target = parse_target(*t);
   else if (auto t = args.get_option("t"))
     target = parse_target(*t);
+  selection.target_triple = selection_triple(target);
   std::string triple_dir =
       target.is_native() ? detect_host_target().triple_ : target.triple_;
   const Path out_dir = *root / "out" / triple_dir;
@@ -892,7 +944,101 @@ int cmd_run(const ParsedArgs &args) {
   return result.exit_code;
 }
 
-// ===== add command =====
+// ===== add / remove commands =====
+
+// Find the start of the next table header ('[' at column 0) on or after
+// `from`, or npos when the section runs to end of file.
+std::size_t next_table_header(const std::string &content, std::size_t from) {
+  std::size_t pos = from;
+  while (pos < content.size()) {
+    std::size_t eol = content.find('\n', pos);
+    if (eol == std::string::npos) eol = content.size();
+    if (eol > pos && content[pos] == '[') return pos;
+    if (eol == content.size()) break;
+    pos = eol + 1;
+  }
+  return std::string::npos;
+}
+
+// Insert a dependency line at the end of a [dependencies] section (global
+// or target-scoped), creating the section if needed. Existing entries,
+// comments, and ordering are untouched.
+bool insert_dependency_line(const Path &toml_path, const std::string &section,
+                            const std::string &dep_line) {
+  auto content = read_file(toml_path);
+  if (!content) return false;
+
+  std::size_t header = content->find("\n" + section + "\n");
+  if (header == std::string::npos && content->rfind(section + "\n", 0) == 0)
+    header = 0;
+  if (header != std::string::npos) {
+    std::size_t section_line_end = content->find('\n', header + 1);
+    if (section_line_end == std::string::npos) section_line_end = content->size();
+    std::size_t next = next_table_header(*content, section_line_end + 1);
+    std::size_t insert_at = (next == std::string::npos)
+                                ? content->size()
+                                : next;
+    if (insert_at > 0 && (*content)[insert_at - 1] != '\n')
+      content->insert(insert_at, "\n");
+    content->insert(insert_at, dep_line);
+  } else {
+    if (!content->empty() && content->back() != '\n')
+      *content += "\n";
+    *content += "\n" + section + "\n" + dep_line;
+  }
+  return write_file(toml_path, *content);
+}
+
+// Remove the entry line for `alias` from a section. Returns false when the
+// section or the entry is not present.
+bool remove_dependency_line(const Path &toml_path, const std::string &section,
+                            const std::string &alias) {
+  auto content = read_file(toml_path);
+  if (!content) return false;
+
+  std::size_t header = content->find("\n" + section + "\n");
+  if (header == std::string::npos && content->rfind(section + "\n", 0) == 0)
+    header = 0;
+  if (header == std::string::npos) return false;
+  std::size_t section_end =
+      next_table_header(*content, content->find('\n', header + 1) + 1);
+  if (section_end == std::string::npos) section_end = content->size();
+
+  std::size_t pos = content->find('\n', header + 1) + 1;
+  const std::string prefix = alias + " ";
+  const std::string prefix_eq = alias + "=";
+  while (pos < section_end) {
+    std::size_t eol = content->find('\n', pos);
+    if (eol == std::string::npos) eol = content->size();
+    std::size_t line_start = pos;
+    while (line_start < eol && (*content)[line_start] == ' ')
+      ++line_start;
+    std::string_view line(content->data() + line_start, eol - line_start);
+    if (line.starts_with(prefix_eq) ||
+        (line.starts_with(prefix) &&
+         line.substr(prefix.size()).starts_with("="))) {
+      content->erase(line_start, eol - line_start + (eol < content->size() ? 1 : 0));
+      return write_file(toml_path, *content);
+    }
+    if (eol == content->size()) break;
+    pos = eol + 1;
+  }
+  return false;
+}
+
+// Every scope of the manifest that can declare dependencies, as (label,
+// table) pairs. The label is the exact TOML section header for edits.
+std::vector<std::pair<std::string, const std::map<std::string, Dependency> *>>
+dependency_scopes(const Manifest &manifest) {
+  std::vector<std::pair<std::string,
+                        const std::map<std::string, Dependency> *>> scopes;
+  scopes.emplace_back("[dependencies]", &manifest.dependencies);
+  for (const auto &condition : manifest.targets)
+    scopes.emplace_back(
+        "[target.\"" + condition.triple_pattern + "\".dependencies]",
+        &condition.dependencies);
+  return scopes;
+}
 
 int cmd_add(const ParsedArgs &args) {
   auto root = find_project_root();
@@ -902,91 +1048,223 @@ int cmd_add(const ParsedArgs &args) {
   }
 
   if (args.positional.empty()) {
-    std::println(std::cerr, "bake: add requires a URL");
-    std::println(std::cerr, "Usage: bake add <url> --tag <tag> [name]");
+    std::println(std::cerr,
+                 "bake: add requires a URL\n"
+                 "Usage: bake add <url> [--tag <t> | --branch <b> | --rev <r>] "
+                 "[name] [--target <glob>]");
     return 1;
   }
 
   std::string url = args.positional[0];
+  // A local path is normalized to a file:// URL so the manifest always
+  // holds one dependency form.
+  if (!url.contains("://")) {
+    if (url.starts_with('/'))
+      url = "file://" + url;
+    else if (url.starts_with("./") || url.starts_with("../")) {
+      std::error_code error;
+      auto absolute = std::filesystem::absolute(url, error);
+      if (!error) url = "file://" + absolute.generic_string();
+    }
+  }
   std::string tag = args.get_option("tag").value_or("");
+  std::string branch = args.get_option("branch").value_or("");
+  std::string rev = args.get_option("rev").value_or("");
+  std::string target_glob = args.get_option("target").value_or("");
   std::string name;
+
+  const bool archive = is_archive_url(url);
+  const int ref_count =
+      !tag.empty() + !branch.empty() + !rev.empty();
+
+  if (ref_count > 1) {
+    std::println(std::cerr,
+                 "bake: --tag, --branch and --rev are mutually exclusive");
+    return 1;
+  }
+  if (archive && ref_count > 0) {
+    std::println(std::cerr,
+                 "bake: archive dependencies take no ref (the URL pins the "
+                 "content)");
+    return 1;
+  }
+
+  if (!target_glob.empty() && !valid_target_pattern(target_glob)) {
+    std::println(std::cerr,
+                 "bake: invalid target pattern '{}': '*' must match a whole "
+                 "segment",
+                 target_glob);
+    return 1;
+  }
 
   // Derive name from URL or use second positional
   if (args.positional.size() >= 2) {
     name = args.positional[1];
+  } else if (archive) {
+    std::string file = url.substr(url.find_last_of('/') + 1);
+    std::string ext = archive_extension(file);
+    name = file.substr(0, file.size() - ext.size());
   } else {
-    // Extract repo name from URL
-    // e.g., https://github.com/fmtlib/fmt → fmt
     std::size_t last_slash = url.find_last_of('/');
-    if (last_slash != std::string::npos) {
-      name = url.substr(last_slash + 1);
-      // Remove .git suffix
-      if (ends_with(name, ".git")) {
-        name = name.substr(0, name.size() - 4);
-      }
-    } else {
-      name = "dep";
-    }
+    name = (last_slash != std::string::npos) ? url.substr(last_slash + 1)
+                                             : "dep";
+    if (ends_with(name, ".git")) name = name.substr(0, name.size() - 4);
   }
 
-  if (tag.empty()) {
-    std::println(std::cerr, "bake: add requires --tag <tag>");
+  auto manifest = Manifest::load(*root);
+  if (!manifest) {
+    std::println(std::cerr, "bake: failed to load bake.toml");
     return 1;
   }
 
-  // Read current bake.toml
+  const std::string section = target_glob.empty()
+                                  ? "[dependencies]"
+                                  : "[target.\"" + target_glob + "\".dependencies]";
+
+  // OverwriteIfExplicit: an identical existing entry is skipped with a hint;
+  // a different definition under the same alias is replaced.
+  for (auto &[label, scope] : dependency_scopes(*manifest)) {
+    auto existing = scope->find(name);
+    if (existing == scope->end()) continue;
+    const Dependency &dep = existing->second;
+    if (dep.url == url && dep.tag == tag && dep.branch == branch &&
+        dep.rev == rev) {
+      std::println("bake: '{}' is already a dependency (in {}); run 'bake "
+                   "update' to re-resolve",
+                   name, label);
+      return 0;
+    }
+    if (!remove_dependency_line(*root / "bake.toml", label, name)) {
+      std::println(std::cerr, "bake: failed to replace '{}' in {}", name,
+                   label);
+      return 1;
+    }
+    std::println("bake: replaced dependency '{}' in {}", name, label);
+    break;
+  }
+
+  std::string dep_line = name + " = { url = \"" + url + "\"";
+  if (!tag.empty()) dep_line += ", tag = \"" + tag + "\"";
+  if (!branch.empty()) dep_line += ", branch = \"" + branch + "\"";
+  if (!rev.empty()) dep_line += ", rev = \"" + rev + "\"";
+  dep_line += " }\n";
+
   Path toml_path = *root / "bake.toml";
-  auto content = read_file(toml_path);
-  if (!content) {
-    std::println(std::cerr, "bake: cannot read bake.toml");
-    return 1;
-  }
-
-  // Check for duplicate dependency name by parsing the TOML properly.
-  // This handles both "name = { ... }" (compact) and "name = {url=...}" forms.
-  {
-    try {
-      auto tbl = toml::parse_file(toml_path.string());
-      if (auto *deps = tbl["dependencies"].as_table()) {
-        if (deps->contains(name)) {
-          std::println(std::cerr,
-                       "bake: dependency '{}' already exists in bake.toml",
-                       name);
-          return 1;
-        }
-      }
-    } catch (...) {
-      // If TOML parsing fails, fall through — the write will still work
-    }
-  }
-
-  // Append dependency to [dependencies] section
-  std::string dep_line =
-      name + " = { url = \"" + url + "\", tag = \"" + tag + "\" }\n";
-
-  // Check if [dependencies] section exists
-  if (contains(*content, "[dependencies]")) {
-    // Insert after the [dependencies] line
-    std::size_t pos = content->find("[dependencies]");
-    pos = content->find('\n', pos);
-    if (pos == std::string::npos)
-      pos = content->size();
-    content->insert(pos + 1, dep_line);
-  } else {
-    // Add new [dependencies] section at end
-    if (!content->empty() && content->back() != '\n')
-      *content += "\n";
-    *content += "\n[dependencies]\n" + dep_line;
-  }
-
-  if (!write_file(toml_path, *content)) {
+  if (!insert_dependency_line(toml_path, section, dep_line)) {
     std::println(std::cerr, "bake: failed to write bake.toml");
     return 1;
   }
 
-  std::println("Added dependency '{}' = {{ url = \"{}\", tag = \"{}\" }}", name,
-               url, tag);
+  if (!target_glob.empty())
+    std::println("Added dependency '{}' to {} ({} ref)", name, section,
+                 archive ? "archive" : ref_count == 0 ? "default-branch"
+                                                      : "pinned");
+  else
+    std::println("Added dependency '{}' to [dependencies] ({} ref)", name,
+                 archive ? "archive" : ref_count == 0 ? "default-branch"
+                                                      : "pinned");
   std::println("Run 'bake build' to resolve and download.");
+  return 0;
+}
+
+int cmd_remove(const ParsedArgs &args) {
+  auto root = find_project_root();
+  if (!root) {
+    std::println(std::cerr, "bake: no bake.toml found");
+    return 1;
+  }
+
+  if (args.positional.empty()) {
+    std::println(std::cerr,
+                 "bake: remove requires a dependency name\n"
+                 "Usage: bake remove <name> [--target <glob>]");
+    return 1;
+  }
+
+  std::string alias = args.positional[0];
+  std::string target_glob = args.get_option("target").value_or("");
+  if (!target_glob.empty() && !valid_target_pattern(target_glob)) {
+    std::println(std::cerr,
+                 "bake: invalid target pattern '{}': '*' must match a whole "
+                 "segment",
+                 target_glob);
+    return 1;
+  }
+
+  auto manifest = Manifest::load(*root);
+  if (!manifest) {
+    std::println(std::cerr, "bake: failed to load bake.toml");
+    return 1;
+  }
+
+  // Resolve the scope to remove from.
+  auto scopes = dependency_scopes(*manifest);
+  std::string section;
+  if (!target_glob.empty()) {
+    section = "[target.\"" + target_glob + "\".dependencies]";
+    bool found = false;
+    for (auto &[label, scope] : scopes)
+      if (label == section && scope->contains(alias)) found = true;
+    if (!found) {
+      std::string where;
+      for (auto &[label, scope] : scopes)
+        if (scope->contains(alias)) where += "\n  " + label;
+      if (where.empty())
+        std::println(std::cerr, "bake: no dependency '{}' in {}", alias,
+                     section);
+      else
+        std::println(std::cerr,
+                     "bake: '{}' is not declared in {} — it exists in:{}",
+                     alias, section, where);
+      return 1;
+    }
+  } else {
+    std::vector<std::string> hits;
+    for (auto &[label, scope] : scopes)
+      if (scope->contains(alias)) hits.push_back(label);
+    if (hits.empty()) {
+      std::println(std::cerr, "bake: no dependency '{}' in bake.toml", alias);
+      return 1;
+    }
+    if (hits.size() > 1) {
+      std::string where;
+      for (auto &label : hits) where += "\n  " + label;
+      std::println(std::cerr,
+                   "bake: '{}' is declared in multiple scopes — pick one "
+                   "with --target:{}",
+                   alias, where);
+      return 1;
+    }
+    section = hits.front();
+  }
+
+  Path toml_path = *root / "bake.toml";
+  if (!remove_dependency_line(toml_path, section, alias)) {
+    std::println(std::cerr, "bake: failed to remove '{}' from {}", alias,
+                 section);
+    return 1;
+  }
+  std::println("Removed dependency '{}' from {}", alias, section);
+
+  // Prune lock entries no longer referenced by any scope. Zero network;
+  // the content cache is never touched.
+  Path lock_path = *root / "bake.lock";
+  if (auto lock = Lockfile::load(lock_path)) {
+    auto updated = Manifest::load(*root);
+    if (updated) {
+      Lockfile pruned = prune_lock(*updated, *lock);
+      if (pruned.deps.size() != lock->deps.size()) {
+        if (pruned.save(lock_path)) {
+          std::println("Pruned {} lock {}",
+                       lock->deps.size() - pruned.deps.size(),
+                       lock->deps.size() - pruned.deps.size() == 1
+                           ? "entry"
+                           : "entries");
+        }
+      }
+    }
+  }
+
   return 0;
 }
 
@@ -1005,23 +1283,37 @@ int cmd_update(const ParsedArgs &args) {
     return 1;
   }
 
-  if (manifest->dependencies.empty()) {
+
+  bool has_any_dep = !manifest->dependencies.empty();
+  for (const auto &condition : manifest->targets)
+    has_any_dep = has_any_dep || !condition.dependencies.empty();
+  if (!has_any_dep) {
     std::println("bake: no dependencies to update");
     return 0;
   }
 
-  // Determine which dep to update (empty = all)
+  // Determine which dep to update (empty = all), searching every scope.
   std::string filter_dep;
+  const Dependency *filter = nullptr;
   if (!args.positional.empty()) {
     filter_dep = args.positional[0];
-    if (manifest->dependencies.find(filter_dep) ==
-        manifest->dependencies.end()) {
+    auto find_scope =
+        [&](const std::map<std::string, Dependency> &deps)
+            -> const Dependency * {
+      auto it = deps.find(filter_dep);
+      return it == deps.end() ? nullptr : &it->second;
+    };
+    filter = find_scope(manifest->dependencies);
+    for (const auto &condition : manifest->targets) {
+      if (filter) break;
+      filter = find_scope(condition.dependencies);
+    }
+    if (!filter) {
       std::println(std::cerr, "bake: dependency '{}' not found in bake.toml",
                    filter_dep);
       return 1;
     }
-    auto &dep = manifest->dependencies[filter_dep];
-    if (dep.is_path_dep) {
+    if (filter->is_path_dep) {
       std::println(std::cerr,
                    "bake: '{}' is a path dependency (no resolution needed)",
                    filter_dep);
@@ -1034,44 +1326,72 @@ int cmd_update(const ParsedArgs &args) {
   // Load existing lock for comparison
   auto old_lock = Lockfile::load(lock_path);
 
-  // Full re-resolve: the lock is flat, so we always resolve the full closure.
+  // Hints: with a filter, carry every locked entry except the filtered
+  // dependency's URL (forced re-resolution); without a filter, re-resolve
+  // the full closure — the only path that moves locked refs.
+  std::optional<Lockfile> hints;
+  if (filter && old_lock) {
+    hints = *old_lock;
+    const std::string forced_url = normalize_dependency_url(filter->url);
+    std::erase_if(hints->deps, [&](const auto &pair) {
+      return normalize_dependency_url(pair.second.url) == forced_url;
+    });
+  }
+
   Resolver resolver;
-  auto new_lock = resolver.resolve(*manifest, ResolverConfig{});
+  auto new_lock = resolver.resolve(
+      *manifest, ResolverConfig{}, hints ? &*hints : nullptr);
   if (!new_lock) {
     std::println(std::cerr, "bake: failed to resolve dependencies");
     return 1;
   }
 
   // Report changes for the filtered dep (or all if no filter)
-  auto report_change = [&](const std::string &name) {
-    // Find old and new lock entries by URL+ref match
-    const auto &dep = manifest->dependencies.at(name);
-    const LockDep *old_entry =
-        old_lock ? old_lock->find_remote(dep.url, dep.tag) : nullptr;
-    const LockDep *new_entry = new_lock->find_remote(dep.url, dep.tag);
+  auto find_entry = [&](const Lockfile *lock,
+                        const Dependency &dep) -> const LockDep * {
+    if (!lock) return nullptr;
+    std::string ref_type = dep.is_archive() ? "archive" : "";
+    std::string ref;
+    if (ref_type.empty()) {
+      auto pair = dep.git_ref();
+      ref_type = pair.first;
+      ref = pair.second;
+    }
+    return lock->find_remote(dep.url, ref_type, ref);
+  };
+  auto report_change = [&](const std::string &name,
+                           const Dependency &dep) {
+    const LockDep *old_entry = find_entry(old_lock ? &*old_lock : nullptr, dep);
+    const LockDep *new_entry = find_entry(&*new_lock, dep);
 
     if (!old_entry && new_entry) {
       std::println("bake: {} added", name);
     } else if (old_entry && new_entry) {
-      if (old_entry->commit != new_entry->commit) {
+      const std::string &old_id = old_entry->commit.empty()
+                                      ? old_entry->integrity
+                                      : old_entry->commit;
+      const std::string &new_id = new_entry->commit.empty()
+                                      ? new_entry->integrity
+                                      : new_entry->commit;
+      if (old_id != new_id) {
         std::println("bake: {} updated: {} → {}", name,
-                     old_entry->commit.substr(0, 12),
-                     new_entry->commit.substr(0, 12));
+                     old_id.substr(0, 12), new_id.substr(0, 12));
       } else {
-        std::println("bake: {} unchanged ({})", name,
-                     new_entry->commit.substr(0, 12));
+        std::println("bake: {} unchanged ({})", name, new_id.substr(0, 12));
       }
     }
   };
 
   if (filter_dep.empty()) {
     for (auto &[name, dep] : manifest->dependencies) {
-      if (dep.is_path_dep)
-        continue;
-      report_change(name);
+      if (dep.is_path_dep) continue;
+      report_change(name, dep);
     }
+    for (const auto &condition : manifest->targets)
+      for (auto &[name, dep] : condition.dependencies)
+        if (!dep.is_path_dep) report_change(name, dep);
   } else {
-    report_change(filter_dep);
+    report_change(filter_dep, *filter);
   }
 
   if (!new_lock->save(lock_path)) {
@@ -1115,9 +1435,9 @@ int cmd_test(const ParsedArgs &args) {
   BuildSelection selection;
   selection.workspace_member = std::move(*selected_member);
   ResolvePolicy policy;
-  policy.locked = args.has_option("locked") || args.has_option("frozen");
   policy.offline = args.has_option("offline") || args.has_option("frozen");
-  auto outer_graph = resolve_moid_graph(*manifest, selection, policy);
+  auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
+                          build_source_index(*root));
   if (!outer_graph) {
     std::println(std::cerr, "bake: {}", outer_graph.error());
     return 1;
@@ -1129,6 +1449,7 @@ int cmd_test(const ParsedArgs &args) {
     target = parse_target(*t);
   else if (auto t = args.get_option("t"))
     target = parse_target(*t);
+  selection.target_triple = selection_triple(target);
   std::string triple_dir =
       target.is_native() ? detect_host_target().triple_ : target.triple_;
   const Path out_dir = *root / "out" / triple_dir;
@@ -1249,6 +1570,8 @@ int run(int argc, char *argv[]) {
     return cmd_build(args);
   if (args.command == "add")
     return cmd_add(args);
+  if (args.command == "remove")
+    return cmd_remove(args);
   if (args.command == "update")
     return cmd_update(args);
   if (args.command == "run")
