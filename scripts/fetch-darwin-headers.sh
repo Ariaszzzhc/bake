@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # fetch-darwin-headers.sh — Extract macOS C library headers + libSystem.tbd
-# from the locally installed SDK into lib/bake/.
+# from the locally installed SDK into lib/.
 #
-# Vendor a curated set of Darwin headers so
-# bake can compile C/C++ without requiring the system SDK at compile time.
+# Vendor a curated set of Darwin headers so bake can compile C/C++ without
+# requiring the system SDK at compile time.
 #
-# Headers are Apple's, redistributed unmodified under APSL-2.0 / OS Reference License.
+# Licensing: everything vendored here is open source — Darwin (APSL-2.0)
+# headers plus third-party OSS (Apache, BSD, MIT, ICU, ...). Interface
+# headers of Apple's closed frameworks (AppleArchive, EndpointSecurity,
+# Spatial, Hypervisor, ...) have no open-source counterpart and must stay
+# excluded.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DEST="$ROOT/lib/bake/libc/darwin"
+DEST="$ROOT/lib/libc/darwin"
 
 # Locate the SDK
 SDK="${SDKROOT:-$(xcrun --show-sdk-path 2>/dev/null || true)}"
@@ -18,6 +22,8 @@ if [[ -z "$SDK" || ! -d "$SDK/usr/include" ]]; then
   exit 1
 fi
 
+command -v rsync >/dev/null 2>&1 || { echo "error: rsync is required" >&2; exit 1; }
+
 echo "==> SDK: $SDK"
 echo "==> Destination: $DEST"
 
@@ -25,19 +31,15 @@ echo "==> Destination: $DEST"
 rm -rf "$DEST"
 mkdir -p "$DEST/include" "$DEST"
 
-# 1. Copy /usr/include/* excluding the c++ directory (we build our own libc++ headers).
-echo "==> Copying C library headers (excluding c++/)..."
-# Use rsync to preserve the directory tree; exclude c++/ since we vendor our own.
-if command -v rsync &>/dev/null; then
-  rsync -a --exclude='c++/' "$SDK/usr/include/" "$DEST/include/"
-else
-  # Fallback: cp without c++/
-  (cd "$SDK/usr/include" && find . -not -path './c++/*' -name '*.h' -o -name '*.modulemap' | \
-    while read -r f; do
-      mkdir -p "$DEST/include/$(dirname "$f")"
-      cp "$SDK/usr/include/$f" "$DEST/include/$f"
-    done)
-fi
+# 1. Copy /usr/include/* excluding:
+#    - c++/ (bake builds its own libc++ headers)
+#    - closed Apple framework interfaces with no open-source counterpart
+CLOSED_FW=(AppleArchive AppleEXR.h AppleTextureEncoder.h EndpointSecurity \
+           Spatial SystemHealthClient.h SystemHealthManager.h networkext \
+           odmodule hvf libmanagedconfigurationfiles.h xcselect.h arm64/hv)
+RSYNC_ARGS=(-a --exclude='c++/')
+for p in "${CLOSED_FW[@]}"; do RSYNC_ARGS+=(--exclude="$p"); done
+rsync "${RSYNC_ARGS[@]}" "$SDK/usr/include/" "$DEST/include/"
 
 HEADER_COUNT=$(find "$DEST/include" -name '*.h' | wc -l | tr -d ' ')
 echo "    Copied $HEADER_COUNT headers"
