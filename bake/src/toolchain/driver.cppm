@@ -529,19 +529,9 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     //     -lmingw32) since we inject libmingw32.a directly. Also skip
     //     -lmsvcrt since we inject api-ms-win-crt-* import libs.
     //
-    // For mingw: generate import libraries on-demand for -l<name> flags.
-    // Only libraries that are referenced are generated.
-    if (is_mingw) {
-      for (const char *Arg : Cmd->getArguments()) {
-        if (!Arg) continue;
-        StringRef A(Arg);
-        if (A.starts_with("-l")) {
-          std::string name(A.substr(2));
-          if (!name.empty())
-            bake::ensure_mingw_import_lib(target, name);
-        }
-      }
-    }
+    // For mingw, -l<name> for system libraries resolves to import
+    // libraries bake generates on demand (see the LinkArgs filter below);
+    // only libraries actually referenced are generated.
 
     // Known glibc library names whose -l references are replaced by the
     // synthesized stub set (stub files are lib<name>.so.<sover> — plain
@@ -577,6 +567,8 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
     bool skip_next_dynamic_linker = false;
     int skip_platform_values = 0;  // remaining -platform_version values
     bool bake_owns_platform_version = is_darwin;
+    // Stable storage: LldArgs holds raw pointers into these strings.
+    std::vector<std::string> mingw_import_libs;
     for (const char *Arg : LinkArgs) {
       if (is_darwin && IsCxx && Arg && StringRef(Arg) == "-lc++")
         continue;
@@ -639,6 +631,19 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
             A == "-ladvapi32" || A == "-lkernel32" || A == "-luser32" ||
             A == "-lshell32" || A == "-lntdll")
           continue;
+        // Other -l<name>: bake generates the import library on demand.
+        // It lands in the toolchain cache where LLD never searches, so
+        // rewrite the flag to the .lib's full path.
+        if (A.starts_with("-l") && A.size() > 2) {
+          bake::Path lib =
+              bake::ensure_mingw_import_lib(target, A.substr(2).str());
+          if (!lib.string().empty()) {
+            mingw_import_libs.push_back(lib.string());
+            LldArgs.push_back(mingw_import_libs.back().c_str());
+            continue;
+          }
+          // No .def for this name: pass through and let LLD diagnose.
+        }
         // GCC CRT startup files — not needed with Clang/LLD (uses crt2.o).
         if (A == "crtbegin.o" || A == "crtend.o" ||
             A == "crtbeginS.o" || A == "crtendS.o")

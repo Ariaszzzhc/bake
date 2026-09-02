@@ -2417,46 +2417,70 @@ export Path ensure_mingw_import_lib(const TargetSpec& target,
         def_file = mingw_src / "lib-common" / (lib_name + ".def");
     if (!def_file.is_regular_file()) return Path();
 
-    // Filter F_* arch directives that LLD can't parse.
+    // lib-common defs carry i386 stdcall decorations (`WSAStartup@8`) and
+    // F_* arch-conditional lines. dlltool strips the decoration for
+    // non-i386 machines when building import libraries; lld-link does
+    // not, so the filter does both jobs here.
     Path use_def = def_file;
     {
         std::ifstream in(def_file.string());
         std::string content((std::istreambuf_iterator<char>(in)),
                              std::istreambuf_iterator<char>());
-        if (content.find("F_") != std::string::npos) {
-            std::string keep_prefix;
-            if (machine == "X64")        keep_prefix = "F_X64(";
-            else if (machine == "ARM64") keep_prefix = "F_ARM64(";
-            else                         keep_prefix = "F_I386(";
+        std::string keep_prefix;
+        if (machine == "X64")        keep_prefix = "F_X64(";
+        else if (machine == "ARM64") keep_prefix = "F_ARM64(";
+        else                         keep_prefix = "F_I386(";
+        const bool strip_stdcall = machine != "X86";
 
-            std::string filtered;
-            filtered.reserve(content.size());
-            std::size_t pos = 0;
-            while (pos < content.size()) {
-                std::size_t eol = content.find('\n', pos);
-                if (eol == std::string::npos) eol = content.size();
-                std::string_view line(content.data() + pos, eol - pos);
+        // Drop a trailing `@<digits>` from the export name (first token).
+        auto undecorate = [&](std::string& line) {
+            if (!strip_stdcall) return;
+            std::size_t end = line.find_first_of(" \t");
+            if (end == std::string::npos) end = line.size();
+            std::size_t at = line.rfind('@', end);
+            std::size_t nondig =
+                line.find_first_not_of("0123456789", at + 1);
+            bool digits_to_token_end =
+                nondig == std::string::npos ? end == line.size()
+                                            : nondig == end;
+            if (digits_to_token_end)
+                line.erase(at, end - at);
+        };
 
-                if (line.starts_with("F_")) {
-                    bool keep = false;
-                    if (line.starts_with(keep_prefix)) keep = true;
-                    else if (line.starts_with("F_NON_I386(") &&
-                             machine != "X86") keep = true;
-                    if (keep) {
-                        std::size_t s = line.find('(');
-                        std::size_t e = line.find(')', s);
-                        if (s != std::string_view::npos &&
-                            e != std::string_view::npos)
-                            filtered += std::string(line.substr(s + 1, e - s - 1));
-                        filtered += '\n';
+        std::string filtered;
+        filtered.reserve(content.size());
+        std::size_t pos = 0;
+        while (pos < content.size()) {
+            std::size_t eol = content.find('\n', pos);
+            if (eol == std::string::npos) eol = content.size();
+            std::string_view line(content.data() + pos, eol - pos);
+
+            if (line.starts_with("F_")) {
+                bool keep = false;
+                if (line.starts_with(keep_prefix)) keep = true;
+                else if (line.starts_with("F_NON_I386(") &&
+                         machine != "X86") keep = true;
+                if (keep) {
+                    std::size_t s = line.find('(');
+                    std::size_t e = line.find(')', s);
+                    if (s != std::string_view::npos &&
+                        e != std::string_view::npos) {
+                        std::string inner(line.substr(s + 1, e - s - 1));
+                        undecorate(inner);
+                        filtered += inner;
                     }
-                } else {
-                    filtered += std::string(line);
                     filtered += '\n';
                 }
-                pos = eol + 1;
+            } else {
+                std::string plain(line);
+                undecorate(plain);
+                filtered += plain;
+                filtered += '\n';
             }
+            pos = eol + 1;
+        }
 
+        if (filtered != content) {
             use_def = import_dir / (lib_name + ".filtered.def");
             write_file(use_def, filtered);
         }
