@@ -44,13 +44,17 @@ jobs:
             external/llvm-install
             external/zlib-install
             external/zstd-install
-          key: host-llvm-${{ env.LLVM_SHA }}-${{ hashFiles('scripts/build-llvm.sh') }}
+          key: host-llvm-${{ env.LLVM_SHA }}-clang22-libcpp-${{ hashFiles('scripts/build-llvm.sh') }}
 
-      - name: Install build tools
+      - name: Install Clang 22 + build tools
         if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build g++
+          sudo apt-get install -y ninja-build wget
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 22
+          sudo apt-get install -y libc++-22-dev libc++abi-22-dev
           python3 -m pip install --user --break-system-packages "cmake>=3.30"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
@@ -58,8 +62,15 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: git submodule update --init --recursive --depth 1
 
-      - name: Build host LLVM/Clang/LLD
+      # The host LLVM archives must be libc++ ABI — stage 0 links bake with
+      # clang-22 -stdlib=libc++. The runner default (g++) produces libstdc++
+      # archives that fail the final link with std::__cxx11 undefined refs.
+      - name: Build host LLVM/Clang/LLD (clang-22 + libc++)
         if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          CC: clang-22
+          CXX: clang++-22
+          CXXFLAGS: -stdlib=libc++
         run: scripts/build-llvm.sh
 
   package:
@@ -90,7 +101,7 @@ jobs:
             external/llvm-install
             external/zlib-install
             external/zstd-install
-          key: host-llvm-${{ env.LLVM_SHA }}-${{ hashFiles('scripts/build-llvm.sh') }}
+          key: host-llvm-${{ env.LLVM_SHA }}-clang22-libcpp-${{ hashFiles('scripts/build-llvm.sh') }}
           fail-on-cache-miss: true
 
       - name: Install Clang 22 + build tools
