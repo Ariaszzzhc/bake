@@ -781,26 +781,25 @@ static void inject_vendored_headers(
     StringRef target_triple, bool IsCxx) {
   const std::string lib = bake::find_lib_dir().string();
 
-  bool is_musl = target_triple.contains("linux") &&
-                 target_triple.contains("musl");
+  // Family from bake's own target model, not string sniffing: an absent
+  // -target is a native compile whose family comes from bake's host
+  // detection (a libc++-built bake resolves native linux to musl — that
+  // path must get the vendored musl header chain, never the system's).
+  bake::TargetSpec ts = target_triple.empty()
+      ? bake::detect_host_target()
+      : bake::parse_target(target_triple);
 
-  bool is_mingw = target_triple.contains("windows") &&
-                  target_triple.contains("gnu");
-
-  bake::TargetSpec host = bake::detect_host_target();
-  bool is_darwin = !target_triple.empty()
-      ? (target_triple.contains("darwin") ||
-         target_triple.contains("apple") ||
-         target_triple.contains("macos"))
-      : host.is_darwin();
+  bool is_musl = ts.is_linux_musl();
+  bool is_mingw = ts.is_windows_gnu();
+  bool is_darwin = ts.is_darwin();
 
   if (is_musl) {
     Args.push_back(Saver.save("-nostdinc").data());
     if (IsCxx)
       Args.push_back(Saver.save("-nostdinc++").data());
 
-    StringRef arch = target_triple.split('-').first;
-    std::string arch_os_dir = (arch == "x86_64") ? "x86" : arch.str();
+    std::string arch = ts.arch();
+    std::string arch_os_dir = (arch == "x86_64") ? "x86" : arch;
 
     auto add = [&](const std::string &path) {
       Args.push_back(Saver.save("-isystem").data());
@@ -814,7 +813,7 @@ static void inject_vendored_headers(
     }
     if (!lib.empty()) {
       add(lib + "/include");
-      add(lib + "/libc/include/" + target_triple.str());
+      add(lib + "/libc/include/" + ts.triple_);
       add(lib + "/libc/include/generic-musl");
       add(lib + "/libc/include/" + arch_os_dir + "-linux-any");
       add(lib + "/libc/include/any-linux-any");

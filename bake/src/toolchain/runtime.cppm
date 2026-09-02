@@ -1029,8 +1029,10 @@ export MuslObjects ensure_musl_objects(const TargetSpec& target) {
         std::vector<std::string> flags;
         flags.push_back(bake_exe_path());
         flags.push_back("cc");
-        flags.push_back("-target");
-        flags.push_back(target.triple());
+        if (!target.is_native()) {
+            flags.push_back("-target");
+            flags.push_back(target.triple());
+        }
         flags.push_back("-c");
         flags.push_back("-std=c99");
         flags.push_back("-ffreestanding");
@@ -1665,8 +1667,10 @@ export Path ensure_sanitizer_objects(const TargetSpec& target, SanitizerKind kin
         std::vector<std::string> flags;
         flags.push_back(bake_exe_path());
         flags.push_back("c++");
-        flags.push_back("-target");
-        flags.push_back(target.triple_with_version());
+        if (!target.is_native()) {
+            flags.push_back("-target");
+            flags.push_back(target.triple_with_version());
+        }
         flags.push_back("-c");
         flags.push_back("-std=c++17");
         flags.push_back("-nostdinc++");
@@ -2118,8 +2122,10 @@ export MingwObjects ensure_mingw_objects(const TargetSpec& target) {
         std::vector<std::string> flags;
         flags.push_back(bake_exe_path());
         flags.push_back("cc");
-        flags.push_back("-target");
-        flags.push_back(target.triple());
+        if (!target.is_native()) {
+            flags.push_back("-target");
+            flags.push_back(target.triple());
+        }
         flags.push_back("-c");
         flags.push_back("-std=gnu11");
         flags.push_back("-D__USE_MINGW_ANSI_STDIO=0");
@@ -2370,8 +2376,10 @@ export Path ensure_mingw_import_lib(const TargetSpec& target,
         std::vector<std::string> flags;
         flags.push_back(bake_exe_path());
         flags.push_back("cc");
-        flags.push_back("-target");
-        flags.push_back(target.triple());
+        if (!target.is_native()) {
+            flags.push_back("-target");
+            flags.push_back(target.triple());
+        }
         flags.push_back("-c");
         flags.push_back("-std=gnu11");
         flags.push_back("-D__USE_MINGW_ANSI_STDIO=0");
@@ -2677,8 +2685,10 @@ export GlibcObjects ensure_glibc_objects(const TargetSpec& target, LinkMode) {
     std::vector<std::string> base;
     base.push_back(bake_exe_path());
     base.push_back("cc");
-    base.push_back("-target");
-    base.push_back(target.triple());
+    if (!target.is_native()) {
+        base.push_back("-target");
+        base.push_back(target.triple());
+    }
     base.push_back("-c");
     base.push_back("-w");
     base.push_back("-fPIC");  // exes may be PIE (clang default) — crt must be PIC
