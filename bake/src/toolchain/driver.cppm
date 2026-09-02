@@ -622,6 +622,19 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
           break;
         }
       }
+      if (is_darwin && Arg) {
+        StringRef A(Arg);
+        // Unix library names that live in libSystem on darwin — drop the
+        // -l reference. The vendored darwin link face ships libSystem.tbd
+        // only; these arrive from cmake probes run on a non-darwin host
+        // (cross builds) and have no standalone .tbd to resolve to.
+        if (A.size() > 2 && A.starts_with("-l")) {
+          StringRef n = A.substr(2);
+          if (n == "m" || n == "rt" || n == "pthread" || n == "dl" ||
+              n == "resolv" || n == "util")
+            continue;
+        }
+      }
       if (is_mingw && Arg) {
         StringRef A(Arg);
         // GCC-specific libs not needed with Clang/LLD.
