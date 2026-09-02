@@ -135,6 +135,10 @@ which checks that builds really are self-contained.
 To cross-compile bake itself: `./bootstrap/build x86_64-linux-musl` — it
 rebuilds LLVM for the target with bake's own compiler first.
 
+To package a distributable archive (release binary + vendored runtime,
+zig-style, unpack and go): `./bootstrap/package x86_64-linux-musl` —
+output lands in `dist/`.
+
 ```
 bake init [name]     scaffold a project
 bake build           build it (incremental, parallel)

@@ -48,6 +48,21 @@ bake audit
 
 Plain `bake build -t <triple>` links the host-built LLVM archives; it only works with `BAKE_LLVM_DIR` pointing at a target LLVM install — which `bootstrap/build` arranges.
 
+## Packaging a distribution
+
+`bootstrap/package` builds bake for a target (release profile) and packs a
+self-contained archive in the zig layout — the binary plus everything it
+needs at runtime:
+
+```bash
+./bootstrap/package x86_64-linux-musl
+```
+
+The result lands in `dist/` as `bake-<arch>-<os>-<version>+<git>.tar.gz`
+(`.zip` for windows). Unpack it anywhere and put it on your `PATH`: the
+binary locates its `lib/` directory relative to itself, so the unpacked
+tree is fully relocatable.
+
 ## Updating
 
 bake vendors its runtime (libc++, compiler-rt, …). Scripts under `scripts/` (`update-runtime.sh`, `fetch-musl.sh`, `fetch-mingw.sh`, …) refresh those sources; rebuild afterwards.

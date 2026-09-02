@@ -1,0 +1,93 @@
+#!/bin/bash
+# bootstrap/package — package bake for distribution.
+#
+# Usage: ./bootstrap/package <target>
+#   target:  aarch64-apple-darwin | x86_64-linux-musl | x86_64-windows-gnu | ...
+#            (anything bootstrap/build accepts; native targets work too)
+#
+# Builds bake for the target (release profile, bootstrapped via
+# bootstrap/build) and assembles a self-contained, relocatable archive —
+# the zig distribution layout:
+#
+#   bake-<arch>-<os>-<version>+<git>/
+#   ├── bake            the toolchain binary
+#   ├── lib/            vendored runtime: libc++, libc sources, headers, …
+#   ├── docs/           the usage book
+#   ├── LICENSE
+#   └── README.md
+#
+# The binary resolves lib/ relative to itself, so the unpacked directory
+# works anywhere. Output lands in dist/ as .tar.gz (.zip for windows).
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+TARGET="${1:?usage: ./bootstrap/package <target>}"
+
+# ── Package identity ──
+VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' bake/bake.toml)"
+case "$VERSION" in
+    ""|*[!0-9.]*) echo "error: bad version in bake/bake.toml: '$VERSION'" >&2; exit 1 ;;
+esac
+GIT_REV="$(git rev-parse --short HEAD)"
+ARCH="${TARGET%%-*}"
+case "$TARGET" in
+    *-apple-darwin)  OS="macos" ;;       # user-facing platform name
+    *-linux-musl)    OS="linux-musl" ;;
+    *-linux-gnu*)    OS="linux-gnu" ;;
+    *-windows-gnu)   OS="windows" ;;
+    *)               OS="${TARGET#*-}" ;;
+esac
+PKG="bake-$ARCH-$OS-$VERSION+$GIT_REV"
+if [ "$OS" = "windows" ]; then EXE=".exe"; else EXE=""; fi
+
+# ── Build (release) ──
+BAKE_PROFILE=release ./bootstrap/build "$TARGET"
+BIN="out/$TARGET/bin/bake$EXE"
+[ -f "$BIN" ] || { echo "error: $BIN missing after build" >&2; exit 1; }
+
+# ── Stage ──
+STAGE="dist/$PKG"
+rm -rf "$STAGE"
+mkdir -p "$STAGE"
+
+cp "$BIN" "$STAGE/bake$EXE"
+# Everything under lib/ is load-bearing for some target family — bake
+# cross-compiles to all four libc families from any host.
+cp -R lib "$STAGE/lib"
+# Vendored trees pick up Finder droppings on macOS.
+find "$STAGE" -name .DS_Store -delete
+
+cp LICENSE README.md README.zh.md "$STAGE/"
+cp -R docs "$STAGE/docs"
+
+# ── Smoke: the staged binary must work where it was staged ──
+if "$STAGE/bake$EXE" --version >/dev/null 2>&1; then
+    echo "smoke: $("$STAGE/bake$EXE" --version)"
+else
+    echo "note: $TARGET not runnable on this host — skipping smoke run"
+fi
+
+# ── Archive ──
+mkdir -p dist
+rm -f "dist/$PKG.tar.gz" "dist/$PKG.zip"
+case "$OS" in
+    windows)
+        ARTIFACT="dist/$PKG.zip"
+        if command -v zip >/dev/null 2>&1; then
+            (cd dist && zip -q -r "$PKG.zip" "$PKG")
+        else
+            (cd dist && python3 -m zipfile -c "$PKG.zip" "$PKG")
+        fi
+        ;;
+    *)
+        ARTIFACT="dist/$PKG.tar.gz"
+        tar -czf "$ARTIFACT" -C dist "$PKG"
+        ;;
+esac
+
+rm -rf "$STAGE"
+
+echo "=== $ARTIFACT ==="
+du -sh "$ARTIFACT" "$BIN"

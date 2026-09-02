@@ -48,6 +48,19 @@ bake audit
 
 直接 `bake build -t <triple>` 链接的是按宿主机构建的 LLVM 归档；只有在 `BAKE_LLVM_DIR` 指向目标平台 LLVM 安装时才能工作——`bootstrap/build` 会负责准备。
 
+## 打包分发
+
+`bootstrap/package` 会为目标平台构建 bake（release 配置），并按 zig 的布局打
+包成自包含归档——binary 加上它运行时需要的一切：
+
+```bash
+./bootstrap/package x86_64-linux-musl
+```
+
+产物位于 `dist/`，名为 `bake-<arch>-<os>-<version>+<git>.tar.gz`
+（windows 为 `.zip`）。解压到任意位置并加入 `PATH` 即可：binary 相对自身
+定位 `lib/` 目录，整个解压目录可随意搬动。
+
 ## 更新
 
 bake 内置其运行时（libc++、compiler-rt 等）。`scripts/` 下的脚本（`update-runtime.sh`、`fetch-musl.sh`、`fetch-mingw.sh` 等）可更新这些源代码；随后重新构建。

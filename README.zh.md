@@ -127,6 +127,9 @@ cmake -G Ninja -B build && cmake --build build
 交叉编译 bake 本体：`./bootstrap/build x86_64-linux-musl`——它会先用 bake
 自己的编译器为目标平台重建 LLVM。
 
+打包分发（release 二进制 + 全部 vendored 运行时，zig 式布局，解压即用）：
+`./bootstrap/package x86_64-linux-musl`——产物在 `dist/`。
+
 ## 命令
 
 ```

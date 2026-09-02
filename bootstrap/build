@@ -4,6 +4,7 @@
 # Usage: ./bootstrap/build <target> [mcpu]
 #   target:  aarch64-linux-musl | x86_64-linux-musl | aarch64-apple-darwin | ...
 #   mcpu:    baseline (default) | native | <specific cpu>
+#   env:     BAKE_PROFILE=release  build bake with --release (default dev)
 #
 # Host dependencies: CMake ≥ 3.30, Ninja, Clang with libc++ (stage 0).
 #
@@ -18,6 +19,22 @@ cd "$(git rev-parse --show-toplevel)"
 
 TARGET="${1:?usage: ./bootstrap/build <target> [mcpu]}"
 MCPU="${2:-baseline}"
+PROFILE="${BAKE_PROFILE:-dev}"
+
+# Canonical host triple as bake names it (arm64→aarch64, vendor and OS
+# version suffixes dropped): aarch64-apple-darwin, x86_64-linux-musl, …
+host_triple() {
+    local raw arch
+    raw="$("$1" cc -dumpmachine)"              # e.g. arm64-apple-darwin25.5.0
+    arch="${raw%%-*}"
+    if [ "$arch" = "arm64" ]; then arch="aarch64"; fi
+    case "$raw" in
+        *-apple-darwin*) echo "$arch-apple-darwin" ;;
+        *-linux-musl)    echo "$arch-linux-musl" ;;
+        *-linux-gnu*)    echo "$arch-linux-gnu" ;;
+        *)               echo "$raw" ;;
+    esac
+}
 
 LLVM_SRC=external/llvm-project/llvm
 PREFIX="external/llvm-install-$TARGET"
@@ -35,6 +52,12 @@ if [ ! -f build/bake ]; then
 fi
 BAKE="$(pwd)/build/bake"
 LIB="$(pwd)/lib"
+
+# Native self-host: link against the host-built LLVM install instead of a
+# per-target cross prefix.
+if [ "$TARGET" = "$(host_triple "$BAKE")" ]; then
+    PREFIX=external/llvm-install
+fi
 
 # ── Compiler wrappers ──
 for w in cc c++; do
@@ -146,8 +169,10 @@ else
 fi
 
 # ── Step 3: Cross-compile bake ──
-echo "=== Step 3: Cross-compiling bake for $TARGET ==="
-BAKE_LLVM_DIR="$PREFIX" "$BAKE" build --target="$TARGET"
+PROFILE_ARGS=()
+if [ "$PROFILE" = "release" ]; then PROFILE_ARGS=(--release); fi
+echo "=== Step 3: Cross-compiling bake for $TARGET ($PROFILE) ==="
+BAKE_LLVM_DIR="$PREFIX" "$BAKE" build --target="$TARGET" "${PROFILE_ARGS[@]}"
 
 echo "=== Done: out/$TARGET/bin/bake ==="
-file "out/$TARGET/bin/bake"
+file out/$TARGET/bin/bake*
