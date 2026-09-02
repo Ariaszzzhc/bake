@@ -1,0 +1,154 @@
+# package — build distributable bake archives (manual trigger).
+#
+# Runs entirely on Linux runners: bake cross-compiles to every libc family
+# from any host, so one environment produces the macos, linux, and windows
+# packages.
+#
+#   host-llvm   builds the stage-0 prerequisite (vendored zlib/zstd +
+#               LLVM/Clang/LLD host install) once, cached by LLVM submodule
+#               pin, shared by all package jobs.
+#   package     matrix over targets: stage 0 → bootstrap/package <target>.
+#               The per-target cross LLVM install is built on first run and
+#               cached afterwards (keyed on the LLVM pin + bootstrap/build).
+#
+# First run: ~2h host LLVM + ~1.5h cross LLVM per target (parallel).
+# Cached runs: ~10 min per job.
+#
+# macOS package target is aarch64 (Apple Silicon), linux is x86_64 musl
+# (static, runs on any distro), windows is x86_64.
+
+name: package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  host-llvm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute LLVM submodule pin
+        run: |
+          echo "LLVM_SHA=$(git ls-tree HEAD external/llvm-project | awk '{print $3}' | cut -c1-12)" >> "$GITHUB_ENV"
+
+      - name: Restore host LLVM cache
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            external/llvm-install
+            external/zlib-install
+            external/zstd-install
+          key: host-llvm-${{ env.LLVM_SHA }}-${{ hashFiles('scripts/build-llvm.sh') }}
+
+      - name: Install build tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build g++
+          python3 -m pip install --user --break-system-packages "cmake>=3.30"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build host LLVM/Clang/LLD
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: scripts/build-llvm.sh
+
+  package:
+    needs: host-llvm
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos
+          - target: x86_64-linux-musl
+            os: linux
+          - target: x86_64-windows-gnu
+            os: windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute LLVM submodule pin
+        run: |
+          echo "LLVM_SHA=$(git ls-tree HEAD external/llvm-project | awk '{print $3}' | cut -c1-12)" >> "$GITHUB_ENV"
+
+      - name: Restore host LLVM cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            external/llvm-install
+            external/zlib-install
+            external/zstd-install
+          key: host-llvm-${{ env.LLVM_SHA }}-${{ hashFiles('scripts/build-llvm.sh') }}
+          fail-on-cache-miss: true
+
+      - name: Install Clang 19 + build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build zip clang-19 libc++-19-dev libc++abi-19-dev
+          python3 -m pip install --user --break-system-packages "cmake>=3.30"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Stage 0 (host bake)
+        run: |
+          # Debian/Ubuntu put libc++.modules.json at <prefix>/lib/, not the
+          # lib/c++/ layout bake's CMakeLists guesses — point CMake at it.
+          MODJSON="$(find /usr/lib/llvm-19 /usr/lib/c++ -name libc++.modules.json 2>/dev/null | head -1)"
+          echo "libc++.modules.json: ${MODJSON:-<not found>}"
+          ARGS=()
+          if [ -n "$MODJSON" ]; then
+            ARGS+=(-DCMAKE_CXX_STDLIB_MODULES_JSON="$MODJSON")
+          fi
+          cmake -G Ninja -B build \
+            -DCMAKE_C_COMPILER=clang-19 \
+            -DCMAKE_CXX_COMPILER=clang++-19 \
+            "${ARGS[@]}"
+          cmake --build build
+
+      - name: Restore cross LLVM cache
+        id: cross
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            external/llvm-install-${{ matrix.target }}
+            external/llvm-project/build-native
+          key: cross-llvm-${{ matrix.target }}-${{ env.LLVM_SHA }}-${{ hashFiles('bootstrap/build') }}
+
+      - name: Init submodules (LLVM sources for the cross build)
+        if: steps.cross.outputs.cache-hit != 'true'
+        run: git submodule update --init --recursive --depth 1
+
+      - name: Package
+        run: ./bootstrap/package "${{ matrix.target }}"
+
+      - name: Save cross LLVM cache
+        if: steps.cross.outputs.cache-hit != 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            external/llvm-install-${{ matrix.target }}
+            external/llvm-project/build-native
+          key: cross-llvm-${{ matrix.target }}-${{ env.LLVM_SHA }}-${{ hashFiles('bootstrap/build') }}
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: bake-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Job summary
+        run: |
+          {
+            echo "### bake-${{ matrix.os }} — \`${{ matrix.target }}\`"
+            echo '```'
+            ls -lh dist/
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
