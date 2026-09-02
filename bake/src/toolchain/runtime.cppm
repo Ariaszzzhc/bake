@@ -311,6 +311,14 @@ static std::vector<std::string> target_surface_lines(const TargetSpec& target) {
         lines.push_back("macos-min:" + target.macos_deployment_min());
     return lines;
 }
+// libc++ config_site override directory for the target, or "" when the
+// stock __config detects the platform on its own (darwin).
+static std::string libcxx_config_subdir(const TargetSpec& target) {
+    if (target.is_windows_gnu()) return "mingw-config";
+    if (target.is_linux_gnu())   return "gnu-config";
+    if (target.is_linux_musl())  return "cross-config";
+    return "";
+}
 
 static ToolchainCacheEntry std_module_cache_entry(const TargetSpec& target) {
     Path gen_dir = get_toolchain_cache_root() / ".gen";
@@ -345,10 +353,9 @@ static ToolchainCacheEntry std_module_cache_entry(const TargetSpec& target) {
     std::vector<Path> inputs;
     Path lib = find_lib_dir();
     inputs.push_back(lib / "libcxx" / "include");
-    std::string config_subdir = target.is_windows_gnu()
-        ? "mingw-config"
-        : target.is_linux_gnu() ? "gnu-config" : "cross-config";
-    inputs.push_back(lib / "libcxx" / config_subdir);
+    std::string config_subdir = libcxx_config_subdir(target);
+    if (!config_subdir.empty())
+        inputs.push_back(lib / "libcxx" / config_subdir);
 
     return toolchain_cache_lookup(target, "std-modules", config, inputs);
 }
@@ -406,11 +413,9 @@ export ModuleFileMap ensure_std_modules(
 
     Path libcxx_inc = find_lib_dir() / "libcxx" / "include";
 
-    // Select libc++ config_site based on target: mingw-config for windows-gnu,
-    // cross-config for other cross-compile targets.
-    std::string config_subdir = target.is_windows_gnu()
-        ? "mingw-config"
-        : target.is_linux_gnu() ? "gnu-config" : "cross-config";
+    // Select libc++ config_site based on target family; darwin and native
+    // need none (stock __config).
+    std::string config_subdir = libcxx_config_subdir(target);
 
     if (!std_pcm.is_regular_file()) {
         std::println("   Preparing standard library module");
@@ -420,12 +425,15 @@ export ModuleFileMap ensure_std_modules(
         cmd.push_back("-stdlib=libc++");
         cmd.push_back("-nostdinc++");
 
-        // Cross-compile: -target + cross __config_site before libc++ headers.
+        // Cross-compile: -target + family __config_site before libc++ headers
+        // (none for darwin — stock __config).
         if (!target.is_native()) {
             cmd.push_back("-target");
             cmd.push_back(target.triple_with_version());
-            cmd.push_back("-isystem");
-            cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
+            if (!config_subdir.empty()) {
+                cmd.push_back("-isystem");
+                cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
+            }
         }
 
         cmd.push_back("-isystem");
@@ -455,8 +463,10 @@ export ModuleFileMap ensure_std_modules(
         if (!target.is_native()) {
             cmd.push_back("-target");
             cmd.push_back(target.triple_with_version());
-            cmd.push_back("-isystem");
-            cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
+            if (!config_subdir.empty()) {
+                cmd.push_back("-isystem");
+                cmd.push_back((find_lib_dir() / "libcxx" / config_subdir).string());
+            }
         }
 
         cmd.push_back("-isystem");
