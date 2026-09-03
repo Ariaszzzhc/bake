@@ -1,0 +1,42 @@
+name: debug-zstd
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -eux
+          curl -sL --fail -o z.tar.gz https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz
+          sha256sum z.tar.gz
+          mkdir x && tar xf z.tar.gz -C x --no-same-owner --no-same-permissions
+          python3 - <<'EOF'
+          import hashlib, os
+          root = "x/zstd-1.5.7"
+          entries = []
+          syms, modes = [], {}
+          for dirpath, dirnames, filenames in os.walk(root):
+              for n in dirnames + filenames:
+                  p = os.path.join(dirpath, n)
+                  rel = os.path.relpath(p, root).replace(os.sep, '/')
+                  st = os.lstat(p)
+                  mode = st.st_mode & 0o7777
+                  modes[oct(mode)] = modes.get(oct(mode), 0) + 1
+                  if os.path.islink(p):
+                      kind = "S:" + os.readlink(p)
+                      syms.append(rel + " -> " + os.readlink(p))
+                  elif os.path.isfile(p):
+                      kind = "F:" + hashlib.sha256(open(p,'rb').read()).hexdigest()
+                  elif os.path.isdir(p):
+                      kind = "D"
+                  else:
+                      continue
+                  entries.append((rel, f"{rel}|{mode}|{kind}"))
+          entries.sort()
+          combined = "".join(c + "\n" for _, c in entries)
+          print("tree:", hashlib.sha256(combined.encode()).hexdigest())
+          print("count:", len(entries))
+          print("symlinks:", syms)
+          print("mode histogram:", dict(sorted(modes.items())))
+          EOF
