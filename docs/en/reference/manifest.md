@@ -120,6 +120,7 @@ Each alias in `[dependencies]` declares one dependency. The same entry syntax is
 | `branch` | Git ref | Select a branch. Mutually exclusive with `tag` and `rev`. |
 | `rev` | Git ref | Select an exact Git revision. Mutually exclusive with `tag` and `branch`. |
 | `features` | any dependency | List of the dependency's `[features]` to activate. |
+| `default-features` | any dependency | `false` stops this edge from contributing the dependency's `default` feature set — only features explicitly named in `features` activate. Union semantics: other edges (or building the package as its own root) still contribute the defaults; bake warns on mixed edges. |
 
 A Git dependency with no `tag`, `branch`, or `rev` resolves its default-branch `HEAD` at build time. Archive dependencies must not specify a ref. Tar archives are extracted with `tar`; ZIP archives use `unzip`.
 

@@ -120,6 +120,7 @@ BAKE_MYAPP_VERSION_PATCH = 0
 | `branch` | Git ref | 选择分支。与 `tag`、`rev` 互斥。 |
 | `rev` | Git ref | 选择确切的 Git revision。与 `tag`、`branch` 互斥。 |
 | `features` | 任意依赖 | 要在该依赖包上激活的 `[features]` 列表。 |
+| `default-features` | 任意依赖 | `false` 时该边不再贡献依赖包的 `default` 特性集——仅 `features` 显式点名的特性激活。并集语义：其他边（或将该包作为根构建）仍会贡献默认特性；混合时 bake 会警告。 |
 
 不带 `tag`、`branch` 或 `rev` 的 Git 依赖会在构建时解析其默认分支 `HEAD`。归档依赖不得指定 ref。tar 归档由 `tar` 提取；ZIP 归档使用 `unzip`。
 

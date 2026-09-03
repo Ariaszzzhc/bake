@@ -16,6 +16,7 @@ export struct MoidEdge {
     std::string alias;
     MoidId target;
     std::vector<std::string> features;
+    bool default_features = true;  // edge contributes target's defaults
 };
 
 export struct MoidNode {
@@ -482,25 +483,20 @@ resolve_moid_graph(const Manifest& root,
             std::set<std::string> effective;
             std::map<std::string, std::string> origin;
             std::map<std::string, bool> hard;
-
-            for (const auto& name : manifest.default_features) {
-                auto it = manifest.features.find(name);
-                if (it == manifest.features.end()) {
-                    return std::unexpected(
-                        "default feature '" + name + "' of package '" +
-                        node.declaration.name + "' is not declared");
-                }
-                if (!feature_supports_target(it->second,
-                                             selection.target_triple))
-                    continue;
-                effective.insert(name);
-                origin.emplace(name, "default");
-                hard.emplace(name, false);
-            }
-
+            // Incoming edges vote on this package's default feature set:
+            // an edge may opt out (default-features = false) so only its
+            // explicit `features` activate here. Union semantics — one
+            // edge keeping defaults is enough to keep them on, and a
+            // package built as its own root has no incoming edges and
+            // keeps its defaults.
+            bool saw_defaults_on = false, saw_defaults_off = false;
             for (const auto& [_, source] : graph.nodes) {
                 for (const auto& edge : source.dependencies) {
                     if (edge.target != id) continue;
+                    if (edge.default_features)
+                        saw_defaults_on = true;
+                    else
+                        saw_defaults_off = true;
                     for (const auto& name : edge.features) {
                         auto it = manifest.features.find(name);
                         if (it == manifest.features.end()) {
@@ -531,6 +527,28 @@ resolve_moid_graph(const Manifest& root,
                                            source.declaration.name + "'");
                         hard[name] = true;
                     }
+                }
+            }
+            if (saw_defaults_off && saw_defaults_on)
+                std::println(std::cerr,
+                             "bake: package '{}' keeps default features: "
+                             "another edge still contributes them",
+                             node.declaration.name);
+
+            if (!saw_defaults_off || saw_defaults_on) {
+                for (const auto& name : manifest.default_features) {
+                    auto it = manifest.features.find(name);
+                    if (it == manifest.features.end()) {
+                        return std::unexpected(
+                            "default feature '" + name + "' of package '" +
+                            node.declaration.name + "' is not declared");
+                    }
+                    if (!feature_supports_target(it->second,
+                                                 selection.target_triple))
+                        continue;
+                    effective.insert(name);
+                    origin.emplace(name, "default");
+                    hard.emplace(name, false);
                 }
             }
 
@@ -714,7 +732,8 @@ resolve_moid_graph(const Manifest& root,
                 // Edges were cleared above and `effective` holds one entry
                 // per alias — a plain append rebuilds the outgoing set.
                 source_node.dependencies.push_back(
-                    MoidEdge{alias, *target_id, dependency.features});
+                    MoidEdge{alias, *target_id, dependency.features,
+                             dependency.default_features});
             }
         }
         return {};

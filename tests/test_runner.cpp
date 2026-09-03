@@ -2946,6 +2946,130 @@ TestResult test_feature_demotion() {
     return {};
 }
 
+// default-features = false on a dependency suppresses that edge's
+// contribution of the target's default feature set: only explicitly named
+// features activate. Union semantics hold — another edge (or building the
+// package as its own root) still contributes the defaults, with a warning.
+TestResult test_feature_default_off() {
+    auto write_lib = [&](const fs::path& root) {
+        write_file(root / "lib/bake.toml",
+            "[package]\n"
+            "name = \"lib\"\n"
+            "version = \"0.1.0\"\n"
+            "type = \"lib\"\n"
+            "[language]\nc = \"c17\"\n\n"
+            "[features]\n"
+            "default = [\"extra\"]\n"
+            "extra = { defines = [\"LIB_EXTRA=1\"] }\n");
+        write_file(root / "lib/src/v.c",
+            "int v(void) {\n"
+            "#ifdef LIB_EXTRA\n"
+            "return 2;\n"
+            "#else\n"
+            "return 1;\n"
+            "#endif\n"
+            "}\n");
+    };
+    auto write_main = [&](const fs::path& root) {
+        write_file(root / "src/main.c",
+            "#include <stdio.h>\n"
+            "int v(void);\n"
+            "int main(void) {\n"
+            "#ifdef LIB_EXTRA\n"
+            "printf(\"extra %d\\n\", v());\n"
+            "#else\n"
+            "printf(\"plain %d\\n\", v());\n"
+            "#endif\n"
+            "return 0;\n"
+            "}\n");
+    };
+
+    // Opt-out edge: the default feature's define is gone everywhere.
+    auto off = make_temp_dir("feature_default_off");
+    write_lib(off);
+    write_file(off / "bake.toml",
+        "[package]\n"
+        "name = \"off-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "lib = { path = \"lib\", default-features = false }\n");
+    write_main(off);
+    auto off_build = run_bake("build", off);
+    CHECK(off_build.success(), "default-features=false build failed: " +
+                                   off_build.stdout);
+    auto run_off = run_cmd(
+        (target_output_dir(off) / "bin" / "off-app").string(), off);
+    CHECK_EQ(run_off.stdout, std::string("plain 1\n"),
+             "default-features=false kept the default feature: " +
+                 run_off.stdout);
+
+    // Plain edge: defaults stay on (and reach consumers transitively).
+    auto on = make_temp_dir("feature_default_on");
+    write_lib(on);
+    write_file(on / "bake.toml",
+        "[package]\n"
+        "name = \"on-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "lib = { path = \"lib\" }\n");
+    write_main(on);
+    auto on_build = run_bake("build", on);
+    CHECK(on_build.success(), "plain dependency build failed: " +
+                                  on_build.stdout);
+    auto run_on = run_cmd(
+        (target_output_dir(on) / "bin" / "on-app").string(), on);
+    CHECK_EQ(run_on.stdout, std::string("extra 2\n"),
+             "plain dependency lost its default feature: " + run_on.stdout);
+
+    // Mixed edges: union keeps the defaults and warns about it.
+    auto mixed = make_temp_dir("feature_default_mixed");
+    write_lib(mixed);
+    write_file(mixed / "via-off/bake.toml",
+        "[package]\n"
+        "name = \"via-off\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "lib = { path = \"../lib\", default-features = false }\n");
+    write_file(mixed / "via-off/src/p.c", "int via_off(void) { return 0; }\n");
+    write_file(mixed / "via-on/bake.toml",
+        "[package]\n"
+        "name = \"via-on\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "lib = { path = \"../lib\" }\n");
+    write_file(mixed / "via-on/src/q.c", "int via_on(void) { return 0; }\n");
+    write_file(mixed / "bake.toml",
+        "[package]\n"
+        "name = \"mixed-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "via-off = { path = \"via-off\" }\n"
+        "via-on = { path = \"via-on\" }\n");
+    write_main(mixed);
+    auto mixed_build = run_bake("build", mixed);
+    CHECK(mixed_build.success(),
+          "mixed-edge build failed: " + mixed_build.stdout);
+    CHECK(mixed_build.stdout.find("keeps default features") !=
+              std::string::npos,
+          "mixed edges did not warn about retained defaults: " +
+              mixed_build.stdout);
+    auto run_mixed = run_cmd(
+        (target_output_dir(mixed) / "bin" / "mixed-app").string(), mixed);
+    CHECK_EQ(run_mixed.stdout, std::string("extra 2\n"),
+             "mixed edges dropped the union default feature: " +
+                 run_mixed.stdout);
+
+    return {};
+}
+
+
 // A platform-restricted feature in the default set is a silent no-op on
 // non-matching targets; activating it explicitly on such a target is an
 // error.
@@ -4626,6 +4750,7 @@ static std::vector<TestCase> all_tests = {
     {"feature_conflict",              test_feature_conflict},
     {"feature_platform",              test_feature_platform},
     {"feature_demotion",              test_feature_demotion},
+    {"feature_default_off",           test_feature_default_off},
     {"build_cpp_transitive_modules",  test_build_cpp_transitive_modules},
     {"std_compat_default_discovery",  test_std_compat_default_discovery},
     {"std_compat_build_cpp",          test_std_compat_build_cpp},

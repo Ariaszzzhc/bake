@@ -64,6 +64,10 @@ export struct Dependency {
     std::string path;     // relative path (for path deps)
     bool is_path_dep = false;
     std::vector<std::string> features;  // features to activate on the target
+    // Contribute the target's default feature set from this edge (true).
+    // false = only `features` above activate on the target; other edges
+    // and the root's own build still contribute their share (union).
+    bool default_features = true;
 
     bool is_remote() const { return !url.empty(); }
     // Direct archive dependency — recognized by URL extension.
@@ -351,6 +355,8 @@ export struct Manifest {
                         d.features.push_back(*s);
                 }
             }
+            if (auto v = (*t)["default-features"].value<bool>())
+                d.default_features = *v;
 
             if (d.is_path_dep) {
                 if (d.path.empty() || !d.url.empty() ||
@@ -631,7 +637,9 @@ namespace {
 
 bool same_definition(const Dependency& a, const Dependency& b) {
     return a.url == b.url && a.tag == b.tag && a.branch == b.branch &&
-           a.rev == b.rev && a.path == b.path && a.features == b.features;
+           a.rev == b.rev && a.path == b.path &&
+           a.default_features == b.default_features &&
+           a.features == b.features;
 }
 
 }  // namespace
