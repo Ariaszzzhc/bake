@@ -733,7 +733,9 @@ inline bool Resolver::ensure_cached(const LockDep& dep) {
     // Verify the tree hash against the lock
     std::string tree_hash = compute_tree_hash(*extracted);
     if (tree_hash != hash) {
-        std::println(std::cerr, "bake: tree hash mismatch for '{}'", dep.key);
+        std::println(std::cerr,
+            "bake: tree hash mismatch for '{}' (expected {}, got {})",
+            dep.key, hash.substr(0, 12), tree_hash.substr(0, 12));
         extracted->remove_all();
         return false;
     }
