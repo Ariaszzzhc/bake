@@ -459,10 +459,12 @@ resolve_moid_graph(const Manifest& root,
     //
     // A feature's dependencies are conditional edges: they exist only when
     // the feature is active, and activation arrives on edges from
-    // dependents that may themselves be feature-gated. Activation only
-    // grows, so expansion and unification iterate to a fixpoint.
+    // dependents that may themselves be feature-gated. Activation can also
+    // shrink — conflict demotion removes defaults — so expansion and
+    // unification iterate to a fixpoint over the changing sets.
     std::map<MoidId, std::set<std::string>> activated;
     std::map<MoidId, std::set<std::string>> expanded_with;
+    std::map<MoidId, std::set<std::string>> demoted_notes;
 
     auto is_root = [&](const MoidId& id) {
         return std::ranges::any_of(
@@ -470,14 +472,16 @@ resolve_moid_graph(const Manifest& root,
     };
 
     // Unify every node's activation set (defaults ∪ incoming edges ∪ CLI,
-    // platform-filtered) and validate declarations, platforms and
-    // conflicts. Returns whether any activation grew.
+    // platform-filtered), validate declarations and platforms, and apply
+    // explicit-beats-default conflict demotion. Returns whether any
+    // activation changed.
     auto unify = [&]() -> std::expected<bool, std::string> {
-        bool grew = false;
+        bool changed = false;
         for (auto& [id, node] : graph.nodes) {
             const Manifest& manifest = source_records.at(id).manifest;
             std::set<std::string> effective;
             std::map<std::string, std::string> origin;
+            std::map<std::string, bool> hard;
 
             for (const auto& name : manifest.default_features) {
                 auto it = manifest.features.find(name);
@@ -491,6 +495,7 @@ resolve_moid_graph(const Manifest& root,
                     continue;
                 effective.insert(name);
                 origin.emplace(name, "default");
+                hard.emplace(name, false);
             }
 
             for (const auto& [_, source] : graph.nodes) {
@@ -524,6 +529,7 @@ resolve_moid_graph(const Manifest& root,
                         origin.emplace(name,
                                        "dependency '" + edge.alias + "' of '" +
                                            source.declaration.name + "'");
+                        hard[name] = true;
                     }
                 }
             }
@@ -548,9 +554,31 @@ resolve_moid_graph(const Manifest& root,
                     }
                     effective.insert(name);
                     origin.emplace(name, "command line");
+                    hard[name] = true;
                 }
             }
 
+            // Conflicts follow explicit-beats-default (see
+            // demote_conflicting_defaults in project.cppm): a default-only
+            // feature yields to an explicitly activated one; two explicit
+            // or two default features that clash are an error.
+            std::set<std::string> demote;
+            for (const auto& [name, name_hard] : hard) {
+                if (!name_hard) continue;
+                for (const auto& other :
+                     manifest.features.at(name).conflicts)
+                    if (effective.count(other) && !hard.at(other))
+                        demote.insert(other);
+            }
+            for (const auto& name : demote) {
+                if (demoted_notes[id].insert(name).second)
+                    std::println(std::cerr,
+                                 "bake: feature '{}' of package '{}' is "
+                                 "disabled: it conflicts with an "
+                                 "explicitly activated feature",
+                                 name, node.declaration.name);
+                effective.erase(name);
+            }
             for (const auto& name : effective) {
                 for (const auto& other :
                      manifest.features.at(name).conflicts) {
@@ -564,30 +592,34 @@ resolve_moid_graph(const Manifest& root,
             }
 
             auto& known = activated[id];
-            if (!std::ranges::includes(known, effective)) {
+            if (known != effective) {
                 known = std::move(effective);
-                grew = true;
+                changed = true;
             }
             node.declaration.active_features.assign(known.begin(),
                                                      known.end());
         }
-        return grew;
+        return changed;
     };
 
-    // Expand dependency edges using the current activation sets. Nodes are
-    // revisited when their activation grew; registered sources dedup.
+    // Expand dependency edges from the current activation sets. Nodes are
+    // revisited whenever their activation changes — including shrinkage
+    // from conflict demotion, which removes feature-conditional edges.
     auto expand = [&]() -> std::expected<void, std::string> {
         for (std::size_t index = 0; index < worklist.size(); ++index) {
             const MoidId source_id = worklist[index];
             const std::set<std::string> features = activated[source_id];
-            auto [marker_entry, first_visit] =
+            auto [marker_entry, marker_fresh] =
                 expanded_with.try_emplace(source_id);
             std::set<std::string>& marker = marker_entry->second;
-            if (!first_visit && std::ranges::includes(marker, features))
-                continue;
-            marker.insert(features.begin(), features.end());
+            if (!marker_fresh && marker == features) continue;
+            marker = features;
             const SourceRecord source = source_records.at(source_id);
             auto& source_node = graph.nodes.at(source_id);
+            // Edges are a pure function of the activation set — rebuild
+            // them from scratch so demoted features lose theirs.
+            source_node.dependencies.clear();
+            source_node.source_deps.clear();
 
             auto effective = effective_dependencies(
                 source.manifest, selection.target_triple, features);
@@ -679,18 +711,10 @@ resolve_moid_graph(const Manifest& root,
                     *target_id, source_key, std::move(*target_manifest));
                 if (!added) return std::unexpected(added.error());
 
-                auto existing = std::ranges::find_if(
-                    source_node.dependencies, [&](const MoidEdge& edge) {
-                        return edge.alias == alias;
-                    });
-                if (existing != source_node.dependencies.end()) {
-                    for (const auto& feature : dependency.features)
-                        if (!std::ranges::count(existing->features, feature))
-                            existing->features.push_back(feature);
-                } else {
-                    source_node.dependencies.push_back(
-                        MoidEdge{alias, *target_id, dependency.features});
-                }
+                // Edges were cleared above and `effective` holds one entry
+                // per alias — a plain append rebuilds the outgoing set.
+                source_node.dependencies.push_back(
+                    MoidEdge{alias, *target_id, dependency.features});
             }
         }
         return {};

@@ -2716,6 +2716,106 @@ TestResult test_feature_conflict() {
     return {};
 }
 
+// Explicit activation demotes a conflicting default: switching a package's
+// default backend from a dependent's edge must succeed, drop the default's
+// conditional dependency from the graph, and note the demotion.
+TestResult test_feature_demotion() {
+    auto dir = make_temp_dir("feature_demotion");
+    write_file(dir / "legacylib/bake.toml",
+        "[package]\n"
+        "name = \"legacylib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n");
+    write_file(dir / "legacylib/src/legacy.c",
+        "int legacy_value(void) { return 10; }\n");
+    write_file(dir / "modernlib/bake.toml",
+        "[package]\n"
+        "name = \"modernlib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n");
+    write_file(dir / "modernlib/src/modern.c",
+        "int modern_value(void) { return 20; }\n");
+    write_file(dir / "backends/bake.toml",
+        "[package]\n"
+        "name = \"backends\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[features]\n"
+        "default = [\"legacy\"]\n"
+        "legacy = { defines = [\"BACKEND=1\"], dependencies = "
+        "{ legacylib = { path = \"../legacylib\" } } }\n"
+        "modern = { defines = [\"BACKEND=2\"], conflicts = [\"legacy\"], "
+        "dependencies = { modernlib = { path = \"../modernlib\" } } }\n");
+    write_file(dir / "backends/src/v.c",
+        "int v(void) { return 1; }\n");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"demote-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "backends = { path = \"backends\", features = [\"modern\"] }\n");
+    write_file(dir / "src/main.c",
+        "#include <stdio.h>\n"
+        "int v(void);\n"
+        "int modern_value(void);\n"
+        "int main(void) {\n"
+        "    printf(\"%d\\n%d\\n\", v(), modern_value());\n"
+        "    return 0;\n"
+        "}\n");
+
+    auto switched = run_bake("build", dir);
+    CHECK(switched.success(),
+          "explicit backend switch over a default failed: " + switched.stdout);
+    CHECK(switched.stdout.find(
+              "feature 'legacy' of package 'backends' is disabled") !=
+              std::string::npos,
+          "demotion was not reported: " + switched.stdout);
+    CHECK(fs::exists(target_output_dir(dir) / "lib" / "libmodernlib.a"),
+          "modern backend library missing from output");
+    CHECK(!fs::exists(target_output_dir(dir) / "lib" / "liblegacylib.a"),
+          "demoted default's library leaked into the build");
+    auto run_switched = run_cmd(
+        (target_output_dir(dir) / "bin" / "demote-app").string(), dir);
+    CHECK_EQ(run_switched.stdout, std::string("1\n20\n"),
+             "switched build did not use the modern backend: " +
+                 run_switched.stdout);
+
+    // A CLI activation on the root demotes the root's own default.
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"demote-root\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[features]\n"
+        "default = [\"legacy\"]\n"
+        "legacy = { defines = [\"BACKEND=1\"], dependencies = "
+        "{ legacylib = { path = \"legacylib\" } } }\n"
+        "modern = { defines = [\"BACKEND=2\"], conflicts = [\"legacy\"], "
+        "dependencies = { modernlib = { path = \"modernlib\" } } }\n");
+    write_file(dir / "src/main.c",
+        "#include <stdio.h>\n"
+        "int modern_value(void);\n"
+        "int main(void) {\n"
+        "    printf(\"%d\\n%d\\n\", BACKEND, modern_value());\n"
+        "    return 0;\n"
+        "}\n");
+    auto root_cli = run_bake("build --feature modern", dir);
+    CHECK(root_cli.success(),
+          "CLI activation did not demote the root's default: " +
+              root_cli.stdout);
+    auto run_root = run_cmd(
+        (target_output_dir(dir) / "bin" / "demote-root").string(), dir);
+    CHECK_EQ(run_root.stdout, std::string("2\n20\n"),
+             "CLI-demoted root build kept the legacy backend: " +
+                 run_root.stdout);
+
+    return {};
+}
+
 // A platform-restricted feature in the default set is a silent no-op on
 // non-matching targets; activating it explicitly on such a target is an
 // error.
@@ -2799,12 +2899,12 @@ TestResult test_std_compat_default_discovery() {
     CHECK(!fs::exists(local_std),
           "out/.bmi/.std should not exist (std PCMs moved to global cache)");
 
-    // compile_commands.json must reference both module mappings.
+    // The std module is compiler-provided (the bake c++ shim injects it at
+    // -std=c++23); compile_commands.json records the build system's plain
+    // argv and must not synthesize std module flags.
     auto cc = read_file(dir / "compile_commands.json");
-    CHECK(cc.find("-fmodule-file=std=") != std::string::npos,
-          "compile_commands missing -fmodule-file=std=");
-    CHECK(cc.find("-fmodule-file=std.compat=") != std::string::npos,
-          "compile_commands missing -fmodule-file=std.compat=");
+    CHECK(cc.find("-fmodule-file=std=") == std::string::npos,
+          "compile_commands must not synthesize -fmodule-file=std=");
 
     return {};
 }
@@ -4392,6 +4492,7 @@ static std::vector<TestCase> all_tests = {
     {"feature_activation",            test_feature_activation},
     {"feature_conflict",              test_feature_conflict},
     {"feature_platform",              test_feature_platform},
+    {"feature_demotion",              test_feature_demotion},
     {"build_cpp_transitive_modules",  test_build_cpp_transitive_modules},
     {"std_compat_default_discovery",  test_std_compat_default_discovery},
     {"std_compat_build_cpp",          test_std_compat_build_cpp},

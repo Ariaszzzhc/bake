@@ -124,40 +124,42 @@ std::vector<std::string> expand_glob(const std::string& pattern,
         return result;
     }
 
-    fs::path p(pattern);
-    bool is_abs = p.is_absolute();
-
-    if (is_abs) {
-        // Absolute pattern: search in pattern's parent, match filename.
-        fs::path search_dir = p.parent_path();
-        std::string match_pat = p.filename().string();
-        if (!fs::exists(search_dir)) return result;
-        try {
-            for (auto& entry : fs::recursive_directory_iterator(search_dir)) {
-                if (!entry.is_regular_file()) continue;
-                auto rel = fs::relative(entry.path(), search_dir);
-                if (glob_match(rel.generic_string(), match_pat))
-                    result.push_back(entry.path().generic_string());
-            }
-        } catch (...) {}
-    } else {
-        // Relative pattern: search in base_dir, match path relative to base_dir.
-        std::string full_pattern = pattern;
-        if (full_pattern.starts_with("./"))
-            full_pattern = full_pattern.substr(2);
-        fs::path search_dir = fs::path(base_dir) / fs::path(full_pattern).parent_path();
-        if (!fs::exists(search_dir)) return result;
-        try {
-            for (auto& entry : fs::recursive_directory_iterator(
-                     fs::path(base_dir) / fs::path(full_pattern).parent_path())) {
-                if (!entry.is_regular_file()) continue;
-                auto rel = fs::relative(entry.path(), base_dir);
-                std::string rel_str = rel.generic_string();
-                if (glob_match(rel_str, full_pattern))
-                    result.push_back(rel_str);
-            }
-        } catch (...) {}
+    // Split at the first component containing a wildcard: the literal
+    // leading components name an existing directory to search, the
+    // remainder is matched against paths relative to it. Wildcard
+    // components ("**", "*.c") never exist on disk, so they must stay
+    // on the pattern side — a plain parent_path() would treat "**" as
+    // a real directory and match nothing.
+    fs::path fixed_prefix;
+    fs::path wild_pattern;
+    bool saw_wildcard = false;
+    for (const auto& part : fs::path(pattern)) {
+        auto piece = part.string();
+        if (!saw_wildcard && piece.find_first_of("*?") == std::string::npos)
+            fixed_prefix /= piece;
+        else {
+            saw_wildcard = true;
+            wild_pattern /= piece;
+        }
     }
+    if (wild_pattern.empty()) return result;
+
+    fs::path search_dir = fixed_prefix;
+    if (search_dir.is_relative()) search_dir = fs::path(base_dir) / search_dir;
+    if (!fs::exists(search_dir)) return result;
+    const bool absolute = fs::path(pattern).is_absolute();
+    try {
+        for (auto& entry : fs::recursive_directory_iterator(search_dir)) {
+            if (!entry.is_regular_file()) continue;
+            auto rel = fs::relative(entry.path(), search_dir);
+            if (!glob_match(rel.generic_string(),
+                            wild_pattern.generic_string()))
+                continue;
+            result.push_back(absolute
+                                 ? entry.path().generic_string()
+                                 : (fixed_prefix / rel).generic_string());
+        }
+    } catch (...) {}
 
     std::sort(result.begin(), result.end());
     return result;

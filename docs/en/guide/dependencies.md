@@ -149,4 +149,4 @@ If your package is a `lib`, dependents get your public headers (your `public/` d
 
 ## Options across the graph
 
-`[features]` are named capability bundles, unified by union across the whole dependency graph (see [Profiles and Features](../reference/profiles.md)). Activating `tls-openssl` on your `curl` dependency resolves that feature's dependencies (the openssl port), injects its `defines`, and compiles the dependency with `BAKE_CURL_TLS_OPENSSL=1`; conflicting features (`conflicts`) fail at configure time.
+`[features]` are named capability bundles, unified by union across the whole dependency graph (see [Profiles and Features](../reference/profiles.md)). Activating `tls-openssl` on your `curl` dependency resolves that feature's dependencies (the openssl port), injects its `defines`, and compiles the dependency with `BAKE_CURL_TLS_OPENSSL=1`; conflicts follow explicit-beats-default — an explicit activation demotes a conflicting default (the default `tls-mbedtls` yields to your explicit `tls-openssl`); only two explicit activations clashing fail at configure time.

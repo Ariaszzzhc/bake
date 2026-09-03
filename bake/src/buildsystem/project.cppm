@@ -645,6 +645,29 @@ export bool feature_supports_target(const FeatureSpec& feature,
     return feature.platforms.empty();
 }
 
+// Conflicts follow explicit-beats-default: a default-only feature yields
+// (is demoted, dropping its dependencies/defines) when it conflicts with
+// an explicitly activated one, so consumers can switch a package's
+// default backend. Two explicit or two default features that conflict
+// stay in the set — graph resolution rejects those with full context.
+// Callers: the resolver's activation and prune walk; graph resolution
+// implements the same rule with origin tracking for its diagnostics.
+export std::set<std::string> demote_conflicting_defaults(
+    const Manifest& manifest, const std::set<std::string>& explicit_features) {
+    std::set<std::string> effective(manifest.default_features.begin(),
+                                    manifest.default_features.end());
+    effective.insert(explicit_features.begin(), explicit_features.end());
+    for (const auto& name : explicit_features) {
+        auto it = manifest.features.find(name);
+        if (it == manifest.features.end()) continue;
+        for (const auto& other : it->second.conflicts)
+            if (effective.count(other) &&
+                !explicit_features.count(other))
+                effective.erase(other);
+    }
+    return effective;
+}
+
 // Effective dependency set for a build triple: the global [dependencies],
 // every [target."<glob>".dependencies] table whose pattern matches the
 // triple, and the dependencies of every active feature. A repeated alias

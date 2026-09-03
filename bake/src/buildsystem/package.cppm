@@ -226,7 +226,9 @@ public:
     // lockfile covering exactly the closure (orphan entries pruned).
     std::optional<Lockfile> resolve(const Manifest& manifest,
                                     const ResolverConfig& config,
-                                    const Lockfile* hints = nullptr);
+                                    const Lockfile* hints = nullptr,
+                                    const std::set<std::string>&
+                                        root_features = {});
 
     // Resolve a single remote dependency (network): ref → commit →
     // download → extract → tree hash. Returns the lock entry.
@@ -1088,10 +1090,11 @@ inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig&
 
     return true;
 }
-
 inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
                                                  const ResolverConfig& config,
-                                                 const Lockfile* hints) {
+                                                 const Lockfile* hints,
+                                                 const std::set<std::string>&
+                                                     root_features) {
     if (config.offline || config.frozen) {
         std::println(std::cerr, "bake: cannot resolve dependencies in offline/frozen mode");
         return std::nullopt;
@@ -1123,8 +1126,6 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
     auto active_features_of = [&](const Manifest& m,
                                   const std::set<std::string>& extra)
             -> std::optional<std::set<std::string>> {
-        std::set<std::string> active(m.default_features.begin(),
-                                     m.default_features.end());
         for (const auto& name : extra) {
             if (!m.features.count(name)) {
                 std::println(std::cerr,
@@ -1134,9 +1135,11 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
                              m.moid ? m.moid->name : std::string("<unknown>"));
                 return std::nullopt;
             }
-            active.insert(name);
         }
-        return active;
+        // Explicit activation demotes conflicting defaults so their
+        // dependencies are neither resolved nor locked (mirrors graph
+        // resolution — see demote_conflicting_defaults).
+        return demote_conflicting_defaults(m, extra);
     };
 
     auto enqueue_scopes = [&](const Manifest& m,
@@ -1153,7 +1156,10 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
                                  {dep.features.begin(), dep.features.end()}});
     };
     {
-        auto root_active = active_features_of(manifest, {});
+        // CLI root features participate in lock resolution: their
+        // conditional dependencies must be resolved and locked.
+        auto root_active =
+            active_features_of(manifest, root_features);
         if (!root_active) return std::nullopt;
         enqueue_scopes(manifest, *root_active);
     }
@@ -1225,15 +1231,27 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
         }
 
         // Locked-as-hints: url+ref unchanged → carry the entry verbatim.
-        // No ls-remote, no download. Only safe when this visit activated
-        // no new features — otherwise the closure reachable through the
-        // new features is not covered by the carried entry.
+        // No ls-remote, no download. The closure through the carried
+        // entry is still re-enqueued: the hint lock may have been pruned
+        // since it was written, and missing transitives then resolve
+        // normally instead of failing the graph later.
         if (hints && !grew) {
             const LockDep* hint = hints->find_remote(dep.url, ref_type, ref);
             if (hint && !hint->integrity.empty() &&
                 (dep.is_archive() || !hint->commit.empty())) {
                 if (lockfile.deps.emplace(hint->key, *hint).second)
                     entry_count++;
+                std::string hash = hint->cache_hash();
+                if (!hash.empty()) {
+                    Path dep_cache = cache_dir_ / hash;
+                    if (auto sub_manifest = Manifest::load_moid(dep_cache)) {
+                        sub_manifest->project_dir = dep_cache;
+                        auto active = active_features_of(*sub_manifest,
+                                                         accumulated);
+                        if (!active) return std::nullopt;
+                        enqueue_scopes(*sub_manifest, *active);
+                    }
+                }
                 continue;
             }
         }
@@ -1263,8 +1281,9 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
 
 // Rebuild a lockfile restricted to the entries reachable from the
 // manifest's declared closure (every scope, defaults plus the feature
-// activations requested on dependency edges). Zero network: reachability
-// walks path-dep manifests and cached native sources through lock entries.
+// activations requested on dependency edges, with conflicting defaults
+// demoted). Zero network: reachability walks path-dep manifests and
+// cached native sources through lock entries.
 // Used by `bake remove` to drop entries the manifest no longer references.
 export Lockfile prune_lock(const Manifest& manifest, const Lockfile& lock) {
     Lockfile pruned;
@@ -1272,17 +1291,14 @@ export Lockfile prune_lock(const Manifest& manifest, const Lockfile& lock) {
     std::map<Path, std::set<std::string>> visited;
     std::function<void(const Manifest&, const std::set<std::string>&)> walk =
         [&](const Manifest& m, const std::set<std::string>& activated) {
+            const std::set<std::string> effective =
+                demote_conflicting_defaults(m, activated);
             std::vector<const std::map<std::string, Dependency>*> scopes;
             scopes.push_back(&m.dependencies);
             for (const auto& condition : m.targets)
                 scopes.push_back(&condition.dependencies);
-            for (const auto& name : m.default_features)
+            for (const auto& name : effective)
                 if (m.features.count(name))
-                    scopes.push_back(&m.features.at(name).dependencies);
-            for (const auto& name : activated)
-                if (m.features.count(name) &&
-                    std::ranges::find(m.default_features, name) ==
-                        m.default_features.end())
                     scopes.push_back(&m.features.at(name).dependencies);
             for (auto* scope : scopes) {
                 for (auto& [alias, dep] : *scope) {

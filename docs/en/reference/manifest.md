@@ -88,7 +88,7 @@ Activation semantics:
 
 - **Union unification**: a package's effective set is its own `default` ∪ all incoming edge activations ∪ CLI. `build.cpp` queries with `b.feature("zlib")`
 - Every declared feature yields the macro `BAKE_<MOID>_<FEATURE>` — `1` when active, `0` when not
-- **conflicts** are validated pairwise within the effective set at configure time, and the error names both activation origins
+- **conflicts** follow explicit-beats-default: a default feature conflicting with an explicitly activated one (dependency edge/CLI) is demoted with a printed note — its dependencies and defines disappear — so consumers can switch a package's default backend; two explicit or two default features clashing fail at configure time, and the error names both activation origins
 - **platforms** is the applicability whitelist: a default-set feature that does not match the build target contributes nothing silently; an explicitly activated one (dependency edge or `--feature`) that does not match is an error
 - A feature's dependencies enter the graph, the lockfile, and the download queue only when active
 
