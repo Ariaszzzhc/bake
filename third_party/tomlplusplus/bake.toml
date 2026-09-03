@@ -1,7 +1,0 @@
-[package]
-name = "tomlplusplus"
-version = "3.4.0"
-type = "lib"
-
-[language]
-cxx = "c++23"

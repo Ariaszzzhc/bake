@@ -45,6 +45,10 @@ int main() {
     auto llvm_libs  = glob_static_libs(llvm_lib, "libLLVM");
 
     b.sources({
+        "src/json.cppm",
+        "src/json.cpp",
+        "src/toml.cppm",
+        "src/toml.cpp",
         "src/util.cppm",
         "src/buildsystem/project.cppm",
         "src/buildsystem/moid.cppm",
@@ -62,8 +66,6 @@ int main() {
     b.sources("src/main.cpp");
     b.include_dirs({
         llvm_include,
-        "../third_party/tomlplusplus/public",
-        "../third_party/nlohmann/public",
     });
 
     // Prebuilt LLVM/Clang/LLD static libraries.

@@ -7,8 +7,8 @@ type = "executable"
 strip = true
 
 [dependencies]
-tomlplusplus = { path = "../third_party/tomlplusplus" }
-nlohmann_json = { path = "../third_party/nlohmann" }
+json = { url = "https://github.com/bake-pkgs/json", tag = "v3.12.2" }
+tomlplusplus = { url = "https://github.com/bake-pkgs/tomlplusplus", tag = "v3.4.3" }
 
 [target."*-windows-gnu"]
 libraries = ["ole32", "version"]

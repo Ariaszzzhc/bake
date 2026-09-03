@@ -3,7 +3,7 @@ export module bake.buildsystem.moid;
 import std;
 import bake.util;
 import bake.buildsystem.project;
-import nlohmann.json;
+import bake.json;
 
 namespace bake {
 
@@ -73,7 +73,7 @@ export Path moid_declaration_path(const Path& out_dir, std::string_view id) {
 
 namespace {
 
-using Json = nlohmann::json;
+using Json = bake::json::Value;
 
 std::string field_path(std::string_view parent, std::string_view field) {
     if (parent.empty()) return std::string(field);
@@ -86,13 +86,10 @@ std::expected<const Json*, std::string> required_field(
         return std::unexpected(
             "moid declaration field '" + std::string(parent) + "' must be an object");
     }
-    auto it = object.find(std::string(name));
-    if (it == object.end()) {
-        return std::unexpected(
-            "missing required moid declaration field '" +
-            field_path(parent, name) + "'");
-    }
-    return &*it;
+    if (const Json* it = object.find(name)) return it;
+    return std::unexpected(
+        "missing required moid declaration field '" +
+        field_path(parent, name) + "'");
 }
 
 std::expected<std::string, std::string> required_string(
@@ -300,8 +297,7 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
     if (!version) return std::unexpected(version.error());
     declaration.version = std::move(*version);
 
-    auto type = document.find("type");
-    if (type != document.end()) {
+    if (const Json* type = document.find("type")) {
         if (!type->is_string()) {
             return std::unexpected(
                 "moid declaration field 'type' must be a string");
@@ -408,8 +404,7 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
     declaration.compile_defines = std::move(*compile_defines);
     // Optional — cached declarations written before the public/private
     // split parse as empty (nothing propagates).
-    if (auto public_field = document.find("public_defines");
-        public_field != document.end()) {
+    if (const Json* public_field = document.find("public_defines")) {
         auto public_defines =
             compile_defines_from_json(*public_field, "public_defines");
         if (!public_defines) return std::unexpected(public_defines.error());
@@ -433,8 +428,7 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
     // inputs). Cached declarations written before these fields existed parse
     // as empty.
     std::set<std::string> binary_names;
-    auto binaries_field = document.find("binaries");
-    if (binaries_field != document.end()) {
+    if (const Json* binaries_field = document.find("binaries")) {
         if (!binaries_field->is_array()) {
             return std::unexpected(
                 "moid declaration field 'binaries' must be an array");
@@ -476,8 +470,7 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
         }
     }
 
-    auto tests_field = document.find("tests");
-    if (tests_field != document.end()) {
+    if (const Json* tests_field = document.find("tests")) {
         if (!tests_field->is_array()) {
             return std::unexpected(
                 "moid declaration field 'tests' must be an array");
@@ -525,8 +518,7 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
 
     // Optional: source deps consumed by the build script (declarations
     // written before this field existed parse as empty).
-    if (auto used = document.find("used_source_deps");
-        used != document.end()) {
+    if (const Json* used = document.find("used_source_deps")) {
         auto aliases = string_array(*used, "used_source_deps");
         if (!aliases) return std::unexpected(aliases.error());
         declaration.used_source_deps = std::move(*aliases);

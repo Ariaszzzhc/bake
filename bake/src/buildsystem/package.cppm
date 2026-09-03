@@ -3,7 +3,8 @@ export module bake.buildsystem.package;
 import std;
 import bake.util;
 import bake.buildsystem.project;
-import nlohmann.json;
+import bake.json;
+namespace json = bake::json;
 
 // ============================================================
 // bake.buildsystem.package — Resolver, Fetcher, Cache
@@ -61,16 +62,16 @@ export struct Lockfile {
 
         Lockfile lf;
 
-        nlohmann::json doc;
+        json::Value doc;
         try {
-            doc = nlohmann::json::parse(*content);
+            doc = json::Value::parse(*content);
         } catch (...) {
             return std::nullopt;
         }
 
         if (!doc.is_object()) return std::nullopt;
-        auto deps_it = doc.find("deps");
-        if (deps_it == doc.end() || !deps_it->is_object()) return std::nullopt;
+        const json::Value* deps_it = doc.find("deps");
+        if (!deps_it || !deps_it->is_object()) return std::nullopt;
 
         for (const auto& item : deps_it->items()) {
             const auto& val = item.value();
@@ -93,11 +94,11 @@ export struct Lockfile {
     }
 
     bool save(const Path& path) const {
-        nlohmann::json doc = nlohmann::json::object();
-        nlohmann::json deps_obj = nlohmann::json::object();
+        json::Value doc = json::Value::object();
+        json::Value deps_obj = json::Value::object();
 
         for (auto& [key, dep] : deps) {
-            nlohmann::json entry = nlohmann::json::object();
+            json::Value entry = json::Value::object();
             entry["url"] = dep.url;
             if (dep.is_archive()) {
                 entry["ref_type"] = "archive";
@@ -1162,6 +1163,25 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
             active_features_of(manifest, root_features);
         if (!root_active) return std::nullopt;
         enqueue_scopes(manifest, *root_active);
+
+        // Workspace members are first-class dependency scopes: their
+        // declarations resolve and lock exactly like the root's.
+        if (manifest.is_workspace()) {
+            for (const auto& member :
+                 manifest.workspace->members) {
+                Path member_dir =
+                    (manifest.project_dir / member.c_str())
+                        .lexically_normal();
+                if (!(member_dir / "bake.toml").is_regular_file())
+                    continue;
+                auto sub = Manifest::load_moid(member_dir);
+                if (!sub) continue;
+                sub->project_dir = member_dir;
+                auto member_active = active_features_of(*sub, {});
+                if (!member_active) return std::nullopt;
+                enqueue_scopes(*sub, *member_active);
+            }
+        }
     }
 
     // Dedupe by normalized url + ref identity within this run.

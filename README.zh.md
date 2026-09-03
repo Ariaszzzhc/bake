@@ -163,5 +163,5 @@ bake 附带双语使用手册：
 
 ## 许可证
 
-[MIT](LICENSE)。`lib/` 与 `third_party/` 下的自带源码保留各自上游许可证
+[MIT](LICENSE)。`lib/` 下的自带源码保留各自上游许可证
 （LLVM、Darwin、musl、MinGW-w64、glibc、compiler-rt、nlohmann/json、toml++）。

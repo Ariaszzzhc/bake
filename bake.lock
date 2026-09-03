@@ -1,0 +1,30 @@
+{
+  "deps": {
+    "archive:https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz": {
+      "url": "https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-9f57b730806150da960829a47f615e1d2ce2471e8b6be7e1dfd56d477531fc2d"
+    },
+    "archive:https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz": {
+      "url": "https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-61704580619a3183b385a8abece0639e60c170f79dab769ce42208ac24c620b1"
+    },
+    "git:https://github.com/bake-pkgs/json@ed3a1dd16f91eba70994a7cb3f358bd2c072245e": {
+      "url": "https://github.com/bake-pkgs/json",
+      "ref": "v3.12.2",
+      "ref_type": "tag",
+      "commit": "ed3a1dd16f91eba70994a7cb3f358bd2c072245e",
+      "integrity": "sha256-fa7366d6baf5c2953f5b92bc9252a4a437efe1536afbdfa1028997e444915642",
+      "name": "json"
+    },
+    "git:https://github.com/bake-pkgs/tomlplusplus@c5a9404e9fb963acf7b727c52e6b387df1b06da0": {
+      "url": "https://github.com/bake-pkgs/tomlplusplus",
+      "ref": "v3.4.3",
+      "ref_type": "tag",
+      "commit": "c5a9404e9fb963acf7b727c52e6b387df1b06da0",
+      "integrity": "sha256-c29cd8db3eba8c15043d12d70130635ff2789516c37135d27b8bfd08f0f71c99",
+      "name": "tomlplusplus"
+    }
+  }
+}

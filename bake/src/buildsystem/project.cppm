@@ -3,8 +3,9 @@ export module bake.buildsystem.project;
 import std;
 import bake.util;
 import bake.toolchain.target;
-import tomlplusplus;
-import nlohmann.json;
+import bake.toml;
+
+namespace toml = bake::toml;
 
 // ============================================================
 // bake.buildsystem.project — bake.toml model, layout, project discovery
@@ -300,7 +301,7 @@ export struct Manifest {
         Manifest m;
         m.project_dir = dir;
 
-        toml::table tbl;
+        toml::Table tbl;
         try {
             tbl = toml::parse_file(toml_path.string());
         } catch (const std::exception& e) {
@@ -309,7 +310,7 @@ export struct Manifest {
             return std::nullopt;
         }
 
-        auto parse_string_array = [](const toml::node& value)
+        auto parse_string_array = [](const toml::Node& value)
                 -> std::vector<std::string> {
             std::vector<std::string> result;
             if (auto* arr = value.as_array()) {
@@ -325,7 +326,7 @@ export struct Manifest {
         // Parse one dependency entry — shared by the global [dependencies]
         // and every [target."<glob>".dependencies] scope.
         auto parse_dependency_entry =
-            [&](const std::string& name, const toml::node& val)
+            [&](const std::string& name, const toml::Node& val)
                 -> std::optional<Dependency> {
             auto* t = val.as_table();
             if (!t) {
@@ -451,7 +452,7 @@ export struct Manifest {
         if (auto* deps = tbl["dependencies"].as_table()) {
             for (auto& [key, val] : *deps) {
                 auto parsed =
-                    parse_dependency_entry(std::string(key.str()), val);
+                    parse_dependency_entry(key, val);
                 if (!parsed) return std::nullopt;
                 m.dependencies[parsed->name] = std::move(*parsed);
             }
@@ -471,7 +472,7 @@ export struct Manifest {
         // activation list, every other key is a feature spec.
         if (auto* feats = tbl["features"].as_table()) {
             for (auto& [key, val] : *feats) {
-                std::string feat_name = std::string(key.str());
+                std::string feat_name = key;
                 if (feat_name == "default") {
                     if (!val.is_array()) {
                         std::println(std::cerr,
@@ -512,7 +513,7 @@ export struct Manifest {
                 if (auto* deps = (*spec)["dependencies"].as_table()) {
                     for (auto& [dep_key, dep_val] : *deps) {
                         auto parsed = parse_dependency_entry(
-                            std::string(dep_key.str()), dep_val);
+                            dep_key, dep_val);
                         if (!parsed) return std::nullopt;
                         value.dependencies[parsed->name] = std::move(*parsed);
                     }
@@ -566,7 +567,7 @@ export struct Manifest {
                     pc.sanitize = parse_string_array(*san);
                 if (auto s = (*pt)["warnings"].value<std::string>())
                     pc.warnings = *s;
-                m.profiles[std::string(prof_key.str())] = std::move(pc);
+                m.profiles[prof_key] = std::move(pc);
             }
         }
 
@@ -576,7 +577,7 @@ export struct Manifest {
                 auto* tt = tgt_val.as_table();
                 if (!tt) continue;
                 TargetCondition tc;
-                tc.triple_pattern = std::string(tgt_key.str());
+                tc.triple_pattern = tgt_key;
 
                 if (!valid_target_pattern(tc.triple_pattern)) {
                     std::println(std::cerr,
@@ -606,7 +607,7 @@ export struct Manifest {
                 if (auto* tdeps = (*tt)["dependencies"].as_table()) {
                     for (auto& [key, val] : *tdeps) {
                         auto parsed =
-                            parse_dependency_entry(std::string(key.str()), val);
+                            parse_dependency_entry(key, val);
                         if (!parsed) return std::nullopt;
                         tc.dependencies[parsed->name] = std::move(*parsed);
                     }

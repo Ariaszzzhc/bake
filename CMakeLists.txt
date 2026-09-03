@@ -55,16 +55,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_link_options(-stdlib=libc++)
 endif()
 
-# ---- Third-party header-only libraries ----
-
-add_library(tomlplusplus INTERFACE)
-target_include_directories(tomlplusplus INTERFACE
-    ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus/public)
-
-add_library(nlohmann_json INTERFACE)
-target_include_directories(nlohmann_json INTERFACE
-    ${CMAKE_SOURCE_DIR}/third_party/nlohmann/public)
-
 # ---- bake (single executable: CLI + compiler + engine + package) ----
 
 add_executable(bake
@@ -75,8 +65,8 @@ target_sources(bake
     PUBLIC
         FILE_SET CXX_MODULES
         FILES
-            third_party/nlohmann/public/nlohmann.json.cppm
-            third_party/tomlplusplus/public/tomlplusplus.cppm
+            bake/src/json.cppm
+            bake/src/toml.cppm
             bake/src/util.cppm
             bake/src/buildsystem/project.cppm
             bake/src/buildsystem/moid.cppm
@@ -90,6 +80,15 @@ target_sources(bake
             bake/src/toolchain/driver.cppm
             bake/src/buildsystem/engine.cppm
             bake/src/buildsystem/package.cppm
+)
+
+# stage0 implementation units of bake.json / bake.toml — hand-written,
+# zero third-party sources. The self-hosted build compiles the
+# nlohmann/toml++-backed units (src/json.cpp, src/toml.cpp) instead,
+# with the packages coming from bake-pkgs.
+target_sources(bake PRIVATE
+    bake/src/stage0/json.cpp
+    bake/src/stage0/toml.cpp
 )
 
 target_compile_features(bake PRIVATE cxx_std_23)
@@ -107,14 +106,12 @@ file(GLOB BAKE_LLD_STATIC_LIBS   "${LLVM_PREFIX}/lib/liblld*.a")
 # on its own and rejects the flag.
 if(APPLE)
     target_link_libraries(bake PRIVATE
-        tomlplusplus nlohmann_json
         ${BAKE_CLANG_STATIC_LIBS}
         ${BAKE_LLD_STATIC_LIBS}
         ${BAKE_LLVM_STATIC_LIBS}
     )
 else()
     target_link_libraries(bake PRIVATE
-        tomlplusplus nlohmann_json
         -Wl,--start-group
         ${BAKE_CLANG_STATIC_LIBS}
         ${BAKE_LLD_STATIC_LIBS}
@@ -142,8 +139,6 @@ target_include_directories(bake PRIVATE
     ${LLVM_INCLUDE_DIRS}
     ${CLANG_INCLUDE_DIRS}
     ${LLD_INCLUDE_DIRS}
-    ${CMAKE_SOURCE_DIR}/third_party/tomlplusplus/public
-    ${CMAKE_SOURCE_DIR}/third_party/nlohmann/public
 )
 target_compile_definitions(bake PRIVATE
     BAKE_VERSION="${PROJECT_VERSION}"
@@ -188,7 +183,6 @@ target_compile_definitions(test_runner PRIVATE
 )
 
 add_executable(graph_test tests/graph_test.cpp)
-target_link_libraries(graph_test PRIVATE tomlplusplus nlohmann_json)
 target_compile_features(graph_test PRIVATE cxx_std_23)
 set_target_properties(graph_test PROPERTIES CXX_MODULE_STD ON)
 
@@ -199,14 +193,36 @@ target_sources(graph_test
     PUBLIC
         FILE_SET CXX_MODULES
         FILES
-            third_party/nlohmann/public/nlohmann.json.cppm
-            third_party/tomlplusplus/public/tomlplusplus.cppm
+            bake/src/json.cppm
+            bake/src/toml.cppm
             bake/src/util.cppm
             bake/src/toolchain/target.cppm
             bake/src/buildsystem/project.cppm
             bake/src/buildsystem/moid.cppm
             bake/src/buildsystem/graph.cppm
 )
+
+target_sources(graph_test PRIVATE
+    bake/src/stage0/json.cpp
+    bake/src/stage0/toml.cpp
+)
+
+add_executable(parser_test tests/parser_test.cpp)
+target_compile_features(parser_test PRIVATE cxx_std_23)
+set_target_properties(parser_test PROPERTIES CXX_MODULE_STD ON)
+target_sources(parser_test
+    PUBLIC
+        FILE_SET CXX_MODULES
+        FILES
+            bake/src/json.cppm
+            bake/src/toml.cppm
+)
+target_sources(parser_test PRIVATE
+    bake/src/stage0/json.cpp
+    bake/src/stage0/toml.cpp
+)
+
+add_test(NAME parser_test COMMAND parser_test)
 
 add_test(
     NAME bake_test_suite

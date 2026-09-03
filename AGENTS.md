@@ -33,8 +33,11 @@ instincts, these rules win:
 # Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 22 + libc++)
 cmake -G Ninja -B build && cmake --build build
 
-# Run the test suite (66 end-to-end tests)
+# Run the test suite (e2e + graph + parser units)
 ctest --test-dir build --output-on-failure
+
+# Self-host needs the two bake-pkgs packages fetched first (json, tomlplusplus)
+./build/bake update
 
 # Self-host: stage 0 bake builds itself → out/bin/bake
 ./build/bake build
@@ -132,6 +135,11 @@ bake/
 │   └── src/
 │       ├── main.cpp             composition root: multicall dispatch + build commands
 │       ├── util.cppm            Path, SHA-256, glob, process spawn, bake_exe_path
+│       ├── json.cppm            bake.json interface (DOM, accessors)
+│       ├── toml.cppm            bake.toml interface (Table/Node model)
+│       ├── json.cpp             bake.json impl: nlohmann/json (self-host, via bake-pkgs)
+│       ├── toml.cpp             bake.toml impl: toml++ (self-host, via bake-pkgs)
+│       ├── stage0/              hand-written bake.json/bake.toml impls (CMake bootstrap)
 │       ├── toolchain/           bake.toolchain.* — the embedded toolchain (mechanism)
 │       │   ├── target.cppm                TargetSpec, triple parsing/matching
 │       │   ├── lld.cppm                   in-process LLD link + archive write
@@ -159,9 +167,6 @@ bake/
 │   │   ├── mingw/               MinGW-w64 headers + CRT sources
 │   │   └── include/             multi-platform headers (linux, generic)
 │   └── include/                 vendored Clang/LLVM headers
-├── third_party/           header-only libs as moid packages
-│   ├── nlohmann/                json
-│   └── tomlplusplus/            toml++
 ├── scripts/
 │   ├── build-llvm.sh            build LLVM into external/
 │   ├── fetch-darwin-headers.sh  extract macOS SDK stubs
@@ -174,6 +179,7 @@ bake/
 ├── tests/
 │   ├── test_runner.cpp          custom test framework, spawns bake binary
 │   ├── graph_test.cpp           unit tests for graph/moid logic
+│   ├── parser_test.cpp          contract tests for bake.json / bake.toml
 │   └── projects/                fixture projects (64 test cases)
 └── external/              LLVM source + prebuilt install (git submodule)
 ```
@@ -282,7 +288,7 @@ no manual bump markers. Managed by `toolchain_cache_lookup`/`finish`.
 - **`import std;`** — all standard library access via `import std;`, not `#include`. The only `#include` in module files are platform/OS headers (`<errno.h>`, `<sys/wait.h>`, `<windows.h>`) in the **global module fragment** (`module;` before `export module`).
 - **I/O**: `std::println(...)` for stdout, `std::println(std::cerr, ...)` for stderr. `{}` format placeholders, not printf. No `fprintf`/`printf`/bare `stderr`/`stdout`.
 - **Module naming**: `bake.<scope>.<name>` with two scopes — `bake.toolchain.*` (the embedded toolchain: mechanism, must never import `bake.buildsystem.*`) and `bake.buildsystem.*` (build system: policy, may import `bake.toolchain.*`). Module files carry only their leaf name; the scope comes from the directory (`toolchain/target.cppm` → `bake.toolchain.target`, `util.cppm` at src/ root → `bake.util`). `bake.build.cppm` (downstream build.cpp API, in lib/bake/) keeps its full name.
-- **Module chain**: `bake.util` → { `bake.toolchain.target`, `bake.buildsystem.project` } → { `bake.toolchain.lld`, `bake.buildsystem.cmdgen` } → `bake.toolchain.runtime` → { `bake.toolchain.cc1`, `bake.toolchain.cc1as` } → `bake.toolchain.driver` → { `bake.buildsystem.moid` / `graph`, `engine` / `package` } → `main.cpp` (composition root, no CLI module). The two scopes meet only at `TargetSpec` + plain argv strings.
+- **Module chain**: { `bake.json`, `bake.toml` } (two impls per module: hand-written `src/stage0/*.cpp` for the CMake bootstrap, nlohmann/json + toml++ via bake-pkgs for the self-host) → `bake.util` → { `bake.toolchain.target`, `bake.buildsystem.project` } → { `bake.toolchain.lld`, `bake.buildsystem.cmdgen` } → `bake.toolchain.runtime` → { `bake.toolchain.cc1`, `bake.toolchain.cc1as` } → `bake.toolchain.driver` → { `bake.buildsystem.moid` / `graph`, `engine` / `package` } → `main.cpp` (composition root, no CLI module). The two scopes meet only at `TargetSpec` + plain argv strings.
 - **User-facing output uses `macos`** not `darwin` for platform names.
 - **Commit messages**: conventional commits, subject-only ≤ 50 chars. Describe what changed, not why.
 

@@ -170,6 +170,6 @@ about [dependencies](docs/en/guide/dependencies.md),
 
 ## License
 
-[MIT](LICENSE). The vendored sources under `lib/` and `third_party/` keep
+[MIT](LICENSE). The vendored sources under `lib/` keep
 their upstream licenses (LLVM, Darwin, musl, MinGW-w64, glibc, compiler-rt,
 nlohmann/json, toml++).

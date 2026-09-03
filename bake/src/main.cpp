@@ -13,7 +13,6 @@ import bake.buildsystem.graph;
 import bake.buildsystem.cmdgen;
 import bake.buildsystem.engine;
 import bake.buildsystem.package;
-import tomlplusplus;
 
 #ifndef BAKE_VERSION
 #define BAKE_VERSION "0.1.0"
@@ -1277,10 +1276,26 @@ int cmd_update(const ParsedArgs &args) {
     return 1;
   }
 
+  // Root + workspace members all carry dependency scopes.
+  std::vector<Manifest> manifests;
+  manifests.push_back(*manifest);
+  if (manifest->is_workspace()) {
+    for (const auto &member : manifest->workspace->members) {
+      Path member_dir = (*root / member.c_str()).lexically_normal();
+      auto sub = Manifest::load(member_dir);
+      if (sub) {
+        sub->project_dir = member_dir;
+        manifests.push_back(std::move(*sub));
+      }
+    }
+  }
 
-  bool has_any_dep = !manifest->dependencies.empty();
-  for (const auto &condition : manifest->targets)
-    has_any_dep = has_any_dep || !condition.dependencies.empty();
+  bool has_any_dep = false;
+  for (const auto &m : manifests) {
+    has_any_dep = has_any_dep || !m.dependencies.empty();
+    for (const auto &condition : m.targets)
+      has_any_dep = has_any_dep || !condition.dependencies.empty();
+  }
   if (!has_any_dep) {
     std::println("bake: no dependencies to update");
     return 0;
@@ -1297,10 +1312,13 @@ int cmd_update(const ParsedArgs &args) {
       auto it = deps.find(filter_dep);
       return it == deps.end() ? nullptr : &it->second;
     };
-    filter = find_scope(manifest->dependencies);
-    for (const auto &condition : manifest->targets) {
+    for (const auto &m : manifests) {
       if (filter) break;
-      filter = find_scope(condition.dependencies);
+      filter = find_scope(m.dependencies);
+      for (const auto &condition : m.targets) {
+        if (filter) break;
+        filter = find_scope(condition.dependencies);
+      }
     }
     if (!filter) {
       std::println(std::cerr, "bake: dependency '{}' not found in bake.toml",
@@ -1384,13 +1402,15 @@ int cmd_update(const ParsedArgs &args) {
   };
 
   if (filter_dep.empty()) {
-    for (auto &[name, dep] : manifest->dependencies) {
-      if (dep.is_path_dep) continue;
-      report_change(name, dep);
+    for (const auto &m : manifests) {
+      for (auto &[name, dep] : m.dependencies) {
+        if (dep.is_path_dep) continue;
+        report_change(name, dep);
+      }
+      for (const auto &condition : m.targets)
+        for (auto &[name, dep] : condition.dependencies)
+          if (!dep.is_path_dep) report_change(name, dep);
     }
-    for (const auto &condition : manifest->targets)
-      for (auto &[name, dep] : condition.dependencies)
-        if (!dep.is_path_dep) report_change(name, dep);
   } else {
     report_change(filter_dep, *filter);
   }

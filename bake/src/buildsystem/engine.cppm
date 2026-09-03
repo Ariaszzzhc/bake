@@ -22,7 +22,8 @@ import bake.buildsystem.graph;
 import bake.buildsystem.cmdgen;
 import bake.toolchain.target;
 import bake.toolchain.runtime;
-import nlohmann.json;
+import bake.json;
+namespace json = bake::json;
 
 
 // ============================================================
@@ -869,16 +870,16 @@ std::string serialize_features(const std::vector<std::string> &features) {
   return out;
 }
 
-nlohmann::json
+json::Value
 declaration_features_json(const std::vector<std::string> &features) {
-  return nlohmann::json(features);
+  return json::Value(features);
 }
 
 std::string
 serialize_declaration_dependencies(const std::vector<MoidEdge> &edges) {
-  nlohmann::json dependencies = nlohmann::json::array();
+  json::Value dependencies = json::Value::array();
   for (const auto &edge : edges) {
-    nlohmann::json dep_features = nlohmann::json::array();
+    json::Value dep_features = json::Value::array();
     for (const auto &feature : edge.features)
       dep_features.push_back(feature);
     dependencies.push_back({
@@ -2309,13 +2310,13 @@ export std::expected<BuildGraph, std::string> build_graph(
 export BuildGraph read_graph_json(const Path& path);
 
 export void write_graph_json(const BuildGraph& graph, const Path& path) {
-    nlohmann::json j;
+    json::Value j;
     j["state_dir"] = graph.state_dir.string();
     j["project_root"] = graph.project_root.string();
 
-    auto actions_arr = nlohmann::json::array();
+    auto actions_arr = json::Value::array();
     for (const auto& action : graph.actions) {
-        nlohmann::json aj;
+        json::Value aj;
         switch (action.type) {
             case BuildAction::Type::CompileModule: aj["type"] = "compile_module"; break;
             case BuildAction::Type::Compile:       aj["type"] = "compile"; break;
@@ -2378,9 +2379,9 @@ export BuildGraph read_graph_json(const Path& path) {
     auto content = read_file(path);
     if (!content) return graph;
 
-    nlohmann::json j;
+    json::Value j;
     try {
-        j = nlohmann::json::parse(*content);
+        j = json::Value::parse(*content);
     } catch (...) {
         return graph;
     }
@@ -2453,7 +2454,7 @@ export bool needs_rebuild(const BuildAction& action) {
 namespace {
 
 std::string action_fingerprint(const BuildAction& action) {
-    nlohmann::json doc;
+    json::Value doc;
     doc["type"] = static_cast<int>(action.type);
     doc["id"] = action.id;
     doc["command"] = action.command;
@@ -2473,7 +2474,7 @@ std::map<std::string, std::string> load_fingerprints(const Path& path) {
     auto content = read_file(path);
     if (!content) return result;
     try {
-        auto doc = nlohmann::json::parse(*content);
+        auto doc = json::Value::parse(*content);
         if (doc.value("schema", 0) != 1 || !doc.contains("actions"))
             return result;
         for (auto& item : doc["actions"].items()) {
@@ -2749,9 +2750,9 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
     }
 
     // Save fingerprints
-    nlohmann::json state;
+    json::Value state;
     state["schema"] = 1;
-    state["actions"] = nlohmann::json::object();
+    state["actions"] = json::Value::object();
     for (std::size_t i = 0; i < graph.actions.size(); ++i)
         state["actions"][graph.actions[i].id] = fingerprints[i];
     atomic_write_file(state_path, state.dump(2));
@@ -2764,13 +2765,13 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
 // ===== compile_commands.json =====
 
 export void write_compile_commands(const BuildGraph& graph, const Path& output_path) {
-    nlohmann::json commands = nlohmann::json::array();
+    json::Value commands = json::Value::array();
 
     for (auto& action : graph.actions) {
         if (!action.is_compile()) continue;
         if (action.inputs.empty() || action.outputs.empty()) continue;
 
-        nlohmann::json entry;
+        json::Value entry;
         entry["directory"] = graph.project_root.absolute().string();
 
         std::string cmd_str;
