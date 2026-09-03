@@ -78,7 +78,8 @@ default = ["tls-mbedtls", "zlib"]     # 保留名：无任何激活时的默认�
 tls-mbedtls = {
   platforms = ["*-apple-darwin", "*-linux-*"],   # 仅这些目标生效；缺省 = 全部
   dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } },  # 条目语法与 [dependencies] 相同，仅激活时解析
-  defines = ["USE_MBEDTLS"],                     # 注入本包编译的宏（"NAME" 或 "NAME=VALUE"）
+  defines = ["USE_MBEDTLS"],                     # 注入本包编译的宏（"NAME" 或 "NAME=VALUE"），默认私有
+  public_defines = ["PCRE2_CODE_UNIT_WIDTH=8"],  # 同时传播给依赖方 TU（如头文件要求的静态链接/形态宏）
   conflicts = ["tls-openssl"],                   # 互斥特性名
 }
 zlib = {}                             # 纯宏特性：只产生 BAKE_<MOID>_ZLIB
@@ -143,7 +144,8 @@ BAKE_MYAPP_VERSION_PATCH = 0
 
 `[target."<glob>"]` 节额外接受：
 
-- `defines` — 本包编译时传入的预处理器宏（`"NAME"` 或 `"NAME=VALUE"`）
+- `defines` — 本包编译时传入的预处理器宏（`"NAME"` 或 `"NAME=VALUE"`），默认私有
+- `public_defines` — 同 `defines`，但会传递性传播给依赖方的编译单元（静态链接宏如 `CARES_STATICLIB`、头文件形态宏如 `PCRE2_CODE_UNIT_WIDTH=8`）
 - `flags` — 追加到编译命令的 flags
 - `include_dirs` — 追加的 include 路径
 

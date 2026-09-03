@@ -78,7 +78,8 @@ default = ["tls-mbedtls", "zlib"]     # reserved: the activation set when nothin
 tls-mbedtls = {
   platforms = ["*-apple-darwin", "*-linux-*"],   # applies only to these targets; omitted = all
   dependencies = { mbedtls = { url = "...", tag = "v3.6.7" } },  # same entry grammar as [dependencies]; resolved only when active
-  defines = ["USE_MBEDTLS"],                     # macros injected into this package's compiles ("NAME" or "NAME=VALUE")
+  defines = ["USE_MBEDTLS"],                     # macros injected into this package's compiles ("NAME" or "NAME=VALUE"); private by default
+  public_defines = ["PCRE2_CODE_UNIT_WIDTH=8"],  # also propagated to dependents' TUs (static-linkage / header-shape macros)
   conflicts = ["tls-openssl"],                   # mutually exclusive feature names
 }
 zlib = {}                             # macro-only feature: just BAKE_<MOID>_ZLIB
@@ -143,7 +144,8 @@ The lockfile records every non-path dependency. Git keys are `git:<url>@<commit>
 
 `[target."<glob>"]` sections additionally accept:
 
-- `defines` — preprocessor macros passed when compiling this package (`"NAME"` or `"NAME=VALUE"`)
+- `defines` — preprocessor macros passed when compiling this package (`"NAME"` or `"NAME=VALUE"`); private by default
+- `public_defines` — like `defines`, but propagated transitively to dependents' translation units (static-linkage macros like `CARES_STATICLIB`, header-shape macros like `PCRE2_CODE_UNIT_WIDTH=8`)
 - `flags` — extra compiler flags appended to compile commands
 - `include_dirs` — extra include paths
 

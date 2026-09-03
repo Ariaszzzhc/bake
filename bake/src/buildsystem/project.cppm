@@ -93,6 +93,7 @@ export struct FeatureSpec {
     std::vector<std::string> platforms;  // triple globs; empty = all targets
     std::map<std::string, Dependency> dependencies;
     std::vector<std::string> defines;    // "NAME" or "NAME=VALUE"
+    std::vector<std::string> public_defines;  // propagate to consumers
     std::vector<std::string> conflicts;  // mutually exclusive feature names
 };
 
@@ -148,6 +149,7 @@ export struct TargetCondition {
     std::vector<std::string> libraries;
     std::vector<std::string> frameworks;
     std::vector<std::string> defines;
+    std::vector<std::string> public_defines;  // propagate to consumers
     std::vector<std::string> flags;
     std::vector<std::string> include_dirs;
     // Target-scoped dependencies: merged into the effective dependency set
@@ -520,6 +522,11 @@ export struct Manifest {
                         if (auto s = elem.value<std::string>())
                             value.defines.push_back(*s);
                 }
+                if (auto* arr = (*spec)["public_defines"].as_array()) {
+                    for (auto& elem : *arr)
+                        if (auto s = elem.value<std::string>())
+                            value.public_defines.push_back(*s);
+                }
                 if (auto* arr = (*spec)["conflicts"].as_array()) {
                     for (auto& elem : *arr)
                         if (auto s = elem.value<std::string>())
@@ -587,6 +594,9 @@ export struct Manifest {
                 if (auto* defs = (*tt)["defines"].as_array())
                     for (auto& e : *defs)
                         if (auto s = e.value<std::string>()) tc.defines.push_back(*s);
+                if (auto* pdefs = (*tt)["public_defines"].as_array())
+                    for (auto& e : *pdefs)
+                        if (auto s = e.value<std::string>()) tc.public_defines.push_back(*s);
                 if (auto* flags = (*tt)["flags"].as_array())
                     for (auto& e : *flags)
                         if (auto s = e.value<std::string>()) tc.flags.push_back(*s);

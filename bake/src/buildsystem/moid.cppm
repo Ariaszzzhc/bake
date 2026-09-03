@@ -47,6 +47,11 @@ export struct MoidDeclaration {
     // Resolved at configure time (profile/target analysis)
     std::vector<std::string> compile_flags;
     std::vector<std::pair<std::string, std::string>> compile_defines;
+    // Subset of compile_defines that also propagates to consumers (via
+    // CompileUsage): static-linkage macros, API-shape macros like
+    // PCRE2_CODE_UNIT_WIDTH. Everything else is private to this moid's
+    // own translation units.
+    std::vector<std::pair<std::string, std::string>> public_compile_defines;
     std::vector<std::string> extra_include_dirs;
     std::vector<std::string> link_flags;
     // Prebuilt libraries (.a/.so paths for linking)
@@ -241,6 +246,8 @@ Json declaration_to_json(const MoidDeclaration& declaration) {
 
     document["flags"] = declaration.compile_flags;
     document["defines"] = compile_defines_to_json(declaration.compile_defines);
+    document["public_defines"] =
+        compile_defines_to_json(declaration.public_compile_defines);
     document["include_dirs"] = declaration.extra_include_dirs;
     document["link_flags"] = declaration.link_flags;
     document["prebuilt_libs"] = declaration.prebuilt_libs;
@@ -399,6 +406,15 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
         compile_defines_from_json(**compile_defines_field, "defines");
     if (!compile_defines) return std::unexpected(compile_defines.error());
     declaration.compile_defines = std::move(*compile_defines);
+    // Optional — cached declarations written before the public/private
+    // split parse as empty (nothing propagates).
+    if (auto public_field = document.find("public_defines");
+        public_field != document.end()) {
+        auto public_defines =
+            compile_defines_from_json(*public_field, "public_defines");
+        if (!public_defines) return std::unexpected(public_defines.error());
+        declaration.public_compile_defines = std::move(*public_defines);
+    }
 
     auto extra_include_dirs =
         required_string_array(document, "include_dirs");

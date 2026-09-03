@@ -2960,7 +2960,7 @@ TestResult test_feature_default_off() {
             "[language]\nc = \"c17\"\n\n"
             "[features]\n"
             "default = [\"extra\"]\n"
-            "extra = { defines = [\"LIB_EXTRA=1\"] }\n");
+            "extra = { public_defines = [\"LIB_EXTRA=1\"] }\n");
         write_file(root / "lib/src/v.c",
             "int v(void) {\n"
             "#ifdef LIB_EXTRA\n"
@@ -3065,6 +3065,63 @@ TestResult test_feature_default_off() {
     CHECK_EQ(run_mixed.stdout, std::string("extra 2\n"),
              "mixed edges dropped the union default feature: " +
                  run_mixed.stdout);
+
+    return {};
+}
+
+// defines are private to the declaring moid's translation units; only
+// public_defines entries (and the informational BAKE_* auto macros)
+// propagate to consumers. The declaring moid sees both kinds.
+TestResult test_define_visibility() {
+    auto dir = make_temp_dir("define_visibility");
+    write_file(dir / "lib/bake.toml",
+        "[package]\n"
+        "name = \"vislib\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[features]\n"
+        "modern = { defines = [\"VIS_PRIVATE=1\"], "
+        "public_defines = [\"VIS_PUBLIC=7\"] }\n\n"
+        "[dependencies]\n"
+        "# none\n");
+    write_file(dir / "lib/src/v.c",
+        "int v(void) {\n"
+        "#if VIS_PRIVATE == 1 && VIS_PUBLIC == 7\n"
+        "return 1;\n"
+        "#else\n"
+        "return 0;\n"
+        "#endif\n"
+        "}\n");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"vis-app\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n\n"
+        "[dependencies]\n"
+        "vislib = { path = \"lib\", features = [\"modern\"] }\n");
+    write_file(dir / "src/main.c",
+        "#include <stdio.h>\n"
+        "int v(void);\n"
+        "int main(void) {\n"
+        "int private_leaked = 0, public_seen = 0;\n"
+        "#ifdef VIS_PRIVATE\n"
+        "private_leaked = 1;\n"
+        "#endif\n"
+        "#if VIS_PUBLIC == 7\n"
+        "public_seen = 1;\n"
+        "#endif\n"
+        "printf(\"%d %d %d\\n\", v(), private_leaked, public_seen);\n"
+        "return 0;\n"
+        "}\n");
+
+    auto built = run_bake("build", dir);
+    CHECK(built.success(), "visibility build failed: " + built.stdout);
+    auto run = run_cmd(
+        (target_output_dir(dir) / "bin" / "vis-app").string(), dir);
+    // v()==1 (lib sees both defines), private must NOT leak, public must.
+    CHECK_EQ(run.stdout, std::string("1 0 1\n"),
+             "define visibility contract broken: " + run.stdout);
 
     return {};
 }
@@ -4694,6 +4751,7 @@ TestResult test_target_output_isolation() {
 static std::vector<TestCase> all_tests = {
     {"with_ubsan",                   test_with_ubsan},
     {"with_asan",                    test_with_asan},
+    {"define_visibility",            test_define_visibility},
     {"cross_gnu",                     test_cross_gnu},
     {"cross_gnu_cpp",                 test_cross_gnu_cpp},
     {"cross_gnu_prereq",              test_cross_gnu_prereq},

@@ -1137,7 +1137,7 @@ void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
       [](const TargetMatch &a, const TargetMatch &b) { return a.wc > b.wc; });
 
   std::vector<std::string> tgt_flags, tgt_libs, tgt_frameworks, tgt_defines,
-      tgt_includes;
+      tgt_public_defines, tgt_includes;
   for (const auto &match : matches) {
     for (auto &f : match.cond->flags)
       tgt_flags.push_back(f);
@@ -1145,6 +1145,8 @@ void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
       tgt_libs.push_back(l);
     for (auto &d : match.cond->defines)
       tgt_defines.push_back(d);
+    for (auto &d : match.cond->public_defines)
+      tgt_public_defines.push_back(d);
     for (auto &i : match.cond->include_dirs)
       tgt_includes.push_back(i);
     if (target.is_darwin())
@@ -1154,32 +1156,48 @@ void merge_manifest_config(MoidDeclaration &decl, const Manifest &manifest,
   for (auto &f : tgt_flags)
     decl.compile_flags.push_back(f);
 
-  // Defines: option macros + package macros + profile defines + target defines
+  // Defines: auto macros + feature/target defines, split by visibility.
+  // Everything applies to this moid's own translation units; only
+  // `public_defines` entries and the informational BAKE_* auto macros
+  // propagate to consumers (public_compile_defines → CompileUsage).
   decl.compile_defines.clear();
+  decl.public_compile_defines.clear();
+  auto add_define =
+      [](std::vector<std::pair<std::string, std::string>> &out,
+         const std::string &raw) {
+          auto equals = raw.find('=');
+          out.push_back(equals == std::string::npos
+                            ? std::pair{raw, std::string{}}
+                            : std::pair{raw.substr(0, equals),
+                                        raw.substr(equals + 1)});
+      };
   for (auto &[k, v] : generate_feature_macros(decl.name, manifest.features,
-                                              decl.active_features))
+                                              decl.active_features)) {
     decl.compile_defines.push_back({k, v});
+    decl.public_compile_defines.push_back({k, v});
+  }
   for (const auto& feature_name : decl.active_features) {
     auto feature = manifest.features.find(feature_name);
     if (feature == manifest.features.end()) continue;
-    for (const auto& define : feature->second.defines) {
-      auto equals = define.find('=');
-      decl.compile_defines.push_back(
-          equals == std::string::npos
-              ? std::pair{define, std::string{}}
-              : std::pair{define.substr(0, equals),
-                          define.substr(equals + 1)});
+    for (const auto& define : feature->second.defines)
+      add_define(decl.compile_defines, define);
+    for (const auto& define : feature->second.public_defines) {
+      add_define(decl.compile_defines, define);
+      add_define(decl.public_compile_defines, define);
     }
   }
-  for (auto &[k, v] : generate_package_macros(decl.name, decl.version))
+  for (auto &[k, v] : generate_package_macros(decl.name, decl.version)) {
     decl.compile_defines.push_back({k, v});
+    decl.public_compile_defines.push_back({k, v});
+  }
+  // Profile defines (e.g. NDEBUG) describe this moid's own compile mode.
   for (auto &[k, v] : resolved.defines)
     decl.compile_defines.push_back({k, v});
-  for (auto &d : tgt_defines) {
-    auto eq = d.find('=');
-    decl.compile_defines.push_back(
-        eq != std::string::npos ? std::pair{d.substr(0, eq), d.substr(eq + 1)}
-                                : std::pair{d, std::string{}});
+  for (auto &d : tgt_defines)
+    add_define(decl.compile_defines, d);
+  for (auto &d : tgt_public_defines) {
+    add_define(decl.compile_defines, d);
+    add_define(decl.public_compile_defines, d);
   }
 
   for (auto &i : tgt_includes)
@@ -1507,8 +1525,9 @@ export std::expected<BuildGraph, std::string> build_graph(
                 resolve_path(include_dir, rm.source_dir));
         }
 
-        // Propagate compile_defines to consumers via CompileUsage.
-        for (const auto& [name, value] : decl.compile_defines) {
+        // Propagate public defines to consumers via CompileUsage. Private
+        // defines stay confined to this moid's own translation units.
+        for (const auto& [name, value] : decl.public_compile_defines) {
             std::string define = value.empty() ? name : name + "=" + value;
             append_unique_string(rm.own_compile.defines, define);
         }

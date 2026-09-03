@@ -146,4 +146,4 @@ bake remove <name> [--target <glob>]
 
 ## 图中的选项
 
-`[features]` 是命名的特性束，会在整个依赖图上并集合一（参见 [Profiles 与特性](../reference/profiles.md)）。在 `curl` 依赖上激活 `tls-openssl` 会解析该特性的依赖（openssl port）、注入其 `defines`，并以 `BAKE_CURL_TLS_OPENSSL=1` 编译该依赖；互斥特性（`conflicts`）遵循显式胜默认——显式激活会降级冲突的默认特性（如默认 `tls-mbedtls` 让位于你显式选择的 `tls-openssl`）；两个显式激活互相冲突才报错。
+`[features]` 是命名的特性束，会在整个依赖图上并集合一（参见 [Profiles 与特性](../reference/profiles.md)）。在 `curl` 依赖上激活 `tls-openssl` 会解析该特性的依赖（openssl port）、注入其 `defines`（注意：`defines` 只作用于该依赖自身的编译单元；要传进你的 TU 需 `public_defines`），并以 `BAKE_CURL_TLS_OPENSSL=1` 编译该依赖；互斥特性（`conflicts`）遵循显式胜默认——显式激活会降级冲突的默认特性（如默认 `tls-mbedtls` 让位于你显式选择的 `tls-openssl`）；两个显式激活互相冲突才报错。要裁剪依赖的默认特性，在该依赖上声明 `default-features = false`——该边只贡献 `features` 显式点名的特性，其他边的并集不受影响（混合时 bake 会警告）。例如只要无 PNG 的 freetype：`freetype = { url = "...", tag = "v2.14.3", default-features = false }`。
