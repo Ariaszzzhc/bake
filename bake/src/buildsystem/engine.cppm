@@ -228,29 +228,67 @@ std::optional<std::pair<std::string, bool>> parse_include_line(
 // build input so mtime comparison and fingerprints see header edits.
 // Unresolved names are system/toolchain headers — their paths are
 // content-addressed, so any re-provisioning changes the command and the
-// flags, which never appear as #include directives; they arrive as raw
-// flag tokens and the "-include <file>" pairs are picked out below.
-std::vector<Path> collect_header_inputs(
-    const Path& source,
-    const std::vector<Path>& include_dirs,
-    const std::vector<std::string>& extra_flags,
-    std::map<std::string, std::vector<Path>>& closure_cache) {
-    std::string dirs_key;
-    for (const auto& dir : include_dirs) {
-        dirs_key += dir.string();
-        dirs_key += '\x1e';
+// fingerprint; they are skipped here. -include forced headers arrive as
+// raw flag tokens; the "-include <file>" pairs are picked out below.
+//
+// Three memoization levels keep large graphs cheap: per-file parse
+// results (the include directives of a header are identical for every TU
+// that reaches it), per-file resolved children (same include-dir list),
+// and per-source closures. A 900-TU vendored tree parses each of its
+// ~250 headers once, not 900 times.
+class HeaderClosureScanner {
+public:
+    std::vector<Path> closure(const Path& source,
+                              const std::vector<Path>& include_dirs,
+                              const std::vector<std::string>& extra_flags) {
+        const std::string dirs_key = join_dirs(include_dirs);
+        const std::string closure_key = source.string() + '\x1f' + dirs_key;
+        auto cached = closures_.find(closure_key);
+        if (cached != closures_.end()) return cached->second;
+
+        std::vector<Path> result;
+        std::set<std::string> visited{source.string()};
+        std::deque<Path> pending{source};
+
+        // BFS across the include graph; the cap bounds pathological
+        // vendored trees without affecting real projects.
+        while (!pending.empty() && result.size() < 512) {
+            Path file = pending.front();
+            pending.pop_front();
+            for (auto& child : children(file, include_dirs, dirs_key)) {
+                if (visited.insert(child.string()).second) {
+                    result.push_back(child);
+                    pending.push_back(child);
+                }
+            }
+        }
+        for (std::size_t i = 0; i + 1 < extra_flags.size(); ++i) {
+            if (extra_flags[i] != "-include") continue;
+            auto resolved =
+                resolve(extra_flags[i + 1], true, source, include_dirs);
+            ++i;
+            if (!resolved) continue;
+            if (visited.insert(resolved->string()).second)
+                result.push_back(*resolved);
+        }
+
+        closures_.emplace(std::move(closure_key), result);
+        return result;
     }
-    std::string cache_key = source.string() + '\x1f' + dirs_key;
-    auto cached = closure_cache.find(cache_key);
-    if (cached != closure_cache.end()) return cached->second;
 
-    std::vector<Path> result;
-    std::set<std::string> visited;
-    std::deque<Path> pending{source};
-    visited.insert(source.string());
+private:
+    static std::string join_dirs(const std::vector<Path>& include_dirs) {
+        std::string key;
+        for (const auto& dir : include_dirs) {
+            key += dir.string();
+            key += '\x1e';
+        }
+        return key;
+    }
 
-    auto resolve = [&](const std::string& name, bool quoted,
-                       const Path& includer) -> std::optional<Path> {
+    static std::optional<Path> resolve(const std::string& name, bool quoted,
+                                       const Path& includer,
+                                       const std::vector<Path>& include_dirs) {
         std::vector<Path> candidates;
         if (quoted) candidates.push_back(includer.parent() / name);
         for (const auto& dir : include_dirs)
@@ -264,41 +302,52 @@ std::vector<Path> collect_header_inputs(
             if (resolved.is_regular_file()) return resolved;
         }
         return std::nullopt;
-    };
+    }
 
-    // BFS across the include graph; the cap bounds pathological vendored
-    // trees without affecting real projects.
-    while (!pending.empty() && result.size() < 512) {
-        Path file = pending.front();
-        pending.pop_front();
-        auto content = read_file(file);
-        if (!content) continue;
-        std::istringstream lines(strip_comments(*content));
-        std::string line;
-        while (std::getline(lines, line)) {
-            auto include = parse_include_line(line);
-            if (!include) continue;
-            auto resolved =
-                resolve(include->first, include->second, file);
-            if (!resolved) continue;
-            if (visited.insert(resolved->string()).second) {
-                result.push_back(*resolved);
-                pending.push_back(*resolved);
+    // Resolved local headers one file includes, memoized per
+    // (file, include-dir list).
+    const std::vector<Path>& children(const Path& file,
+                                      const std::vector<Path>& include_dirs,
+                                      const std::string& dirs_key) {
+        const std::string key = file.string() + '\x1f' + dirs_key;
+        auto cached = children_.find(key);
+        if (cached != children_.end()) return cached->second;
+
+        std::vector<Path> resolved;
+        for (auto& [name, quoted] : parsed_includes(file)) {
+            auto hit = resolve(name, quoted, file, include_dirs);
+            if (hit) resolved.push_back(*hit);
+        }
+        auto [inserted, _] = children_.emplace(std::move(key),
+                                               std::move(resolved));
+        return inserted->second;
+    }
+
+    // Include directives of one file (comment-stripped text scan),
+    // memoized by path: identical for every TU reaching the file.
+    const std::vector<std::pair<std::string, bool>>& parsed_includes(
+        const Path& file) {
+        auto cached = parsed_.find(file.string());
+        if (cached != parsed_.end()) return cached->second;
+
+        std::vector<std::pair<std::string, bool>> names;
+        if (auto content = read_file(file)) {
+            std::istringstream lines(strip_comments(*content));
+            std::string line;
+            while (std::getline(lines, line)) {
+                if (auto include = parse_include_line(line))
+                    names.push_back(std::move(*include));
             }
         }
-    }
-    for (std::size_t i = 0; i + 1 < extra_flags.size(); ++i) {
-        if (extra_flags[i] != "-include") continue;
-        auto resolved = resolve(extra_flags[i + 1], true, source);
-        ++i;
-        if (!resolved) continue;
-        if (visited.insert(resolved->string()).second)
-            result.push_back(*resolved);
+        auto [inserted, _] = parsed_.emplace(file.string(),
+                                             std::move(names));
+        return inserted->second;
     }
 
-    closure_cache.emplace(std::move(cache_key), result);
-    return result;
-}
+    std::map<std::string, std::vector<std::pair<std::string, bool>>> parsed_;
+    std::map<std::string, std::vector<Path>> children_;
+    std::map<std::string, std::vector<Path>> closures_;
+};
 
 } // namespace
 
@@ -1339,7 +1388,6 @@ configure_moid_graph(MoidGraph &graph, const TargetSpec& target, const Path &out
 
   return {};
 }
-
 export std::expected<BuildGraph, std::string> build_graph(
         const MoidGraph& outer_graph,
         const TargetSpec& target,
@@ -1390,8 +1438,8 @@ export std::expected<BuildGraph, std::string> build_graph(
     std::map<std::string, std::size_t> action_indices;
     std::vector<std::string> moid_order;
     std::map<std::string, std::string> storage_owners;
-    // Memoized per-TU local-header closures (see collect_header_inputs).
-    std::map<std::string, std::vector<Path>> header_closure_cache;
+    // Memoized local-header closures (see HeaderClosureScanner).
+    HeaderClosureScanner header_scanner;
 
     // Resolves one declaration (main moid or extra binary) into the graph:
     // expands sources, validates the terminal name, claims the output path.
@@ -1916,9 +1964,8 @@ export std::expected<BuildGraph, std::string> build_graph(
         action.moid_version = rm.decl->version;
         action.description = normalized_source_id(rm.source_dir, src);
         action.inputs = {src};
-        for (auto& header : collect_header_inputs(
-                 src, cc.include_dirs, cc.extra_flags,
-                 header_closure_cache))
+        for (auto& header : header_scanner.closure(
+                 src, cc.include_dirs, cc.extra_flags))
             append_unique_path(action.inputs, header);
         for (auto& [_, dep_pcm] : cc.module_deps)
             action.inputs.push_back(dep_pcm);
@@ -2026,9 +2073,8 @@ export std::expected<BuildGraph, std::string> build_graph(
             action.moid_version = rm.decl->version;
             action.description = normalized_source_id(rm.source_dir, src);
             action.inputs = {src};
-            for (auto& header : collect_header_inputs(
-                     src, cc.include_dirs, cc.extra_flags,
-                     header_closure_cache))
+            for (auto& header : header_scanner.closure(
+                     src, cc.include_dirs, cc.extra_flags))
                 append_unique_path(action.inputs, header);
             for (auto& [_, dep_pcm] : cc.module_deps)
                 action.inputs.push_back(dep_pcm);
