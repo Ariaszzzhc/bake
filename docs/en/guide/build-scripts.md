@@ -67,6 +67,11 @@ return b.build();
 
 Each `b.binary()` becomes its own synthetic moid: it compiles its sources, links the main library (and everything the library depends on), inherits the merged configuration, and can `import` the main moid's public modules. The binary lands in `out/<triple>/bin/`.
 
+Binaries build only for the moid being built (or a workspace member) —
+**libraries pulled in as dependencies never produce their binaries**
+(matching Cargo, which does not build dependency bins). To get a port's
+CLI tool, build its repository as the project root.
+
 Declaring binaries on an `executable` moid is an error — the design assumes a library plus its tools.
 
 ## The `import std;` fast path

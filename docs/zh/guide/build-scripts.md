@@ -67,6 +67,8 @@ return b.build();
 
 每个 `b.binary()` 都会成为独立的合成 moid：它会编译自己的源文件，链接主库（以及该库所依赖的全部内容），继承合并后的配置，并且可以 `import` 主 moid 的公开模块。binary 会位于 `out/<triple>/bin/`。
 
+binary 只在被构建的 moid 自身（或 workspace 成员）中产生——**依赖带进来的库不会产出它的 binary**（与 Cargo 一致：依赖的 bin 不构建）。想要某个 port 的 CLI 工具，就把它的仓库当作项目根来构建。
+
 在 `executable` moid 上声明 binary 是错误的——此设计假定存在一个库及其工具。
 
 ## `import std;` 快速路径

@@ -1431,12 +1431,19 @@ export std::expected<BuildGraph, std::string> build_graph(
         // declaring moids.
         const std::string main_id = moid_order[index];
         const MoidDeclaration& decl = *moids.at(main_id).decl;
-        if (decl.binaries.empty()) continue;
-        if (decl.type == MoidType::Executable) {
+        // Binaries belong to the moid being built: dependencies pulled in
+        // from the graph never produce their binaries (Cargo semantics —
+        // build the port itself to get its tools).
+        if (!decl.binaries.empty() && decl.type == MoidType::Executable) {
             return std::unexpected(
                 "binary declarations require moid '" + decl.name +
                 "' to be a lib or dylib, not an executable");
         }
+        if (std::find_if(outer_graph.roots.begin(), outer_graph.roots.end(),
+                         [&](const MoidId& id) {
+                             return id.value == main_id;
+                         }) == outer_graph.roots.end())
+            continue;
 
         for (const auto& binary : decl.binaries) {
             const std::string synthetic_id =

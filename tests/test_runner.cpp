@@ -2193,6 +2193,61 @@ TestResult test_build_cpp_binary_module_imports() {
     return {};
 }
 
+TestResult test_dependency_binaries_stay_out() {
+    auto dir = make_temp_dir("dep_binaries_stay_out");
+    write_file(dir / "dep/bake.toml",
+        "[package]\n"
+        "name = \"tooldep\"\n"
+        "version = \"0.1.0\"\n"
+        "type = \"lib\"\n"
+        "[language]\ncxx = \"c++23\"\n");
+    write_file(dir / "dep/dep.cppm",
+        "export module tooldep;\n"
+        "export int dep_value() { return 7; }\n");
+    write_file(dir / "dep/tool.cpp",
+        "import std;\n"
+        "import tooldep;\n"
+        "int main() { std::println(\"TOOL_{}\", dep_value()); }\n");
+    write_file(dir / "dep/build.cpp",
+        "import bake.build;\n"
+        "int main() {\n"
+        "    bake::Builder b;\n"
+        "    b.public_modules(\"dep.cppm\");\n"
+        "    b.binary(\"dep-tool\").sources(\"tool.cpp\");\n"
+        "    return b.build();\n"
+        "}\n");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"dep-bin-consumer\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\ncxx = \"c++23\"\n"
+        "[dependencies]\n"
+        "tooldep = { path = \"dep\" }\n");
+    write_file(dir / "src/main.cpp",
+        "import std;\n"
+        "import tooldep;\n"
+        "int main() { std::println(\"CONSUMER_{}\", dep_value()); }\n");
+
+    // As a dependency: the lib flows in, its binary does not.
+    auto build = run_bake("build", dir);
+    CHECK(build.success(), "consumer build failed: " + build.stdout);
+    const fs::path out = target_output_dir(dir);
+    CHECK(fs::exists(native_executable_path(out, "dep-bin-consumer")),
+          "consumer executable was not produced");
+    CHECK(!fs::exists(native_executable_path(out, "dep-tool")),
+          "dependency binary leaked into the consumer build");
+
+    // As the root: the same port builds its own binary.
+    auto root_build = run_bake("build", dir / "dep");
+    CHECK(root_build.success(),
+          "dependency-as-root build failed: " + root_build.stdout);
+    const fs::path dep_out = target_output_dir(dir / "dep");
+    CHECK(fs::exists(native_executable_path(dep_out, "dep-tool")),
+          "root binary was not produced when building the port itself");
+
+    return {};
+}
+
 TestResult test_source_less_executable_rejects_stale_output() {
     auto dir = make_temp_dir("source_less_executable");
     write_file(dir / "bake.toml",
@@ -4482,6 +4537,7 @@ static std::vector<TestCase> all_tests = {
     {"executable_dependency",         test_executable_dependency},
     {"run_build_cpp_declaration",     test_run_build_cpp_declaration},
     {"build_cpp_binary_module_imports", test_build_cpp_binary_module_imports},
+    {"dependency_binaries_stay_out",  test_dependency_binaries_stay_out},
     {"source_less_executable_rejects_stale_output", test_source_less_executable_rejects_stale_output},
     {"run_requires_member_for_multiple_executables", test_run_requires_member_for_multiple_executables},
     {"default_discovery_meta_dependency", test_default_discovery_meta_dependency},
