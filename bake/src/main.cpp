@@ -497,24 +497,6 @@ int enforce_lock(const Path &root, const Manifest &manifest,
 
   bool needs_resolve = !lockfile || !lockfile->is_consistent(manifest, root);
 
-  // CLI root features change the dependency closure: re-resolve so their
-  // conditional dependencies enter the lock (hints carry the rest).
-  std::set<std::string> cli_features;
-  {
-    auto member =
-        resolve_workspace_member_selection(manifest, args.get_option("p"));
-    if (!member) {
-      std::println(std::cerr, "bake: {}", member.error());
-      return 1;
-    }
-    auto names = parse_root_features(manifest, args, *member);
-    if (!names)
-      return 1;
-    cli_features.insert(names->begin(), names->end());
-    if (!cli_features.empty())
-      needs_resolve = true;
-  }
-
   // For --locked/--frozen: full enforcement.
   if (locked) {
     if (needs_resolve) {
@@ -552,9 +534,8 @@ int enforce_lock(const Path &root, const Manifest &manifest,
   // url+ref still match the stale lock are carried over — only new or
   // changed dependencies touch the network.
   Resolver resolver;
-  auto new_lock = resolver.resolve(manifest, ResolverConfig{},
-                                   lockfile ? &*lockfile : nullptr,
-                                   cli_features);
+  auto new_lock = resolver.resolve(
+      manifest, ResolverConfig{}, lockfile ? &*lockfile : nullptr);
   if (!new_lock) {
     std::println(std::cerr, "bake: failed to resolve dependencies");
     return 1;
@@ -1332,16 +1313,9 @@ int cmd_update(const ParsedArgs &args) {
     });
   }
 
-  std::set<std::string> cli_features;
-  {
-    auto names = parse_root_features(*manifest, args, std::nullopt);
-    if (!names)
-      return 1;
-    cli_features.insert(names->begin(), names->end());
-  }
   Resolver resolver;
-  auto new_lock = resolver.resolve(*manifest, ResolverConfig{},
-                                   hints ? &*hints : nullptr, cli_features);
+  auto new_lock = resolver.resolve(
+      *manifest, ResolverConfig{}, hints ? &*hints : nullptr);
   if (!new_lock) {
     std::println(std::cerr, "bake: failed to resolve dependencies");
     return 1;
