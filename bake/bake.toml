@@ -9,8 +9,8 @@ strip = true
 [dependencies]
 json = { url = "https://github.com/bake-pkgs/json", tag = "v3.12.2" }
 tomlplusplus = { url = "https://github.com/bake-pkgs/tomlplusplus", tag = "v3.4.3" }
-curl = { url = "https://github.com/bake-pkgs/curl", tag = "v8.17.0" }
-libarchive = { url = "https://github.com/bake-pkgs/libarchive", tag = "v3.8.9" }
+curl = { url = "https://github.com/bake-pkgs/curl", tag = "v8.17.0-r1" }
+libarchive = { url = "https://github.com/bake-pkgs/libarchive", tag = "v3.8.9-r1" }
 
 [target."*-windows-gnu"]
 libraries = ["ole32", "version"]
