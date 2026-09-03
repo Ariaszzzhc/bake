@@ -148,6 +148,12 @@ export struct Lockfile {
   private:
     bool check_consistency(const Manifest& manifest, const Path& root,
                            std::set<Path>& visited) const {
+        // Workspace members are first-class dependency scopes: their
+        // declarations must be locked too.
+        for (const auto& member : Manifest::member_manifests(manifest)) {
+            if (!check_consistency(member, root, visited)) return false;
+        }
+
         std::vector<const std::map<std::string, Dependency>*> scopes;
         scopes.push_back(&manifest.dependencies);
         for (const auto& condition : manifest.targets)
@@ -239,6 +245,10 @@ public:
     // commits/URLs. Does NOT re-resolve refs. Used when cache is
     // missing/corrupted but lock is valid.
     bool redownload(const Lockfile& lockfile, const ResolverConfig& config);
+
+    // Fetch a single locked entry's sources by identity (no ref
+    // re-resolution, tree hash verified). No-op when already cached.
+    bool ensure_cached(const LockDep& dep);
 
 private:
     Path cache_dir_;
@@ -1047,46 +1057,51 @@ inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep
     return node;
 }
 
+inline bool Resolver::ensure_cached(const LockDep& dep) {
+    std::string hash = dep.cache_hash();
+    if (hash.empty()) return true;
+
+    Path cached = cache_dir_ / hash;
+    if (cached.is_directory()) return true;  // already cached
+
+    // A git entry without a resolved commit cannot be fetched by
+    // identity; the next resolve re-locks it.
+    if (!dep.is_archive() && dep.commit.empty()) return true;
+
+    cache_dir_.mkdir_recursive();
+
+    // Download by locked identity (no ref re-resolution)
+    auto extracted = fetch_sources(dep.url, dep.is_archive(), dep.commit);
+    if (!extracted) {
+        std::println(std::cerr, "bake: download failed for '{}'", dep.key);
+        return false;
+    }
+
+    // Verify the tree hash against the lock
+    std::string tree_hash = compute_tree_hash(*extracted);
+    if (tree_hash != hash) {
+        std::println(std::cerr, "bake: tree hash mismatch for '{}'", dep.key);
+        extracted->remove_all();
+        return false;
+    }
+
+    // Move to final cache location
+    Path final_dir = cache_dir_ / tree_hash;
+    final_dir.parent().mkdir_recursive();
+    std::filesystem::rename(extracted->fs(), final_dir.fs());
+    return true;
+}
+
 inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig& config) {
     if (config.offline || config.frozen) {
         std::println(std::cerr, "bake: cannot re-download in offline/frozen mode");
         return false;
     }
 
-    cache_dir_.mkdir_recursive();
-
     for (auto& [key, dep] : lockfile.deps) {
+        (void)key;
         if (!dep.is_remote()) continue;
-
-        std::string hash = dep.cache_hash();
-        if (hash.empty()) continue;
-
-        Path cached = cache_dir_ / hash;
-        if (cached.is_directory()) continue;  // already cached
-
-        // A git entry without a resolved commit cannot be fetched by
-        // identity; the next resolve re-locks it.
-        if (!dep.is_archive() && dep.commit.empty()) continue;
-
-        // Download by locked identity (no ref re-resolution)
-        auto extracted = fetch_sources(dep.url, dep.is_archive(), dep.commit);
-        if (!extracted) {
-            std::println(std::cerr, "bake: download failed for '{}'", key);
-            return false;
-        }
-
-        // Verify the tree hash against the lock
-        std::string tree_hash = compute_tree_hash(*extracted);
-        if (tree_hash != hash) {
-            std::println(std::cerr, "bake: tree hash mismatch for '{}'", key);
-            extracted->remove_all();
-            return false;
-        }
-
-        // Move to final cache location
-        Path final_dir = cache_dir_ / tree_hash;
-        final_dir.parent().mkdir_recursive();
-        std::filesystem::rename(extracted->fs(), final_dir.fs());
+        if (!ensure_cached(dep)) return false;
     }
 
     return true;
@@ -1166,21 +1181,10 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
 
         // Workspace members are first-class dependency scopes: their
         // declarations resolve and lock exactly like the root's.
-        if (manifest.is_workspace()) {
-            for (const auto& member :
-                 manifest.workspace->members) {
-                Path member_dir =
-                    (manifest.project_dir / member.c_str())
-                        .lexically_normal();
-                if (!(member_dir / "bake.toml").is_regular_file())
-                    continue;
-                auto sub = Manifest::load_moid(member_dir);
-                if (!sub) continue;
-                sub->project_dir = member_dir;
-                auto member_active = active_features_of(*sub, {});
-                if (!member_active) return std::nullopt;
-                enqueue_scopes(*sub, *member_active);
-            }
+        for (auto& member : Manifest::member_manifests(manifest)) {
+            auto member_active = active_features_of(member, {});
+            if (!member_active) return std::nullopt;
+            enqueue_scopes(member, *member_active);
         }
     }
 
@@ -1260,7 +1264,15 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
             if (hint && !hint->integrity.empty() &&
                 (dep.is_archive() || !hint->commit.empty())) {
                 if (lockfile.deps.emplace(hint->key, *hint).second)
-                    entry_count++;
+                entry_count++;
+                // Fresh machine with a committed lock: the carried entry
+                // may have no local cache. Fetch by locked identity (no
+                // ref movement) so the closure walk below — and the graph
+                // build later — both find the sources. Offline/frozen
+                // builds skip this and fail at cache verification.
+                if (!config.offline && !config.frozen &&
+                    !ensure_cached(*hint))
+                    return std::nullopt;
                 std::string hash = hint->cache_hash();
                 if (!hash.empty()) {
                     Path dep_cache = cache_dir_ / hash;
@@ -1313,6 +1325,9 @@ export Lockfile prune_lock(const Manifest& manifest, const Lockfile& lock) {
         [&](const Manifest& m, const std::set<std::string>& activated) {
             const std::set<std::string> effective =
                 demote_conflicting_defaults(m, activated);
+            // Workspace members are first-class dependency scopes.
+            for (const auto& member : Manifest::member_manifests(m))
+                walk(member, {});
             std::vector<const std::map<std::string, Dependency>*> scopes;
             scopes.push_back(&m.dependencies);
             for (const auto& condition : m.targets)

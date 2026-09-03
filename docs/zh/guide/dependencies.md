@@ -102,7 +102,7 @@ musl_helpers = { url = "https://github.com/org/musl-helpers", branch = "main" }
 
 ### 增量解析
 
-当构建或更新需要刷新锁文件时，URL 和 ref 未变的已有条目会原样搬运。bake 不会再次运行 `git ls-remote`，也不会再次下载它。只有新增或变更的依赖，以及由 `bake update <dep>` 显式选中的依赖，才需要网络解析或下载。
+当构建或更新需要刷新锁文件时，URL 和 ref 未变的已有条目会原样搬运。bake 不会再次运行 `git ls-remote`，也不会重新解析它。只有新增或变更的依赖，以及由 `bake update <dep>` 显式选中的依赖，才需要网络解析。若搬运条目在本机没有缓存（例如新克隆的仓库带着已提交的锁文件），`bake build` 会按锁定的 commit/URL 重新下载并校验树哈希——ref 不发生移动。
 
 `bake update` 是唯一会移动已锁定 ref 的命令。不带依赖名称时，它会重新解析所有依赖，并可能移动所有已锁定 ref；`bake build` 不会移动已锁定的 ref。
 

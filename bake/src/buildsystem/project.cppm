@@ -268,6 +268,11 @@ export struct Manifest {
         for (const auto& condition : manifest.targets)
             scopes.push_back(&condition.dependencies);
 
+        // Workspace members are first-class dependency scopes.
+        for (const auto& member : member_manifests(manifest)) {
+            if (!closure_has_only_path_deps(member, visited)) return false;
+        }
+
         for (auto* scope : scopes) {
             for (auto& [name, dep] : *scope) {
                 (void)name;
@@ -290,7 +295,24 @@ export struct Manifest {
         return true;
     }
 
+
   public:
+    // Load the manifests of all workspace members that declare a moid.
+    // Members are dependency scopes on par with the root manifest.
+    static std::vector<Manifest> member_manifests(const Manifest& manifest) {
+        std::vector<Manifest> members;
+        if (!manifest.is_workspace()) return members;
+        for (const auto& member : manifest.workspace->members) {
+            Path member_dir =
+                (manifest.project_dir / member.c_str()).lexically_normal();
+            if (!(member_dir / "bake.toml").is_regular_file()) continue;
+            auto sub = Manifest::load_moid(member_dir);
+            if (!sub) continue;
+            sub->project_dir = member_dir;
+            members.push_back(std::move(*sub));
+        }
+        return members;
+    }
 
     // Try to load bake.toml from the given directory.
     // Returns nullopt if no bake.toml exists.

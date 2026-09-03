@@ -105,7 +105,7 @@ An alias may not have different definitions across scopes. If, for example, both
 
 ### Incremental resolution
 
-When a build or update refreshes a lockfile, an existing entry whose URL and ref are unchanged is carried over unchanged. bake does not run `git ls-remote` or download it again. Only newly added or changed dependencies, and dependencies explicitly selected by `bake update <dep>`, need network resolution or download.
+When a build or update refreshes a lockfile, an existing entry whose URL and ref are unchanged is carried over unchanged. bake does not run `git ls-remote` or re-resolve it. Only newly added or changed dependencies, and dependencies explicitly selected by `bake update <dep>`, need network resolution. If a carried entry has no local cache (e.g. a fresh clone with a committed lockfile), `bake build` re-downloads it by its locked commit/URL and verifies the tree hash — the ref does not move.
 
 `bake update` is the only command that can move locked refs. Without a dependency name, it re-resolves every dependency and can move every locked ref; `bake build` does not move locked refs.
 
