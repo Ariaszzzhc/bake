@@ -29,7 +29,7 @@ b.prebuilt_lib("vendor/libz.a");            // prebuilt archive to link
 | 方法 | 效果 |
 |---|---|
 | `sources(patterns)` | 编译为私有源文件。非公开模块接口也属于此处（例如 `src/*.cppm`）。 |
-| `public_modules(patterns)` | 编译为公开模块接口——依赖方可以 `import` 它们。 |
+| `public_modules(patterns)` | 编译为公开模块接口——依赖方可以 `import` 它们。接口身份来自声明而非文件扩展名：可指名任意 C++ 源（上游模块单元未必用 `.cppm`/`.ixx`，如 fmt 的 `src/fmt.cc`）。 |
 | `include_dirs(dirs)` | 私有包含目录（仅此 moid）。 |
 | `public_headers(dirs)` | 公开包含目录（传播给使用方）。 |
 | `prebuilt_lib(path)` | 将预构建静态归档链接进 moid。 |

@@ -1319,7 +1319,12 @@ export std::expected<BuildGraph, std::string> build_graph(
                 continue;
             }
 
-            if (source.is_module_interface()) {
+            // Explicit public module declarations (b.public_modules) own
+            // their interface role: the pattern may name any C++ source —
+            // upstream module TUs don't always use module extensions
+            // (fmt ships src/fmt.cc). Discovery only marks extension-
+            // classified interfaces public, so this cannot misfire there.
+            if (source.is_module_interface() || group.is_public) {
                 rm.module_interfaces.push_back(source);
                 rm.uses_cxx = true;
                 if (group.is_public)

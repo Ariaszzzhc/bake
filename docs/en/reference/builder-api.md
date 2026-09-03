@@ -29,7 +29,7 @@ b.prebuilt_lib("vendor/libz.a");            // prebuilt archive to link
 | Method | Effect |
 |---|---|
 | `sources(patterns)` | Compile as private sources. Non-public module interfaces belong here too (e.g. `src/*.cppm`). |
-| `public_modules(patterns)` | Compile as public module interfaces — dependents can `import` them. |
+| `public_modules(patterns)` | Compile as public module interfaces — dependents can `import` them. Interface status comes from the declaration, not the file extension: any C++ source may be named (upstream module units don't always use `.cppm`/`.ixx`, e.g. fmt's `src/fmt.cc`). |
 | `include_dirs(dirs)` | Private include directories (this moid only). |
 | `public_headers(dirs)` | Public include directories (propagate to consumers). |
 | `prebuilt_lib(path)` | Link a prebuilt static archive into the moid. |
