@@ -312,12 +312,16 @@ export inline std::string compute_tree_sha256(const Path& dir) {
             if (c == '\\') c = '/';
         }
 
+        // The tree identity is path + kind + content. Permission bits are
+        // deliberately excluded: they are extractor and OS detail, not
+        // source identity. tar preserves them, unzip discards them, the
+        // libarchive transport normalizes them — and the platforms
+        // themselves disagree (lstat reports symlink modes as 0777 on
+        // Linux but 0755 on macOS), which made identical tarballs hash
+        // differently across machines.
         auto status = entry.symlink_status();
-        unsigned mode = static_cast<unsigned>(status.permissions());
 
         std::string contribution = path;
-        contribution += '|';
-        contribution += std::to_string(mode);
         contribution += '|';
 
         if (std::filesystem::is_symlink(status)) {

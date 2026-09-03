@@ -4489,7 +4489,10 @@ TestResult test_with_asan() {
         native_executable_path(target_output_dir(dir), "with-asan");
     CHECK(fs::exists(exe), "asan executable missing");
 
-    auto run = run_cmd(exe.string(), dir);
+    // Symbolization is disabled: the report and the abort are the
+    // contract under test, and the macOS symbolizer (atos) can hang
+    // indefinitely on instrumented binaries, stalling the suite.
+    auto run = run_cmd("ASAN_OPTIONS=symbolize=0 " + exe.string(), dir);
     CHECK(!run.success(),
           "asan-detected overflow must abort: " + run.stdout);
     CHECK(run.stdout.find("AddressSanitizer: heap-buffer-overflow") !=
