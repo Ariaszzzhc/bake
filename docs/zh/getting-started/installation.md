@@ -8,7 +8,7 @@
 - Ninja
 - 带有 libc++ 的 Clang ≥ 22
 
-这些工具只需使用一次：引导编译器构建 stage 0，随后由 stage 0 构建其余所有内容。生成的 bake binary 不依赖外部工具链——它嵌入 LLVM/Clang/LLD，并内置 libc++、libc++abi、libunwind、compiler-rt、musl 和 MinGW-w64。
+这些工具只需使用一次：引导编译器构建 stage 0，随后由 stage 0 构建其余所有内容。生成的 bake binary 不依赖外部工具链——它嵌入 LLVM/Clang/LLD，并内置 libc++、libc++abi、libunwind、compiler-rt、musl 和 MinGW-w64。包下载与归档解压同样在进程内完成（libcurl + libarchive）；只有 stage-0 引导二进制会调用系统 `curl`、`tar`、`unzip`，Git 传输（ref 解析、clone 兜底）仍使用 `git` 二进制。
 
 ## 从源代码构建
 

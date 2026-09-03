@@ -53,9 +53,9 @@ default_branch = { url = "https://github.com/org/repo" }
 
 ### 归档依赖
 
-以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch` 或 `rev`；归档依赖带 ref 会报错。
+以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz`、`.tar.zst`、`.tzst` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch` 或 `rev`；归档依赖带 ref 会报错。
 
-归档提取使用外部工具：tar 归档使用 `tar`，ZIP 归档使用 `unzip`。归档 URL 按 URL 锁定，已下载内容会记录完整性值。
+自举后的 bake 内嵌 libcurl 与 libarchive，下载与解压都在进程内完成；stage-0 引导二进制则调用系统 `curl`、`tar`、`unzip`。Git 传输（ref 解析、clone 兜底）仍使用 `git` 二进制。归档 URL 按 URL 锁定，已下载内容会记录完整性值。
 
 ## 目标专属依赖
 

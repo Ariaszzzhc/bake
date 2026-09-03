@@ -56,9 +56,9 @@ on which one was used.
 
 ### Archive dependencies
 
-A URL ending in `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, or `.zip` is recognized as a direct archive dependency. Do not specify `tag`, `branch`, or `rev` for an archive URL; a ref on an archive dependency is an error.
+A URL ending in `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar.zst`, `.tzst`, or `.zip` is recognized as a direct archive dependency. Do not specify `tag`, `branch`, or `rev` for an archive URL; a ref on an archive dependency is an error.
 
-Archive extraction uses external tools: tar archives use `tar`, and ZIP archives use `unzip`. The archive URL is locked by URL and its downloaded content is recorded with an integrity value.
+Downloads and extraction run in process in the self-hosted bake, which links libcurl and libarchive; the stage-0 bootstrap binary shells out to the system `curl`, `tar`, and `unzip` instead. Git transport (ref resolution, clone fallback) still uses the `git` binary. The archive URL is locked by URL and its downloaded content is recorded with an integrity value.
 
 ## Target-specific dependencies
 

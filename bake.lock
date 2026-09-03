@@ -1,14 +1,70 @@
 {
   "deps": {
+    "archive:https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.6.7.tar.gz": {
+      "url": "https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v3.6.7.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-2cd28985a18a613670a4b33315cab819dd59dd01bab39d640d51081aa982bb02"
+    },
+    "archive:https://github.com/curl/curl/archive/refs/tags/curl-8_17_0.tar.gz": {
+      "url": "https://github.com/curl/curl/archive/refs/tags/curl-8_17_0.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-ea9a668f688cca5fc65884104368551a12094a5abb109a2234bd622f9fd805f3"
+    },
+    "archive:https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz": {
+      "url": "https://github.com/facebook/zstd/archive/refs/tags/v1.5.7.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-7ba7a1b56ae1e879f11040ee509c912cb2e985c452cda7e3351ad7ea7e06abe9"
+    },
+    "archive:https://github.com/libarchive/libarchive/releases/download/v3.8.9/libarchive-3.8.9.tar.gz": {
+      "url": "https://github.com/libarchive/libarchive/releases/download/v3.8.9/libarchive-3.8.9.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-c1acceb59a383d4129ed1d8b40d41ddd96c66f411fa33ba90900036f4297fe4c"
+    },
     "archive:https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz": {
       "url": "https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz",
       "ref_type": "archive",
       "integrity": "sha256-9f57b730806150da960829a47f615e1d2ce2471e8b6be7e1dfd56d477531fc2d"
     },
+    "archive:https://github.com/nghttp2/nghttp2/archive/refs/tags/v1.70.0.tar.gz": {
+      "url": "https://github.com/nghttp2/nghttp2/archive/refs/tags/v1.70.0.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-23a4afa88c3a72b59bc6b22a652a7517de311206225abd7457f6f5c867bc2eab"
+    },
     "archive:https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz": {
       "url": "https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz",
       "ref_type": "archive",
       "integrity": "sha256-61704580619a3183b385a8abece0639e60c170f79dab769ce42208ac24c620b1"
+    },
+    "archive:https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz": {
+      "url": "https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-df0dfce830057f9775b57f3b1d2f75854fc233ce29e19240a1e3958d4b6faef3"
+    },
+    "archive:https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz": {
+      "url": "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-6694926f9927b04fb62fcff8b4846f4a7ca65ec4e7c9c846a07d6d247949ecd2"
+    },
+    "archive:https://zlib.net/fossils/zlib-1.3.1.tar.gz": {
+      "url": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-d754c9d5ecc26c4aeaf5ccdc598679410597a08e45f792cd62fedeeab6f7a58d"
+    },
+    "git:https://github.com/bake-pkgs/bzip2@3c274884fe72bcd6905eb148de673dc70a83d1e3": {
+      "url": "https://github.com/bake-pkgs/bzip2",
+      "ref": "v1.0.8",
+      "ref_type": "tag",
+      "commit": "3c274884fe72bcd6905eb148de673dc70a83d1e3",
+      "integrity": "sha256-e87652b69e99be3803484a304730efb1aab05b0cf29254f7aadb8c23cfe67de7",
+      "name": "bzip2"
+    },
+    "git:https://github.com/bake-pkgs/curl@c0a90d20e379f7449d4ff8dadf911a1eddfcd721": {
+      "url": "https://github.com/bake-pkgs/curl",
+      "ref": "v8.17.0",
+      "ref_type": "tag",
+      "commit": "c0a90d20e379f7449d4ff8dadf911a1eddfcd721",
+      "integrity": "sha256-377d717f052f2e2a11184560d9071e126f3f41a6803bad22f5884563537b11a6",
+      "name": "curl"
     },
     "git:https://github.com/bake-pkgs/json@ed3a1dd16f91eba70994a7cb3f358bd2c072245e": {
       "url": "https://github.com/bake-pkgs/json",
@@ -18,6 +74,30 @@
       "integrity": "sha256-fa7366d6baf5c2953f5b92bc9252a4a437efe1536afbdfa1028997e444915642",
       "name": "json"
     },
+    "git:https://github.com/bake-pkgs/libarchive@82cec06ae2446c3e256ed8e3d93f0274e1fb9283": {
+      "url": "https://github.com/bake-pkgs/libarchive",
+      "ref": "v3.8.9",
+      "ref_type": "tag",
+      "commit": "82cec06ae2446c3e256ed8e3d93f0274e1fb9283",
+      "integrity": "sha256-084c479a9052425e104e226f5d49094f352d86ee53b2c1f530adbc29bb002151",
+      "name": "libarchive"
+    },
+    "git:https://github.com/bake-pkgs/mbedtls@c1c0e7fb60a72cbf2e7c773ed82a97546b6ba121": {
+      "url": "https://github.com/bake-pkgs/mbedtls",
+      "ref": "v3.6.7",
+      "ref_type": "tag",
+      "commit": "c1c0e7fb60a72cbf2e7c773ed82a97546b6ba121",
+      "integrity": "sha256-4a9bcd4cce5f579d978662f6d1fa9505a62c98c3a644803c951039b21467fc0e",
+      "name": "mbedtls"
+    },
+    "git:https://github.com/bake-pkgs/nghttp2@d3101cab4cc64ae5c6091d6dc6521e5aee24bf01": {
+      "url": "https://github.com/bake-pkgs/nghttp2",
+      "ref": "v1.70.0",
+      "ref_type": "tag",
+      "commit": "d3101cab4cc64ae5c6091d6dc6521e5aee24bf01",
+      "integrity": "sha256-5b3b21429d8353052b6f6be89d34242fd66e54b11781729fb9b23f149f15b0eb",
+      "name": "nghttp2"
+    },
     "git:https://github.com/bake-pkgs/tomlplusplus@c5a9404e9fb963acf7b727c52e6b387df1b06da0": {
       "url": "https://github.com/bake-pkgs/tomlplusplus",
       "ref": "v3.4.3",
@@ -25,6 +105,30 @@
       "commit": "c5a9404e9fb963acf7b727c52e6b387df1b06da0",
       "integrity": "sha256-c29cd8db3eba8c15043d12d70130635ff2789516c37135d27b8bfd08f0f71c99",
       "name": "tomlplusplus"
+    },
+    "git:https://github.com/bake-pkgs/xz@8a1ba1392a972dda3ecd716177e38e93f79f55ee": {
+      "url": "https://github.com/bake-pkgs/xz",
+      "ref": "v5.8.3",
+      "ref_type": "tag",
+      "commit": "8a1ba1392a972dda3ecd716177e38e93f79f55ee",
+      "integrity": "sha256-d3310c02e88eae3db4961df6276c05f2eb3acdc1094e459acad4327bb729c152",
+      "name": "xz"
+    },
+    "git:https://github.com/bake-pkgs/zlib@4aba90cadac063b8c06cdfa5d991dc868e85cd80": {
+      "url": "https://github.com/bake-pkgs/zlib",
+      "ref": "v1.3.1",
+      "ref_type": "tag",
+      "commit": "4aba90cadac063b8c06cdfa5d991dc868e85cd80",
+      "integrity": "sha256-385a8055d2a1d9663b2f58c46a4f67d69cd8939b80297e3f1a707d1c87cd401c",
+      "name": "zlib"
+    },
+    "git:https://github.com/bake-pkgs/zstd@c4409ea15fa1f581fd0bef00cf88437c5f305415": {
+      "url": "https://github.com/bake-pkgs/zstd",
+      "ref": "v1.5.7",
+      "ref_type": "tag",
+      "commit": "c4409ea15fa1f581fd0bef00cf88437c5f305415",
+      "integrity": "sha256-d3dbba1cf179c2f0e5790001b201c7026808ab65c78097599a3b02179e7c6607",
+      "name": "zstd"
     }
   }
 }

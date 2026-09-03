@@ -116,14 +116,14 @@ Each alias in `[dependencies]` declares one dependency. The same entry syntax is
 | Key | Kind | Meaning |
 |---|---|---|
 | `path` | path dependency | Local directory. It is resolved from disk on each build and is never entered in `bake.lock`. |
-| `url` | Git or archive dependency | A Git URL, unless it ends in `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, or `.zip`; those suffixes declare a direct archive dependency. |
+| `url` | Git or archive dependency | A Git URL, unless it ends in `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar.zst`, `.tzst`, or `.zip`; those suffixes declare a direct archive dependency. |
 | `tag` | Git ref | Select a tag. Mutually exclusive with `branch` and `rev`. |
 | `branch` | Git ref | Select a branch. Mutually exclusive with `tag` and `rev`. |
 | `rev` | Git ref | Select an exact Git revision. Mutually exclusive with `tag` and `branch`. |
 | `features` | any dependency | List of the dependency's `[features]` to activate. |
 | `default-features` | any dependency | `false` stops this edge from contributing the dependency's `default` feature set — only features explicitly named in `features` activate. Union semantics: other edges (or building the package as its own root) still contribute the defaults; bake warns on mixed edges. |
 
-A Git dependency with no `tag`, `branch`, or `rev` resolves its default-branch `HEAD` at build time. Archive dependencies must not specify a ref. Tar archives are extracted with `tar`; ZIP archives use `unzip`.
+A Git dependency with no `tag`, `branch`, or `rev` resolves its default-branch `HEAD` at build time. Archive dependencies must not specify a ref. Downloads and extraction run in process (libcurl + libarchive) in the self-hosted binary; the stage-0 bootstrap binary uses the system `curl`, `tar`, and `unzip`. Git transport still uses the `git` binary.
 
 ## `[target."<glob>".dependencies]`
 

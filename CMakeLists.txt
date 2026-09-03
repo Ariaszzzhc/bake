@@ -67,6 +67,8 @@ target_sources(bake
         FILES
             bake/src/json.cppm
             bake/src/toml.cppm
+            bake/src/net.cppm
+            bake/src/archive.cppm
             bake/src/util.cppm
             bake/src/buildsystem/project.cppm
             bake/src/buildsystem/moid.cppm
@@ -82,13 +84,17 @@ target_sources(bake
             bake/src/buildsystem/package.cppm
 )
 
-# stage0 implementation units of bake.json / bake.toml — hand-written,
-# zero third-party sources. The self-hosted build compiles the
-# nlohmann/toml++-backed units (src/json.cpp, src/toml.cpp) instead,
-# with the packages coming from bake-pkgs.
+# stage0 implementation units of bake.json / bake.toml / bake.net /
+# bake.archive — hand-written, zero third-party sources; the system
+# curl/tar/unzip binaries stand in for the network and archive
+# transports. The self-hosted build compiles the libcurl/libarchive-
+# backed units (src/net.cpp, src/archive.cpp) instead, with the
+# packages coming from bake-pkgs.
 target_sources(bake PRIVATE
     bake/src/stage0/json.cpp
     bake/src/stage0/toml.cpp
+    bake/src/stage0/net_cli.cpp
+    bake/src/stage0/archive_cli.cpp
 )
 
 target_compile_features(bake PRIVATE cxx_std_23)

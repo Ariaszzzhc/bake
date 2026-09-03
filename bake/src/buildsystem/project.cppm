@@ -45,7 +45,8 @@ parse_moid_type(std::string_view text) {
 // dependencies (tarball/zip fetched verbatim) from git dependencies.
 export std::string archive_extension(std::string_view url) {
     constexpr std::string_view extensions[] = {
-        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz", ".zip",
+        ".tar.gz", ".tgz", ".tar.bz2", ".tbz2",
+        ".tar.xz", ".txz", ".tar.zst", ".tzst", ".zip",
     };
     for (auto extension : extensions)
         if (ends_with(url, extension)) return std::string(extension);

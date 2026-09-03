@@ -8,7 +8,7 @@ Bootstrapping bake from source requires:
 - Ninja
 - Clang ≥ 22 with libc++
 
-These are only needed once: the bootstrap compiler builds stage 0, and stage 0 builds everything after that. The resulting bake binary has no external toolchain dependencies — it embeds LLVM/Clang/LLD and vendors libc++, libc++abi, libunwind, compiler-rt, musl, and MinGW-w64.
+These are only needed once: the bootstrap compiler builds stage 0, and stage 0 builds everything after that. The resulting bake binary has no external toolchain dependencies — it embeds LLVM/Clang/LLD and vendors libc++, libc++abi, libunwind, compiler-rt, musl, and MinGW-w64. Package downloads and archive extraction also run in process (libcurl + libarchive); the stage-0 bootstrap binary alone shells out to the system `curl`, `tar`, and `unzip`, and Git transport (ref resolution, clone fallback) still uses the `git` binary.
 
 ## Build from source
 

@@ -116,14 +116,14 @@ BAKE_MYAPP_VERSION_PATCH = 0
 | 键 | 种类 | 含义 |
 |---|---|---|
 | `path` | 路径依赖 | 本地目录。每次构建都从磁盘解析，且永不写入 `bake.lock`。 |
-| `url` | Git 或归档依赖 | Git URL，除非其以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz` 或 `.zip` 结尾；这些后缀声明直接归档依赖。 |
+| `url` | Git 或归档依赖 | Git URL，除非其以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz`、`.tar.zst`、`.tzst` 或 `.zip` 结尾；这些后缀声明直接归档依赖。 |
 | `tag` | Git ref | 选择标签。与 `branch`、`rev` 互斥。 |
 | `branch` | Git ref | 选择分支。与 `tag`、`rev` 互斥。 |
 | `rev` | Git ref | 选择确切的 Git revision。与 `tag`、`branch` 互斥。 |
 | `features` | 任意依赖 | 要在该依赖包上激活的 `[features]` 列表。 |
 | `default-features` | 任意依赖 | `false` 时该边不再贡献依赖包的 `default` 特性集——仅 `features` 显式点名的特性激活。并集语义：其他边（或将该包作为根构建）仍会贡献默认特性；混合时 bake 会警告。 |
 
-不带 `tag`、`branch` 或 `rev` 的 Git 依赖会在构建时解析其默认分支 `HEAD`。归档依赖不得指定 ref。tar 归档由 `tar` 提取；ZIP 归档使用 `unzip`。
+不带 `tag`、`branch` 或 `rev` 的 Git 依赖会在构建时解析其默认分支 `HEAD`。归档依赖不得指定 ref。自举后的二进制在进程内完成下载与解压（libcurl + libarchive）；stage-0 引导二进制使用系统 `curl`、`tar`、`unzip`。Git 传输仍使用 `git` 二进制。
 
 ## `[target."<glob>".dependencies]`
 
