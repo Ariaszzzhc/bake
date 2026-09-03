@@ -67,7 +67,7 @@ Extension sets are configurable via `[sources]` in `bake.toml` (see the [manifes
 
 ## Incremental builds
 
-Re-running `bake build` is cheap: bake fingerprints every action (content-based) and only re-execulates what changed. Editing one source file recompiles that file and relinks. Switching profiles (`--release`) or targets (`-t`) builds into separate output directories and both trees remain valid.
+Re-running `bake build` is cheap: bake fingerprints every action (content-based) and only re-executes what changed. Editing one source file recompiles that file and relinks; editing a header recompiles every translation unit that includes it (directly or via a `-include` flag) — compile inputs cover the local header closure, while system/toolchain headers are covered indirectly through the content-addressed cache. Switching profiles (`--release`) or targets (`-t`) builds into separate output directories and both trees remain valid.
 
 ## Where things go
 

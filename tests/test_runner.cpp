@@ -2181,6 +2181,44 @@ TestResult test_build_cpp_target_env() {
     return {};
 }
 
+// Local header edits must reach the rebuild: the compile action's inputs
+// cover the #include closure (and -include forced headers), so an edit
+// recompiles — and an untouched build stays a no-op.
+TestResult test_header_incremental_rebuild() {
+    auto dir = make_temp_dir("header_incremental_rebuild");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"hdr-inc\"\n"
+        "version = \"0.1.0\"\n");
+    write_file(dir / "src/answer.h",
+        "#pragma once\n"
+        "inline int answer() { return 1; }\n");
+    write_file(dir / "src/main.cpp",
+        "#include \"answer.h\"\n"
+        "#include <cstdio>\n"
+        "int main() { std::printf(\"%d\\n\", answer()); return 0; }\n");
+
+    auto first = run_bake("run -j 1", dir);
+    CHECK(first.success() && first.stdout.find("1\n") != std::string::npos,
+          "initial build/run failed: " + first.stdout);
+
+    write_file(dir / "src/answer.h",
+        "#pragma once\n"
+        "inline int answer() { return 2; }\n");
+    auto second = run_bake("run -j 1", dir);
+    CHECK(second.success() && second.stdout.find("2\n") != std::string::npos,
+          "header edit did not reach the binary (stale value): " +
+              second.stdout);
+
+    auto untouched = run_bake("build -j 1", dir);
+    CHECK(untouched.success() &&
+              untouched.stdout.find("Compiling") == std::string::npos,
+          "untouched rebuild recompiled (over-rebuild): " +
+              untouched.stdout);
+
+    return {};
+}
+
 // Binary sources consume the main moid's public module interfaces the same
 // way external consumers do.
 TestResult test_build_cpp_binary_module_imports() {
@@ -4575,6 +4613,7 @@ static std::vector<TestCase> all_tests = {
     {"run_build_cpp_declaration",     test_run_build_cpp_declaration},
     {"build_cpp_binary_module_imports", test_build_cpp_binary_module_imports},
     {"build_cpp_target_env",          test_build_cpp_target_env},
+    {"header_incremental_rebuild",    test_header_incremental_rebuild},
     {"dependency_binaries_stay_out",  test_dependency_binaries_stay_out},
     {"source_less_executable_rejects_stale_output", test_source_less_executable_rejects_stale_output},
     {"run_requires_member_for_multiple_executables", test_run_requires_member_for_multiple_executables},

@@ -152,23 +152,19 @@ export struct ModuleInfo {
     std::vector<std::string> imports;
 };
 
-// Text-based module scanner: extracts module name and imports by parsing
-// `export module <name>;` and `import <name>;` declarations directly.
-// This replaces the former clang-scan-deps subprocess — bake no longer needs
-// any external binary for C++ module dependency scanning.
-export std::optional<ModuleInfo> scan_module_file(const Path& source) {
-    auto content = read_file(source);
-    if (!content) return std::nullopt;
+namespace {
 
-    // Strip comments so declarations inside /* */ or after // are ignored.
+// Strip // and /* */ comments, preserving newlines so line structure
+// survives for the line-based scanners below.
+std::string strip_comments(const std::string& content) {
     std::string stripped;
-    stripped.reserve(content->size());
+    stripped.reserve(content.size());
     bool in_block = false;
     bool in_line = false;
-    for (std::size_t i = 0; i < content->size(); ++i) {
-        char c = (*content)[i];
+    for (std::size_t i = 0; i < content.size(); ++i) {
+        char c = content[i];
         if (in_block) {
-            if (c == '*' && i + 1 < content->size() && (*content)[i + 1] == '/') {
+            if (c == '*' && i + 1 < content.size() && content[i + 1] == '/') {
                 in_block = false;
                 ++i;
                 stripped += ' ';
@@ -181,14 +177,14 @@ export std::optional<ModuleInfo> scan_module_file(const Path& source) {
                 stripped += '\n';
             }
         } else {
-            if (c == '/' && i + 1 < content->size()) {
-                if ((*content)[i + 1] == '*') {
+            if (c == '/' && i + 1 < content.size()) {
+                if (content[i + 1] == '*') {
                     in_block = true;
                     ++i;
                     stripped += ' ';
                     continue;
                 }
-                if ((*content)[i + 1] == '/') {
+                if (content[i + 1] == '/') {
                     in_line = true;
                     ++i;
                     stripped += ' ';
@@ -198,6 +194,124 @@ export std::optional<ModuleInfo> scan_module_file(const Path& source) {
             stripped += c;
         }
     }
+    return stripped;
+}
+
+// One #include target: the name between quotes or angle brackets, plus
+// whether it was quoted (quoted includes also search the includer's
+// directory first, matching the preprocessor).
+std::optional<std::pair<std::string, bool>> parse_include_line(
+    std::string_view raw) {
+    auto start = raw.find_first_not_of(" \t");
+    if (start == std::string_view::npos) return std::nullopt;
+    std::string_view line = raw.substr(start);
+    if (!line.starts_with('#')) return std::nullopt;
+    line.remove_prefix(1);
+    auto head = line.find_first_not_of(" \t");
+    if (head == std::string_view::npos ||
+        !line.substr(head).starts_with("include"))
+        return std::nullopt;
+    line.remove_prefix(head + 7);
+    auto name = line.find_first_not_of(" \t");
+    if (name == std::string_view::npos) return std::nullopt;
+    const bool quoted = line[name] == '"';
+    if (!quoted && line[name] != '<') return std::nullopt;
+    const char close = quoted ? '"' : '>';
+    auto end = line.find(close, name + 1);
+    if (end == std::string_view::npos) return std::nullopt;
+    return std::make_pair(
+        std::string(line.substr(name + 1, end - name - 1)), quoted);
+}
+
+// Local-header closure of one translation unit, resolved against the
+// action's include directories: every reachable project header becomes a
+// build input so mtime comparison and fingerprints see header edits.
+// Unresolved names are system/toolchain headers — their paths are
+// content-addressed, so any re-provisioning changes the command and the
+// flags, which never appear as #include directives; they arrive as raw
+// flag tokens and the "-include <file>" pairs are picked out below.
+std::vector<Path> collect_header_inputs(
+    const Path& source,
+    const std::vector<Path>& include_dirs,
+    const std::vector<std::string>& extra_flags,
+    std::map<std::string, std::vector<Path>>& closure_cache) {
+    std::string dirs_key;
+    for (const auto& dir : include_dirs) {
+        dirs_key += dir.string();
+        dirs_key += '\x1e';
+    }
+    std::string cache_key = source.string() + '\x1f' + dirs_key;
+    auto cached = closure_cache.find(cache_key);
+    if (cached != closure_cache.end()) return cached->second;
+
+    std::vector<Path> result;
+    std::set<std::string> visited;
+    std::deque<Path> pending{source};
+    visited.insert(source.string());
+
+    auto resolve = [&](const std::string& name, bool quoted,
+                       const Path& includer) -> std::optional<Path> {
+        std::vector<Path> candidates;
+        if (quoted) candidates.push_back(includer.parent() / name);
+        for (const auto& dir : include_dirs)
+            candidates.push_back(dir / name);
+        for (const auto& candidate : candidates) {
+            std::error_code ec;
+            auto canonical =
+                std::filesystem::weakly_canonical(candidate.fs(), ec);
+            if (ec) continue;
+            Path resolved(canonical);
+            if (resolved.is_regular_file()) return resolved;
+        }
+        return std::nullopt;
+    };
+
+    // BFS across the include graph; the cap bounds pathological vendored
+    // trees without affecting real projects.
+    while (!pending.empty() && result.size() < 512) {
+        Path file = pending.front();
+        pending.pop_front();
+        auto content = read_file(file);
+        if (!content) continue;
+        std::istringstream lines(strip_comments(*content));
+        std::string line;
+        while (std::getline(lines, line)) {
+            auto include = parse_include_line(line);
+            if (!include) continue;
+            auto resolved =
+                resolve(include->first, include->second, file);
+            if (!resolved) continue;
+            if (visited.insert(resolved->string()).second) {
+                result.push_back(*resolved);
+                pending.push_back(*resolved);
+            }
+        }
+    }
+    for (std::size_t i = 0; i + 1 < extra_flags.size(); ++i) {
+        if (extra_flags[i] != "-include") continue;
+        auto resolved = resolve(extra_flags[i + 1], true, source);
+        ++i;
+        if (!resolved) continue;
+        if (visited.insert(resolved->string()).second)
+            result.push_back(*resolved);
+    }
+
+    closure_cache.emplace(std::move(cache_key), result);
+    return result;
+}
+
+} // namespace
+
+// Text-based module scanner: extracts module name and imports by parsing
+// `export module <name>;` and `import <name>;` declarations directly.
+// This replaces the former clang-scan-deps subprocess — bake no longer needs
+// any external binary for C++ module dependency scanning.
+export std::optional<ModuleInfo> scan_module_file(const Path& source) {
+    auto content = read_file(source);
+    if (!content) return std::nullopt;
+
+    // Strip comments so declarations inside /* */ or after // are ignored.
+    std::string stripped = strip_comments(*content);
 
     ModuleInfo info;
     info.source_path = source.string();
@@ -1276,6 +1390,8 @@ export std::expected<BuildGraph, std::string> build_graph(
     std::map<std::string, std::size_t> action_indices;
     std::vector<std::string> moid_order;
     std::map<std::string, std::string> storage_owners;
+    // Memoized per-TU local-header closures (see collect_header_inputs).
+    std::map<std::string, std::vector<Path>> header_closure_cache;
 
     // Resolves one declaration (main moid or extra binary) into the graph:
     // expands sources, validates the terminal name, claims the output path.
@@ -1800,6 +1916,10 @@ export std::expected<BuildGraph, std::string> build_graph(
         action.moid_version = rm.decl->version;
         action.description = normalized_source_id(rm.source_dir, src);
         action.inputs = {src};
+        for (auto& header : collect_header_inputs(
+                 src, cc.include_dirs, cc.extra_flags,
+                 header_closure_cache))
+            append_unique_path(action.inputs, header);
         for (auto& [_, dep_pcm] : cc.module_deps)
             action.inputs.push_back(dep_pcm);
         action.outputs = {obj, pcm};
@@ -1906,6 +2026,10 @@ export std::expected<BuildGraph, std::string> build_graph(
             action.moid_version = rm.decl->version;
             action.description = normalized_source_id(rm.source_dir, src);
             action.inputs = {src};
+            for (auto& header : collect_header_inputs(
+                     src, cc.include_dirs, cc.extra_flags,
+                     header_closure_cache))
+                append_unique_path(action.inputs, header);
             for (auto& [_, dep_pcm] : cc.module_deps)
                 action.inputs.push_back(dep_pcm);
             action.outputs = {obj};
