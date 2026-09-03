@@ -497,6 +497,24 @@ int enforce_lock(const Path &root, const Manifest &manifest,
 
   bool needs_resolve = !lockfile || !lockfile->is_consistent(manifest, root);
 
+  // CLI root features change the dependency closure: re-resolve so their
+  // conditional dependencies enter the lock (hints carry the rest).
+  std::set<std::string> cli_features;
+  {
+    auto member =
+        resolve_workspace_member_selection(manifest, args.get_option("p"));
+    if (!member) {
+      std::println(std::cerr, "bake: {}", member.error());
+      return 1;
+    }
+    auto names = parse_root_features(manifest, args, *member);
+    if (!names)
+      return 1;
+    cli_features.insert(names->begin(), names->end());
+    if (!cli_features.empty())
+      needs_resolve = true;
+  }
+
   // For --locked/--frozen: full enforcement.
   if (locked) {
     if (needs_resolve) {
@@ -534,8 +552,9 @@ int enforce_lock(const Path &root, const Manifest &manifest,
   // url+ref still match the stale lock are carried over — only new or
   // changed dependencies touch the network.
   Resolver resolver;
-  auto new_lock = resolver.resolve(
-      manifest, ResolverConfig{}, lockfile ? &*lockfile : nullptr);
+  auto new_lock = resolver.resolve(manifest, ResolverConfig{},
+                                   lockfile ? &*lockfile : nullptr,
+                                   cli_features);
   if (!new_lock) {
     std::println(std::cerr, "bake: failed to resolve dependencies");
     return 1;
@@ -660,8 +679,9 @@ int cmd_build(const ParsedArgs &args) {
 
   std::println("   Building {}", label);
 
-  // Std PCM for user code. build.cpp handles its own native PCM internally.
-  ModuleFileMap prebuilt_modules = ensure_std_modules(target, out_dir);
+  // The std module is a compiler concern — the bake c++ shim provisions
+  // and injects it. The build system deliberately knows nothing about it.
+
 
   auto configured =
       configure_moid_graph(*outer_graph, target, out_dir, *root, profile);
@@ -670,7 +690,7 @@ int cmd_build(const ParsedArgs &args) {
     return 1;
   }
 
-  auto graph = build_graph(*outer_graph, target, out_dir, *root, prebuilt_modules);
+  auto graph = build_graph(*outer_graph, target, out_dir, *root);
   if (!graph) {
     std::println(std::cerr, "bake: {}", graph.error());
     return 1;
@@ -1312,9 +1332,16 @@ int cmd_update(const ParsedArgs &args) {
     });
   }
 
+  std::set<std::string> cli_features;
+  {
+    auto names = parse_root_features(*manifest, args, std::nullopt);
+    if (!names)
+      return 1;
+    cli_features.insert(names->begin(), names->end());
+  }
   Resolver resolver;
-  auto new_lock = resolver.resolve(
-      *manifest, ResolverConfig{}, hints ? &*hints : nullptr);
+  auto new_lock = resolver.resolve(*manifest, ResolverConfig{},
+                                   hints ? &*hints : nullptr, cli_features);
   if (!new_lock) {
     std::println(std::cerr, "bake: failed to resolve dependencies");
     return 1;

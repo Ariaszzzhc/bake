@@ -1211,11 +1211,18 @@ static int clang_main(int Argc, const char **Argv,
   // normalizes it the same way.
   inject_vendored_headers(Args, Saver, target_triple, IsCxx);
 
-  // `import std;` on raw bake c++ invocations (zig cc style). The build
-  // system passes -fmodule-file=std=… itself; bare driver calls get the
-  // prebuilt module injected here. Only for -std=c++23 — the pcm's exact
-  // language configuration — and never when the caller supplies one.
-  if (IsCxx) {
+  // The std module is a compiler capability, on par with linking libc++:
+  // at -std=c++23 the prebuilt std / std.compat modules are provisioned
+  // (first use compiles the pcm, cached afterwards) and injected — whether
+  // or not the TU imports them, so a single-file program freely mixes
+  // modules and standard headers. Unused module files load lazily at zero
+  // cost. Callers that supply their own -fmodule-file=std=… (e.g. the
+  // build system's own tooling) are left alone. c++26 needs pcms built at
+  // that language level — not provided yet.
+  // BAKE_INTERNAL_COMPILE marks bake's own toolchain provisioning spawns
+  // (pcm / libc++ builds run before the pcms exist) — injecting there
+  // would recurse the provisioning into itself.
+  if (IsCxx && !::getenv("BAKE_INTERNAL_COMPILE")) {
     bool std23 = false, has_std_module = false;
     for (const char *A : Args) {
       if (!A) continue;
@@ -1223,16 +1230,19 @@ static int clang_main(int Argc, const char **Argv,
       if (S.starts_with("-std=")) {
         StringRef V = S.substr(5);
         std23 = (V == "c++23" || V == "c++2b");
-      } else if (S.starts_with("-fmodule-file=std=")) {
+      } else if (S.starts_with("-fmodule-file=std")) {
         has_std_module = true;
       }
     }
     if (std23 && !has_std_module) {
       auto Mods = bake::ensure_std_modules(resolved, bake::Path());
-      auto It = Mods.find("std");
-      if (It != Mods.end() && !It->second.string().empty()) {
-        std::string Flag = "-fmodule-file=std=" + It->second.string();
-        Args.push_back(Saver.save(Flag.c_str()).data());
+      for (const char *Name : {"std", "std.compat"}) {
+        auto It = Mods.find(Name);
+        if (It != Mods.end() && !It->second.string().empty()) {
+          std::string Flag =
+              std::string("-fmodule-file=") + Name + "=" + It->second.string();
+          Args.push_back(Saver.save(Flag.c_str()).data());
+        }
       }
     }
   }

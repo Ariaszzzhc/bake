@@ -745,8 +745,10 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
   // build.cpp runs on the host — always use a native toolchain.
   TargetSpec native_target = detect_host_target();
 
-  // Native std modules (cached separately from cross-target modules).
-  ModuleFileMap prebuilt_modules = ensure_std_modules(native_target, out_dir);
+  // The std module is a compiler concern: `bake c++` provisions and
+  // injects it for any -std=c++23 compile (see driver.cppm). The build
+  // system deliberately knows nothing about it.
+
 
   // Project-local scripts dir: only build.o and build_app live here.
   Path scripts_dir = out_dir / ".bake" / "scripts" / identity_key;
@@ -769,13 +771,8 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
   if (auto content = read_file(wrapper_src))
     write_file(wrapper_dst, *content);
 
-  // Helper: append valid std-module file flags.
-  auto append_std_flags = [&](std::vector<std::string> &cmd) {
-    for (auto &[name, pcm] : prebuilt_modules) {
-      if (!pcm.string().empty() && pcm.is_regular_file())
-        cmd.push_back("-fmodule-file=" + name + "=" + pcm.string());
-    }
-  };
+  // (std module flags are injected by the bake c++ shim itself.)
+
 
   // Step 1: Compile bake.build.cppm → PCM + .o  (global cache)
   Path pcm = build_cache_dir / "bake.build.pcm";
@@ -803,7 +800,7 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
     cmd.push_back("-x");
     cmd.push_back("c++-module");
     cmd.push_back("-I" + build_cache_dir.string());
-    append_std_flags(cmd);
+
     cmd.push_back("-fmodule-output=" + tmp_pcm.string());
     cmd.push_back(wrapper_dst.string());
     cmd.push_back("-o");
@@ -837,7 +834,7 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
     cmd.push_back("-stdlib=libc++");
     cmd.push_back("-Wno-reserved-module-identifier");
     cmd.push_back("-I" + build_cache_dir.string());
-    append_std_flags(cmd);
+
     cmd.push_back("-fmodule-file=bake.build=" + pcm.string());
     cmd.push_back(build_cpp.string());
     cmd.push_back("-o");
@@ -1231,8 +1228,7 @@ export std::expected<BuildGraph, std::string> build_graph(
         const MoidGraph& outer_graph,
         const TargetSpec& target,
         const Path& out_dir,
-        const Path& project_root,
-        const ModuleFileMap& prebuilt_modules) {
+        const Path& project_root) {
 
     auto topology = topological_moids(outer_graph);
     if (!topology) return std::unexpected(topology.error());
@@ -1782,16 +1778,6 @@ export std::expected<BuildGraph, std::string> build_graph(
             }
         }
 
-        for (auto& [pname, pcm_path] : prebuilt_modules) {
-            if (!pcm_path.string().empty() && pcm_path.is_regular_file()) {
-                bool found = false;
-                for (auto& [e, _] : cc.module_deps)
-                    if (e == pname) { found = true; break; }
-                if (!found)
-                    cc.module_deps.push_back({pname, pcm_path});
-            }
-        }
-
         BuildAction action;
         action.type = BuildAction::Type::CompileModule;
         action.id = aid;
@@ -1897,17 +1883,6 @@ export std::expected<BuildGraph, std::string> build_graph(
                 }
             }
 
-            if (!src.is_c()) {
-                for (auto& [pname, pcm_path] : prebuilt_modules) {
-                    if (!pcm_path.string().empty() && pcm_path.is_regular_file()) {
-                        bool found = false;
-                        for (auto& [e, _] : cc.module_deps)
-                            if (e == pname) { found = true; break; }
-                        if (!found)
-                            cc.module_deps.push_back({pname, pcm_path});
-                    }
-                }
-            }
 
             BuildAction action;
             action.type = BuildAction::Type::Compile;

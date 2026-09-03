@@ -2,8 +2,10 @@ module;
 
 #ifdef _WIN32
 #include <process.h>
+#include <stdlib.h>
 #else
 #include <unistd.h>
+#include <stdlib.h>
 #endif
 
 export module bake.toolchain.runtime;
@@ -360,6 +362,24 @@ static ToolchainCacheEntry std_module_cache_entry(const TargetSpec& target) {
     return toolchain_cache_lookup(target, "std-modules", config, inputs);
 }
 
+// Spawn an internal toolchain compile (pcm/libc++ sources) with the
+// re-entrancy guard set: these bake c++ children run before/while the
+// std pcms exist; without the guard the driver's provisioning hook would
+// recurse into itself (see driver.cppm) and fork-bomb.
+static ProcessResult run_internal_compile(
+        const std::vector<std::string>& args, bool capture) {
+#ifdef _WIN32
+    _putenv_s("BAKE_INTERNAL_COMPILE", "1");
+    ProcessResult r = run_process(args, Path(), capture);
+    _putenv_s("BAKE_INTERNAL_COMPILE", "0");
+#else
+    setenv("BAKE_INTERNAL_COMPILE", "1", 1);
+    ProcessResult r = run_process(args, Path(), capture);
+    unsetenv("BAKE_INTERNAL_COMPILE");
+#endif
+    return r;
+}
+
 static bool atomic_compile_pcm(
         const std::vector<std::string>& compile_cmd,
         const Path& dest) {
@@ -382,7 +402,7 @@ static bool atomic_compile_pcm(
         if (arg == dest.string()) arg = tmp.string();
     }
 
-    auto result = run_process(cmd, Path(), true);
+    auto result = run_internal_compile(cmd, true);
     if (!result.success()) {
         std::print(std::cerr, "{}", result.stderr_output);
         Path(tmp).remove();
@@ -784,7 +804,7 @@ export CxxRuntime ensure_cxx_runtime(const TargetSpec& target) {
         flags.push_back("-o");
         flags.push_back(obj.string());
 
-        auto r = run_process(flags, Path(), true);
+        auto r = run_internal_compile(flags, true);
         if (!r.success()) {
             std::print(std::cerr, "{}", r.stderr_output);
             std::println(std::cerr, "bake: failed to compile {}:{}", prefix, filename);
@@ -2160,7 +2180,7 @@ export MingwObjects ensure_mingw_objects(const TargetSpec& target) {
         flags.push_back("-o");
         flags.push_back(obj.string());
 
-        auto r = run_process(flags, Path(), true);
+        auto r = run_internal_compile(flags, true);
         if (!r.success()) {
             std::print(std::cerr, "{}", r.stderr_output);
             std::println(std::cerr, "bake: failed to compile {}:{}", prefix, filename);
@@ -2180,7 +2200,7 @@ export MingwObjects ensure_mingw_objects(const TargetSpec& target) {
             flags.push_back((mingw_src / "crt" / "crtexe.c").string());
             flags.push_back("-o");
             flags.push_back(result.crt2_o.string());
-            auto r = run_process(flags, Path(), true);
+            auto r = run_internal_compile(flags, true);
             if (!r.success()) {
                 std::print(std::cerr, "{}", r.stderr_output);
                 std::println(std::cerr, "bake: failed to compile crt2.o");
@@ -2199,7 +2219,7 @@ export MingwObjects ensure_mingw_objects(const TargetSpec& target) {
             flags.push_back((mingw_src / "crt" / "crtdll.c").string());
             flags.push_back("-o");
             flags.push_back(result.dllcrt2_o.string());
-            auto r = run_process(flags, Path(), true);
+            auto r = run_internal_compile(flags, true);
             if (!r.success()) {
                 std::print(std::cerr, "{}", r.stderr_output);
                 std::println(std::cerr, "bake: failed to compile dllcrt2.o");
