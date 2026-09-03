@@ -2144,6 +2144,43 @@ TestResult test_run_build_cpp_declaration() {
     return {};
 }
 
+// BAKE_TARGET must always carry the effective triple — the host triple for
+// native builds, the -t triple for cross builds. build.cpp platform
+// branching (per-target source selection) depends on it.
+TestResult test_build_cpp_target_env() {
+    auto dir = make_temp_dir("build_cpp_target_env");
+    write_file(dir / "bake.toml",
+        "[package]\n"
+        "name = \"target-env\"\n"
+        "version = \"0.1.0\"\n"
+        "[language]\ncxx = \"c++23\"\n");
+    write_file(dir / "build.cpp",
+        "import bake.build;\n"
+        "import std;\n\n"
+        "int main() {\n"
+        "    bake::Builder builder;\n"
+        "    if (builder.target().empty()) {\n"
+        "        std::println(std::cerr, \"build.cpp: BAKE_TARGET is empty\");\n"
+        "        return 1;\n"
+        "    }\n"
+        "    builder.sources(\"src/main.cpp\");\n"
+        "    return builder.build();\n"
+        "}\n");
+    write_file(dir / "src/main.cpp",
+        "import std;\n"
+        "int main() { std::println(\"TARGET_ENV_OK\"); return 0; }\n");
+
+    auto native = run_bake("build -j 1", dir);
+    CHECK(native.success(),
+          "native build.cpp saw empty BAKE_TARGET: " + native.stdout);
+
+    auto cross = run_bake("build -j 1 -t x86_64-linux-musl", dir);
+    CHECK(cross.success(),
+          "cross build.cpp saw empty BAKE_TARGET: " + cross.stdout);
+
+    return {};
+}
+
 // Binary sources consume the main moid's public module interfaces the same
 // way external consumers do.
 TestResult test_build_cpp_binary_module_imports() {
@@ -4537,6 +4574,7 @@ static std::vector<TestCase> all_tests = {
     {"executable_dependency",         test_executable_dependency},
     {"run_build_cpp_declaration",     test_run_build_cpp_declaration},
     {"build_cpp_binary_module_imports", test_build_cpp_binary_module_imports},
+    {"build_cpp_target_env",          test_build_cpp_target_env},
     {"dependency_binaries_stay_out",  test_dependency_binaries_stay_out},
     {"source_less_executable_rejects_stale_output", test_source_less_executable_rejects_stale_output},
     {"run_requires_member_for_multiple_executables", test_run_requires_member_for_multiple_executables},

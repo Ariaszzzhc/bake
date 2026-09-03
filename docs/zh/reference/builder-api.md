@@ -61,7 +61,7 @@ b.add_test("suite-name", "binary-name").set_default();
 | `b.feature("name")` | `[features]` 特性是否激活（图上并集合一） |
 | `b.source_dir()` | 包根目录（绝对路径） |
 | `b.build_dir()` | `out/` 目录（绝对路径） |
-| `b.target()` | 活动目标三元组 |
+| `b.target()` | 活动目标三元组——原生构建也始终携带宿主三元组（如 `aarch64-apple-darwin`），永不为空；跨平台源选择可直接按它分支 |
 | `b.dep_src_dir("alias")` | 已解析依赖的源目录（若未知则为空）——可用于 glob 依赖的头文件 |
 
 ## 执行模型

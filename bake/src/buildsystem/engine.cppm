@@ -912,8 +912,10 @@ MoidDeclaration compile_and_run_build_cpp(const Path &moid_dir,
                                            declaration_dependencies);
     ScopedEnv dependencies_env("BAKE_DEPS", deps_str);
     ScopedEnv executable_env("BAKE_EXE", self);
-    ScopedEnv target_env("BAKE_TARGET",
-                         target.is_native() ? "" : target.triple());
+    ScopedEnv target_env(
+        "BAKE_TARGET", target.is_native()
+                           ? detect_host_target().triple_
+                           : target.triple());
 
     // Do not capture stdout/stderr: declaration transport uses the file,
     // so build scripts retain their normal user-facing streams.

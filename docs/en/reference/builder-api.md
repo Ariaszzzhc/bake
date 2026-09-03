@@ -61,7 +61,7 @@ Registers a named test backed by a binary (declared via `binary()`). `set_defaul
 | `b.feature("name")` | Whether the `[features]` feature is active (graph-unified) |
 | `b.source_dir()` | Package root (absolute) |
 | `b.build_dir()` | `out/` directory (absolute) |
-| `b.target()` | Active target triple |
+| `b.target()` | Active target triple — native builds carry the host triple (e.g. `aarch64-apple-darwin`) too, never empty; branch per-platform source selection directly on it |
 | `b.dep_src_dir("alias")` | Source directory of a resolved dependency (empty if unknown) — useful for globbing a dependency's headers |
 
 ## Execution model
