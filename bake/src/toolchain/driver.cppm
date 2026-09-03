@@ -1211,6 +1211,32 @@ static int clang_main(int Argc, const char **Argv,
   // normalizes it the same way.
   inject_vendored_headers(Args, Saver, target_triple, IsCxx);
 
+  // `import std;` on raw bake c++ invocations (zig cc style). The build
+  // system passes -fmodule-file=std=… itself; bare driver calls get the
+  // prebuilt module injected here. Only for -std=c++23 — the pcm's exact
+  // language configuration — and never when the caller supplies one.
+  if (IsCxx) {
+    bool std23 = false, has_std_module = false;
+    for (const char *A : Args) {
+      if (!A) continue;
+      StringRef S(A);
+      if (S.starts_with("-std=")) {
+        StringRef V = S.substr(5);
+        std23 = (V == "c++23" || V == "c++2b");
+      } else if (S.starts_with("-fmodule-file=std=")) {
+        has_std_module = true;
+      }
+    }
+    if (std23 && !has_std_module) {
+      auto Mods = bake::ensure_std_modules(resolved, bake::Path());
+      auto It = Mods.find("std");
+      if (It != Mods.end() && !It->second.string().empty()) {
+        std::string Flag = "-fmodule-file=std=" + It->second.string();
+        Args.push_back(Saver.save(Flag.c_str()).data());
+      }
+    }
+  }
+
   std::unique_ptr<Compilation> C(TheDriver.BuildCompilation(Args));
 
   Driver::ReproLevel ReproLevel = Driver::ReproLevel::OnCrash;
@@ -1266,8 +1292,13 @@ static int clang_main(int Argc, const char **Argv,
     if (C->getArgs().hasArg(options::OPT__HASH_HASH_HASH)) {
       C->getJobs().Print(llvm::errs(), "\n", true);
     } else {
-      for (const auto &Cmd : C->getJobs())
+      for (const auto &Cmd : C->getJobs()) {
         bakeExecuteJob(&Cmd, TargetTriple, IsCxx, Res, FailingCommands);
+        // A failed job (e.g. a compile error) stops the pipeline —
+        // linking with missing objects buries the real diagnostic.
+        if (Res != 0 || !FailingCommands.empty())
+          break;
+      }
     }
 
     for (const auto &P : FailingCommands) {
