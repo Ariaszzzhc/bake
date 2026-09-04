@@ -253,6 +253,47 @@ bool moid_judgment_tests() {
     return ok;
 }
 
+// ===== glob tests (`*` / `**` / `?` semantics used by build.cpp patterns) =====
+
+bool glob_tests() {
+    auto dir = std::filesystem::temp_directory_path() /
+               ("bake_glob_test_" + std::to_string(++temp_counter));
+    std::filesystem::create_directories(dir / "src/a/b");
+    std::ofstream(dir / "src/top.cpp") << "x";
+    std::ofstream(dir / "src/a/mid.cpp") << "x";
+    std::ofstream(dir / "src/a/b/leaf.cpp") << "x";
+    std::ofstream(dir / "src/a/note.txt") << "x";
+
+    auto names = [&](std::string_view pattern) {
+        std::vector<std::string> out;
+        for (auto& p : bake::glob(bake::Path(dir), pattern))
+            out.push_back(p.filename_string());
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    auto expect = [&](std::string_view pattern,
+                      const std::vector<std::string>& want) {
+        auto got = names(pattern);
+        bool ok = got == want;
+        if (!ok) {
+            std::println(std::cerr, "glob '{}' ->", pattern);
+            for (auto& n : got) std::println(std::cerr, "  {}", n);
+        }
+        return ok;
+    };
+
+    bool ok = true;
+    ok &= expect("src/*.cpp", {"top.cpp"});                          // `*` stays in one dir
+    ok &= expect("src/**/*.cpp", {"leaf.cpp", "mid.cpp", "top.cpp"}); // `**` crosses, zero segments included
+    ok &= expect("src/**", {"leaf.cpp", "mid.cpp", "note.txt", "top.cpp"});
+    ok &= expect("src/a/m?d.cpp", {"mid.cpp"});                      // `?` is one char
+    ok &= expect("src/a?mid.cpp", {});                               // `?` is not '/'
+    ok &= expect("src/**/b/*.cpp", {"leaf.cpp"});
+    if (!ok) std::println(std::cerr, "glob_tests failed");
+    drop_temp_project(bake::Path(dir));
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -265,7 +306,7 @@ int main() {
 
     if (!manifest_form_tests()) return 1;
     if (!effective_dependency_tests()) return 1;
-    if (!moid_judgment_tests()) return 1;
+    if (!glob_tests()) return 1;
 
     return 0;
 }

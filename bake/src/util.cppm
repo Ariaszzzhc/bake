@@ -535,54 +535,31 @@ export std::vector<Path> glob(const Path& base, std::string_view pattern);
 namespace detail {
 
 inline bool glob_match(std::string_view text, std::string_view pattern) {
-    std::size_t ti = 0, pi = 0;
-    std::size_t star_t = std::string_view::npos, star_p = std::string_view::npos;
-    while (ti < text.size() || pi < pattern.size()) {
-        if (pi < pattern.size()) {
-            if (pi + 1 < pattern.size() && pattern[pi] == '*' && pattern[pi + 1] == '*') {
-                pi += 2;
-                if (pi < pattern.size() && pattern[pi] == '/') pi++;
-                star_p = pi;
-                star_t = ti;
-                continue;
-            }
-            if (pattern[pi] == '*') {
-                star_p = pi;
-                star_t = ti;
-                pi++;
-                continue;
-            }
-            if (pi < pattern.size() && ti < text.size() &&
-                (pattern[pi] == '?' || pattern[pi] == text[ti])) {
-                if (pattern[pi] == '?' && text[ti] == '/') {
-                    // ? does not match /
-                } else {
-                    pi++;
-                    ti++;
-                    continue;
-                }
-            }
-        }
-        if (star_p != std::string_view::npos) {
-            pi = star_p + 1;
-            if (pi <= pattern.size() && pattern[star_p] == '*' &&
-                (star_p == 0 || pattern[star_p - 1] != '*')) {
-                if (star_t < text.size() && text[star_t] != '/') {
-                    star_t++;
-                    ti = star_t;
-                    continue;
-                }
-            } else {
-                if (star_t < text.size()) {
-                    star_t++;
-                    ti = star_t;
-                    continue;
-                }
-            }
-        }
+    // `**` matches any sequence including '/'; `*` any sequence except '/';
+    // `?` exactly one character except '/'.
+    if (pattern.empty()) return text.empty();
+
+    if (pattern.starts_with("**")) {
+        std::string_view rest = pattern.substr(2);
+        // "**/" may also match zero segments: "src/**/*.cpp" hits "src/x.cpp".
+        if (!rest.empty() && rest.front() == '/' && glob_match(text, rest.substr(1)))
+            return true;
+        for (std::size_t i = 0; i <= text.size(); ++i)
+            if (glob_match(text.substr(i), rest)) return true;
         return false;
     }
-    return true;
+    if (pattern.front() == '*') {
+        std::string_view rest = pattern.substr(1);
+        for (std::size_t i = 0;; ++i) {
+            if (glob_match(text.substr(i), rest)) return true;
+            if (i == text.size() || text[i] == '/') return false;
+        }
+    }
+    if (text.empty()) return false;
+    if (pattern.front() == '?')
+        return text.front() != '/' && glob_match(text.substr(1), pattern.substr(1));
+    if (text.front() != pattern.front()) return false;
+    return glob_match(text.substr(1), pattern.substr(1));
 }
 
 } // namespace detail
