@@ -32,6 +32,12 @@ Shared across projects, keyed by target and content:
 
 The first `bake build -t <triple>` pays the runtime build cost once; every later build — in any project — reuses the cached products. Targets with a version suffix (`x86_64-linux-gnu.2.36`) get their own cache entry, separate from the unsuffixed triple.
 
+The same quota discipline covers the language server's namespaces under the
+target directory: `lsp-preamble/` (preamble PCHs, keyed by preamble content
+plus compile command) and `lsp-index/` (per-TU symbol shards plus a key
+index). Both are content-addressed; eviction discards them without data loss
+— the next compile rebuilds the PCH, the next index pass the shard.
+
 Toolchain products are bounded: after each insertion the target namespace is
 trimmed to a least-recently-used quota (8 GiB by default, override with the
 `BAKE_CACHE_LIMIT_MB` environment variable). Eviction only removes

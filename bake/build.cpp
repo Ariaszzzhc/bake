@@ -56,6 +56,7 @@ int main() {
         "src/util.cppm",
         "src/util/filetable.cppm",
         "src/util/cachestore.cppm",
+        "src/util/blobdb.cppm",
         "src/buildsystem/project.cppm",
         "src/buildsystem/moid.cppm",
         "src/buildsystem/semver.cppm",
@@ -73,6 +74,7 @@ int main() {
         "src/buildsystem/package.cppm",
         "src/buildsystem/query.cppm",
         "src/lsp/lsp.cppm",
+        "src/lsp/index.cppm",
         "src/lsp/lsp_core.cpp",
     });
     b.sources("src/main.cpp");

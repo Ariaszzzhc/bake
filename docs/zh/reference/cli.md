@@ -123,8 +123,15 @@ bake lsp
 - 在 stdio 上讲语言服务器协议（JSON-RPC、Content-Length 分帧）。编辑器像任何 LSP server 一样启动它；
   工作区根来自 `initialize` 握手。
 - 当前能力：生命周期（`initialize`/`shutdown`/`exit`）、全量文档同步
-  （`didOpen`/`didChange`/`didClose`）与诊断。编译在进程内按 `bake build` 会用的命令执行，
-  编辑器缓冲区重映射到文件之上——诊断永远反映构建真相，而不是猜测的编译数据库。
+  （`didOpen`/`didChange`/`didClose`）、诊断、补全
+  （`textDocument/completion`）、跳转与引用
+  （`textDocument/definition`、`textDocument/references`）。
+- 编译在进程内按 `bake build` 会用的命令执行，编辑器缓冲区重映射到文件之上——
+  诊断永远反映构建真相，而不是猜测的编译数据库。
+- 文件头部（preamble）编译一次生成 PCH，按内容寻址存入全局缓存；按键编译只解析
+  正在编辑的函数体（含模块导入的 preamble 回退为整文件编译）。
+- 低优先级后台线程把项目源码索引成按编译单元的符号 shard；跳转/引用优先用打开
+  文件的实时索引，其次用 shard 集——冷索引下跨文件跳转同样可用。
 - 仅存在于自举（self-hosted）二进制中（依赖 kotatsu 异步运行时）；stage0 引导会打印说明性错误。
 
 ## 退出码

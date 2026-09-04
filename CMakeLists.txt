@@ -72,6 +72,7 @@ target_sources(bake
             bake/src/util.cppm
             bake/src/util/filetable.cppm
             bake/src/util/cachestore.cppm
+            bake/src/util/blobdb.cppm
             bake/src/buildsystem/project.cppm
             bake/src/buildsystem/semver.cppm
             bake/src/buildsystem/moid.cppm
@@ -89,6 +90,7 @@ target_sources(bake
             bake/src/buildsystem/package.cppm
             bake/src/buildsystem/query.cppm
             bake/src/lsp/lsp.cppm
+            bake/src/lsp/index.cppm
 )
 
 # stage0 implementation units of bake.json / bake.toml / bake.net /

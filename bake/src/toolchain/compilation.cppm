@@ -1,21 +1,40 @@
 module;
 
+#include "clang/AST/Decl.h"
+#include "clang/AST/DeclBase.h"
 #include "clang/Basic/Diagnostic.h"
 #include "clang/Basic/DiagnosticIDs.h"
 #include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/CodeGen/ObjectFilePCHContainerWriter.h"
+#include "clang/Frontend/CommandLineSourceLoc.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/CompilerInvocation.h"
-#include "clang/Lex/PreprocessorOptions.h"
+#include "clang/Frontend/FrontendActions.h"
 #include "clang/FrontendTool/Utils.h"
+#include "clang/Index/IndexDataConsumer.h"
+#include "clang/Index/IndexSymbol.h"
+#include "clang/Index/IndexingAction.h"
+#include "clang/Index/USRGeneration.h"
+#include "clang/Lex/Lexer.h"
+#include "clang/Lex/PreprocessorOptions.h"
+#include "clang/Sema/CodeCompleteConsumer.h"
+#include "clang/Sema/Sema.h"
 #include "clang/Serialization/ObjectFilePCHContainerReader.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
+
+#include <clang-c/Index.h>
+
+#include <functional>
+#include <map>
+#include <mutex>
 
 export module bake.toolchain.compilation;
 
@@ -33,11 +52,19 @@ import bake.toolchain.driver;
 //
 //   - remapped file buffers (unsaved editor content)
 //   - a structured diagnostic collector
+//   - optional preamble PCH build / load
+//   - code completion at a position
+//   - symbol occurrence collection (decls, refs, macros)
 //
 // This is the compilation abstraction every tool that needs to
 // *inspect* a compile rather than produce its outputs builds on
-// (the language server serves diagnostics through it). It keeps the
-// stock cc1 path (bake cc / bake c++) untouched.
+// (the language server serves diagnostics, completion and the
+// index through it). It keeps the stock cc1 path (bake cc /
+// bake c++) untouched.
+//
+// Clang cc1 holds process-global state (diagnostic registries,
+// backend setup), so concurrent invocations are serialized by
+// one process-wide mutex regardless of the calling thread.
 // ============================================================
 
 namespace bake {
@@ -55,7 +82,100 @@ export struct CompileOutcome {
     std::vector<SourceDiagnostic> diagnostics;
 };
 
+// Load a cached preamble PCH while parsing: the implicit include
+// plus the recorded byte range the preprocessor must skip because
+// the PCH already covers it.
+export struct PchLoad {
+    std::string path;
+    unsigned preamble_size = 0;
+    bool preamble_ends_at_start_of_line = false;
+
+    bool empty() const { return path.empty(); }
+};
+
+export struct CompileOptions {
+    PchLoad pch;
+};
+
+export CompileOutcome run_syntax_check(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const CompileOptions& options = {});
+
+export struct PreambleBuild {
+    bool ok = false;
+    unsigned preamble_size = 0;             // clang-exact preamble bounds
+    bool preamble_ends_at_start_of_line = false;
+    CompileOutcome outcome;
+};
+
+// Compile the preamble region of `main_file` (taken from the
+// remapped buffer) into a PCH at `pch_out`. The recorded bounds
+// are the ones ClangComputePreamble derives with the real
+// LangOptions of the invocation.
+export PreambleBuild run_preamble_build(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const std::string& main_file,
+        const std::string& pch_out);
+
+export struct CompletionItemData {
+    std::string label;        // text to type (the TypedText chunks)
+    std::string detail;       // full render, e.g. "[#int#]foo()"
+    std::string kind;         // "keyword" | "macro" | decl kind name
+    int priority = 0;         // Clang's completion priority (lower first)
+};
+
+// Run code completion at a 1-based position inside `main_file`
+// (remapped buffer when present).
+export std::vector<CompletionItemData> run_code_complete(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const std::string& main_file,
+        unsigned line,
+        unsigned column);
+
+export struct SymbolOccurrence {
+    std::string usr;          // stable symbol identity (Clang USR)
+    std::string name;
+    std::string kind;         // Decl kind name, or "macro"
+    bool is_decl = false;
+    bool is_def = false;
+    bool is_ref = false;
+    bool is_call = false;
+    std::string file;
+    unsigned line = 1;
+    unsigned column = 1;
+    // Where the referenced declaration lives (equals the occurrence
+    // for declarations themselves). This is the jump target when the
+    // defining file has not been indexed yet.
+    std::string decl_file;
+    unsigned decl_line = 0;
+    unsigned decl_column = 0;
+};
+
+// Collect every symbol occurrence (declarations, definitions,
+// references, calls, macros) produced by parsing `main_file`.
+export std::vector<SymbolOccurrence> run_symbol_collection(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const std::string& main_file);
+
 namespace {
+
+std::mutex g_compile_mutex;  // serializes all in-process cc1 runs
+
+bool role_has(clang::index::SymbolRoleSet set, clang::index::SymbolRole role) {
+    return (set & static_cast<clang::index::SymbolRoleSet>(role)) != 0;
+}
+
+clang::CodeCompleteOptions base_options() {
+    clang::CodeCompleteOptions opts;
+    opts.IncludeMacros = true;
+    opts.IncludeGlobals = true;
+    opts.IncludeBriefComments = false;
+    return opts;
+}
 
 std::string severity_name(clang::DiagnosticsEngine::Level level) {
     switch (level) {
@@ -99,22 +219,236 @@ private:
     std::vector<SourceDiagnostic>* m_out;
 };
 
-} // namespace
+class CollectingCompletion : public clang::CodeCompleteConsumer {
+public:
+    explicit CollectingCompletion(std::vector<CompletionItemData>* out)
+        : clang::CodeCompleteConsumer(base_options()), m_out(out),
+          m_cctu_info(m_allocator) {}
+public:
+    void ProcessCodeCompleteResults(
+            clang::Sema& sema, clang::CodeCompletionContext context,
+            clang::CodeCompletionResult* results,
+            unsigned num_results) override {
+        for (unsigned i = 0; i < num_results; ++i) {
+            clang::CodeCompletionResult& r = results[i];
+            CompletionItemData item;
+            item.priority = r.Priority;
 
-// Run one compile in-process. driver_argv has the shape of a build
-// action command: {<bake exe>, "c++"|"cc", flags..., source} —
-// typically with -fsyntax-only (no outputs are produced).
-// remapped_files overlays unsaved editor content by path; the
-// buffers live for the duration of the compile only.
-export CompileOutcome run_syntax_check(
+            if (r.Kind == clang::CodeCompletionResult::RK_Keyword) {
+                item.kind = "keyword";
+                item.label = r.getKeyword();
+            } else if (r.Kind == clang::CodeCompletionResult::RK_Macro) {
+                item.kind = "macro";
+                item.label = r.Macro->getName().str();
+            } else {
+                clang::CodeCompletionString* string = r.CreateCodeCompletionString(
+                    sema, context, *m_allocator, m_cctu_info,
+                    /*IncludeBriefComments=*/false);
+                if (!string) continue;
+                if (r.Kind == clang::CodeCompletionResult::RK_Declaration)
+                    item.kind = r.Declaration->getDeclKindName();
+                else
+                    item.kind = "pattern";
+                item.label = string->getAllTypedText();
+                item.detail = string->getAsString();
+            }
+            if (!item.label.empty())
+                m_out->push_back(std::move(item));
+        }
+    }
+
+    void ProcessOverloadCandidates(
+            clang::Sema& sema, unsigned current_arg,
+            [[maybe_unused]] clang::CodeCompleteConsumer::OverloadCandidate*
+                candidates,
+            unsigned num_candidates,
+            [[maybe_unused]] clang::SourceLocation open_paren,
+            [[maybe_unused]] bool braced) override {
+        // Overload chunks are not offered yet; the candidate count
+        // is kept for future use.
+        (void)sema;
+        (void)current_arg;
+        (void)num_candidates;
+    }
+
+    clang::CodeCompletionAllocator& getAllocator() override {
+        return *m_allocator;
+    }
+    clang::CodeCompletionTUInfo& getCodeCompletionTUInfo() override {
+        return m_cctu_info;
+    }
+
+private:
+    std::vector<CompletionItemData>* m_out;
+    std::shared_ptr<clang::GlobalCodeCompletionAllocator> m_allocator =
+        std::make_shared<clang::GlobalCodeCompletionAllocator>();
+    clang::CodeCompletionTUInfo m_cctu_info;
+};
+
+class CollectingIndex : public clang::index::IndexDataConsumer {
+public:
+    CollectingIndex(std::vector<SymbolOccurrence>* out)
+        : m_out(out) {}
+
+    void initialize(clang::ASTContext& ctx) override {
+        m_sm = &ctx.getSourceManager();
+    }
+
+    bool handleDeclOccurrence(
+            const clang::Decl* decl, clang::index::SymbolRoleSet roles,
+            llvm::ArrayRef<clang::index::SymbolRelation> relations,
+            clang::SourceLocation loc,
+            [[maybe_unused]] ASTNodeInfo node) override {
+        (void)relations;
+        if (!m_sm || loc.isInvalid()) return true;
+        const clang::SourceManager& sm = *m_sm;
+
+        clang::PresumedLoc presumed = sm.getPresumedLoc(loc);
+        const bool presumed_ok = presumed.isValid() &&
+                                 presumed.getFilename() &&
+                                 *presumed.getFilename();
+        const bool is_sys = sm.isInSystemHeader(loc);
+
+        if (is_sys || !presumed_ok) return true;
+
+        // Name first (USR synthesis needs it as a fallback identity).
+        std::string name;
+        if (const auto* named = llvm::dyn_cast<clang::NamedDecl>(decl)) {
+            name = named->getDeclName().getAsString();
+            if (name.empty()) name = named->getNameAsString();
+            if (name.empty()) return true;  // unnamed: not navigable
+        } else {
+            return true;
+        }
+
+        SymbolOccurrence occ;
+        llvm::SmallString<128> usr;
+        if (!clang::index::generateUSRForDecl(decl, usr)) {
+            // Fallback identity: the declaration's own location (the
+            // `decl` received for a reference IS the referenced
+            // declaration, so definitions and references agree).
+            clang::PresumedLoc decl_loc =
+                sm.getPresumedLoc(decl->getLocation());
+            std::string where = decl_loc.isValid() && decl_loc.getFilename()
+                ? std::string(decl_loc.getFilename()) + ":" +
+                  std::to_string(decl_loc.getLine())
+                : std::string(presumed.getFilename()) + ":" +
+                  std::to_string(presumed.getLine());
+            occ.usr = std::string(decl->getDeclKindName()) + ":" + name +
+                      ":" + where;
+        } else {
+            occ.usr = usr.str().str();
+        }
+        occ.name = std::move(name);
+
+        occ.kind = decl->getDeclKindName();
+        occ.is_decl = role_has(roles, clang::index::SymbolRole::Declaration);
+        occ.is_def = role_has(roles, clang::index::SymbolRole::Definition);
+        occ.is_ref = role_has(roles, clang::index::SymbolRole::Reference);
+        occ.is_call = role_has(roles, clang::index::SymbolRole::Call);
+        occ.file = presumed.getFilename();
+        occ.line = static_cast<unsigned>(presumed.getLine());
+        occ.column = static_cast<unsigned>(presumed.getColumn());
+        clang::PresumedLoc decl_loc =
+            sm.getPresumedLoc(decl->getLocation());
+        if (decl_loc.isValid() && decl_loc.getFilename() &&
+            *decl_loc.getFilename()) {
+            occ.decl_file = decl_loc.getFilename();
+            occ.decl_line = static_cast<unsigned>(decl_loc.getLine());
+            occ.decl_column =
+                static_cast<unsigned>(decl_loc.getColumn());
+        } else {
+            occ.decl_file = occ.file;
+            occ.decl_line = occ.line;
+            occ.decl_column = occ.column;
+        }
+        m_out->push_back(std::move(occ));
+        return true;
+    }
+
+    bool handleMacroOccurrence(
+            const clang::IdentifierInfo* name, const clang::MacroInfo*,
+            clang::index::SymbolRoleSet roles,
+            clang::SourceLocation loc) override {
+        if (loc.isInvalid() || !name || !m_sm) return true;
+        const clang::SourceManager& sm = *m_sm;
+        if (sm.isInSystemHeader(loc)) return true;
+        clang::PresumedLoc presumed = sm.getPresumedLoc(loc);
+        if (!presumed.isValid() || !presumed.getFilename() ||
+            !*presumed.getFilename())
+            return true;
+        SymbolOccurrence occ;
+        occ.usr = "c:@macro@" + name->getName().str();
+        occ.name = name->getName().str();
+        occ.kind = "macro";
+        occ.is_decl = role_has(roles, clang::index::SymbolRole::Declaration);
+        occ.is_def = role_has(roles, clang::index::SymbolRole::Definition);
+        occ.is_ref = role_has(roles, clang::index::SymbolRole::Reference);
+        occ.file = presumed.getFilename();
+        occ.line = static_cast<unsigned>(presumed.getLine());
+        occ.column = static_cast<unsigned>(presumed.getColumn());
+        m_out->push_back(std::move(occ));
+        return true;
+    }
+
+private:
+    std::vector<SymbolOccurrence>* m_out;
+    clang::SourceManager* m_sm = nullptr;
+};
+
+// FrontendAction wrapper: the indexing consumer rides a real
+// syntax-only parse, so declaration occurrences (not just
+// preprocessor-level macros) are collected.
+class IndexCollectAction : public clang::SyntaxOnlyAction {
+public:
+    IndexCollectAction(std::shared_ptr<CollectingIndex> consumer,
+                       clang::index::IndexingOptions opts)
+        : m_consumer(std::move(consumer)), m_opts(opts) {}
+
+protected:
+    std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(
+            clang::CompilerInstance& ci,
+            [[maybe_unused]] llvm::StringRef in_file) override {
+        return clang::index::createIndexingASTConsumer(
+            m_consumer, m_opts, ci.getPreprocessorPtr());
+    }
+
+private:
+    std::shared_ptr<CollectingIndex> m_consumer;
+    clang::index::IndexingOptions m_opts;
+};
+
+// Shared cc1 plumbing for every run_* entry point above.
+//
+// on_parsed   — after CompilerInvocation::CreateFromArgs, with the
+//               invocation's LangOpts available and before buffers
+//               are attached; remaps can still be rewritten here
+//               (the preamble build swaps the main-file buffer).
+// on_instance — after the CompilerInstance exists; consumer hooks.
+// execute     — the execution strategy; the default runs the stock
+//               ExecuteCompilerInvocation.
+struct FrontendHooks {
+    std::function<void(clang::CompilerInvocation&,
+                       std::map<std::string, llvm::MemoryBuffer*>&)>
+        on_parsed;
+    std::function<void(clang::CompilerInstance&)> on_instance;
+    std::function<int(clang::CompilerInstance&)> execute;
+};
+
+int run_frontend_locked(
         const std::vector<std::string>& driver_argv,
-        const std::map<std::string, std::string>& remapped_files) {
-    CompileOutcome outcome;
-
+        const std::map<std::string, std::string>& remapped_files,
+        CompileOutcome& outcome,
+        const FrontendHooks& hooks) {
     // Remapped buffers must outlive the CompilerInstance; with
     // RetainRemappedFileBuffers the preprocessor never frees them,
     // and this vector reclaims them at scope exit.
     std::vector<std::unique_ptr<llvm::MemoryBuffer>> buffers;
+    std::map<std::string, llvm::MemoryBuffer*> buffer_map;
+    for (const auto& [path, content] : remapped_files) {
+        buffers.push_back(llvm::MemoryBuffer::getMemBufferCopy(content, path));
+        buffer_map[path] = buffers.back().get();
+    }
 
     Cc1Hook hook = [&](const char* const* argv, int argc) -> int {
         // argv[1] is "-cc1"; the cc1 argument vector follows.
@@ -143,12 +477,12 @@ export CompileOutcome run_syntax_check(
             return 1;
         }
 
+        if (hooks.on_parsed)
+            hooks.on_parsed(*invocation, buffer_map);
+
         auto& pp_opts = invocation->getPreprocessorOpts();
-        for (const auto& [path, content] : remapped_files) {
-            buffers.push_back(
-                llvm::MemoryBuffer::getMemBufferCopy(content, path));
-            pp_opts.addRemappedFile(path, buffers.back().get());
-        }
+        for (const auto& [path, buffer] : buffer_map)
+            pp_opts.addRemappedFile(path, buffer);
         pp_opts.RetainRemappedFileBuffers = true;
 
         auto clang = std::make_unique<clang::CompilerInstance>(
@@ -160,8 +494,15 @@ export CompileOutcome run_syntax_check(
             return 1;
         }
 
-        bool success = clang::ExecuteCompilerInvocation(clang.get());
-        outcome.status = success ? 0 : 1;
+        if (hooks.on_instance)
+            hooks.on_instance(*clang);
+
+        if (hooks.execute) {
+            outcome.status = hooks.execute(*clang);
+        } else {
+            bool success = clang::ExecuteCompilerInvocation(clang.get());
+            outcome.status = success ? 0 : 1;
+        }
         return outcome.status;
     };
 
@@ -174,7 +515,142 @@ export CompileOutcome run_syntax_check(
                                 std::move(hook));
     if (outcome.status == 0)
         outcome.status = rc;
+    return rc;
+}
+
+} // namespace
+
+export CompileOutcome run_syntax_check(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const CompileOptions& options) {
+    std::lock_guard<std::mutex> lock(g_compile_mutex);
+    CompileOutcome outcome;
+
+    FrontendHooks hooks;
+    if (!options.pch.empty()) {
+        hooks.on_parsed =
+            [&options](clang::CompilerInvocation& invocation,
+                       std::map<std::string, llvm::MemoryBuffer*>& bufs) {
+                // Safety: the PCH is only valid when the current
+                // text's preamble is byte-identical to the one it
+                // was built from. Recompute the exact bounds with
+                // the real LangOptions and compare.
+                auto it = bufs.find(options.pch.path);
+                if (it == bufs.end()) return;
+                llvm::MemoryBuffer* main = it->second;
+                clang::PreambleBounds bounds = clang::Lexer::ComputePreamble(
+                    main->getBuffer(), invocation.getLangOpts());
+                if (bounds.Size != options.pch.preamble_size) return;
+
+                auto& pp_opts = invocation.getPreprocessorOpts();
+                pp_opts.ImplicitPCHInclude = options.pch.path;
+                pp_opts.PrecompiledPreambleBytes = std::make_pair(
+                    bounds.Size, bounds.PreambleEndsAtStartOfLine);
+            };
+    }
+
+    run_frontend_locked(driver_argv, remapped_files, outcome, hooks);
     return outcome;
+}
+
+export PreambleBuild run_preamble_build(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const std::string& main_file,
+        const std::string& pch_out) {
+    std::lock_guard<std::mutex> lock(g_compile_mutex);
+    PreambleBuild result;
+    std::unique_ptr<llvm::MemoryBuffer> preamble_buffer;
+
+    FrontendHooks hooks;
+    hooks.on_parsed =
+        [&](clang::CompilerInvocation& invocation,
+            std::map<std::string, llvm::MemoryBuffer*>& bufs) {
+            auto it = bufs.find(main_file);
+            if (it == bufs.end()) return;
+            clang::PreambleBounds bounds = clang::Lexer::ComputePreamble(
+                it->second->getBuffer(), invocation.getLangOpts());
+            result.preamble_size = bounds.Size;
+            result.preamble_ends_at_start_of_line =
+                bounds.PreambleEndsAtStartOfLine;
+
+            // Replace the main-file buffer with its preamble region:
+            // the PCH is generated from exactly those bytes.
+            std::string preamble_text(
+                it->second->getBuffer().substr(0, bounds.Size));
+            preamble_buffer =
+                llvm::MemoryBuffer::getMemBufferCopy(
+                    llvm::StringRef(preamble_text),
+                    it->second->getBufferIdentifier());
+            bufs[main_file] = preamble_buffer.get();
+
+            auto& front = invocation.getFrontendOpts();
+            front.ProgramAction = clang::frontend::GeneratePCH;
+            front.OutputFile = pch_out;
+        };
+
+    run_frontend_locked(driver_argv, remapped_files, result.outcome, hooks);
+    result.ok = result.outcome.status == 0 &&
+                std::filesystem::exists(std::filesystem::path(pch_out));
+    return result;
+}
+
+export std::vector<CompletionItemData> run_code_complete(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const std::string& main_file,
+        unsigned line,
+        unsigned column) {
+    std::lock_guard<std::mutex> lock(g_compile_mutex);
+    std::vector<CompletionItemData> items;
+    CompileOutcome outcome;
+
+    FrontendHooks hooks;
+    hooks.on_parsed =
+        [&main_file, line, column](clang::CompilerInvocation& invocation,
+                                   std::map<std::string,
+                                            llvm::MemoryBuffer*>&) {
+            auto& front = invocation.getFrontendOpts();
+            front.CodeCompletionAt.FileName = main_file;
+            front.CodeCompletionAt.Line = line;
+            front.CodeCompletionAt.Column = column;
+            front.SkipFunctionBodies = true;
+        };
+    hooks.on_instance =
+        [&items](clang::CompilerInstance& instance) {
+            instance.setCodeCompletionConsumer(
+                new CollectingCompletion(&items));
+        };
+
+    run_frontend_locked(driver_argv, remapped_files, outcome, hooks);
+    return items;
+}
+
+export std::vector<SymbolOccurrence> run_symbol_collection(
+        const std::vector<std::string>& driver_argv,
+        const std::map<std::string, std::string>& remapped_files,
+        const std::string& main_file) {
+    std::lock_guard<std::mutex> lock(g_compile_mutex);
+    std::vector<SymbolOccurrence> occurrences;
+    CompileOutcome outcome;
+
+    FrontendHooks hooks;
+    hooks.execute = [&occurrences, &main_file](
+                        clang::CompilerInstance& instance) -> int {
+        auto consumer =
+            std::make_shared<CollectingIndex>(&occurrences);
+        clang::index::IndexingOptions index_opts;
+        index_opts.IndexFunctionLocals = false;
+        index_opts.IndexParametersInDeclarations = true;
+        index_opts.IndexTemplateParameters = false;
+        IndexCollectAction action(std::move(consumer), index_opts);
+        instance.ExecuteAction(action);
+        return instance.getDiagnostics().hasErrorOccurred() ? 1 : 0;
+    };
+
+    run_frontend_locked(driver_argv, remapped_files, outcome, hooks);
+    return occurrences;
 }
 
 } // namespace bake

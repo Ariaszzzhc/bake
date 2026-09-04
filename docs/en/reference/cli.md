@@ -127,14 +127,20 @@ bake lsp
   framing). Editors launch it like any LSP server; the workspace root comes
   from the `initialize` handshake.
 - Current surface: lifecycle (`initialize`/`shutdown`/`exit`), full document
-  sync (`didOpen`/`didChange`/`didClose`), and diagnostics. Compiles run
-  in-process against the command `bake build` would use, with the editor
-  buffer remapped over the file — diagnostics always reflect build truth,
-  never a guessed compilation database.
+  sync (`didOpen`/`didChange`/`didClose`), diagnostics, completion
+  (`textDocument/completion`), definition and references
+  (`textDocument/definition`, `textDocument/references`).
+- Compiles run in-process against the command `bake build` would use, with
+  the editor buffer remapped over the file — diagnostics always reflect
+  build truth, never a guessed compilation database.
+- Preamble regions compile once into PCHs, content-keyed in the global
+  cache; keystroke compiles parse the edited body only (module-importing
+  preambles fall back to whole-file compiles).
+- A low-priority background thread indexes project sources into per-TU
+  symbol shards; definition/references answer from the open file first
+  and the shard set second, so cross-file jumps work on a cold index too.
 - Only present in the self-hosted binary (it rides on the kotatsu async
   runtime); the stage0 bootstrap prints an explanatory error.
 
-
 ## Exit codes
-
 0 on success; 1 on any failure (build error, failed test, unsatisfiable `--locked`/`--offline`, missing manifest). Test failures propagate the failing binary's exit code semantics through `bake test`'s own non-zero exit.
