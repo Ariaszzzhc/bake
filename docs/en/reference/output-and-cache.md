@@ -21,6 +21,15 @@ out/
 
 `bake clean` removes `out/` entirely.
 
+The language server keeps its caches inside the project, next to the other
+build intermediates: `out/<triple>/.bake/lsp-preamble/` (preamble PCHs,
+keyed by preamble content plus compile command) and
+`out/<triple>/.bake/lsp-index/` (per-TU symbol shards plus a key index).
+Their keys already embed project paths, so cross-project sharing never
+applied; living under `out/` means `bake clean` clears them with everything
+else, and temporary projects take their shards with them. Both are
+content-addressed — a removed product simply rebuilds on the next miss.
+
 ## Global cache: `~/.cache/bake/`
 
 Shared across projects, keyed by target and content:
@@ -31,12 +40,6 @@ Shared across projects, keyed by target and content:
 | `~/.cache/bake/src/` | Fetched remote dependency sources (git checkouts, extracted archives) |
 
 The first `bake build -t <triple>` pays the runtime build cost once; every later build — in any project — reuses the cached products. Targets with a version suffix (`x86_64-linux-gnu.2.36`) get their own cache entry, separate from the unsuffixed triple.
-
-The same quota discipline covers the language server's namespaces under the
-target directory: `lsp-preamble/` (preamble PCHs, keyed by preamble content
-plus compile command) and `lsp-index/` (per-TU symbol shards plus a key
-index). Both are content-addressed; eviction discards them without data loss
-— the next compile rebuilds the PCH, the next index pass the shard.
 
 Toolchain products are bounded: after each insertion the target namespace is
 trimmed to a least-recently-used quota (8 GiB by default, override with the

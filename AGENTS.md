@@ -248,7 +248,8 @@ out/
 │   ├── lib/                  .a / .dylib / .so / .dll
 │   ├── .obj/                 object files
 │   ├── .bmi/                 module PCMs
-│   └── .bake/                declarations, fingerprints, graph.json
+│   └── .bake/                declarations, fingerprints, graph.json,
+│                              lsp-preamble/ + lsp-index/ (LSP caches)
 └── .bake/                    host-level (build.cpp compiled scripts)
 
 ## Global Toolchain Cache

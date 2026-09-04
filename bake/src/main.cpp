@@ -14,6 +14,7 @@ import bake.buildsystem.cmdgen;
 import bake.buildsystem.engine;
 import bake.buildsystem.package;
 import bake.buildsystem.query;
+import bake.json;
 import bake.lsp;
 
 #ifndef BAKE_VERSION

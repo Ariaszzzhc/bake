@@ -8,7 +8,6 @@ module;
 #include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/CodeGen/ObjectFilePCHContainerWriter.h"
-#include "clang/Frontend/CommandLineSourceLoc.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/CompilerInvocation.h"
 #include "clang/Frontend/FrontendActions.h"
@@ -29,8 +28,6 @@ module;
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/TargetSelect.h"
-
-#include <clang-c/Index.h>
 
 #include <functional>
 #include <map>
@@ -111,8 +108,8 @@ export struct PreambleBuild {
 
 // Compile the preamble region of `main_file` (taken from the
 // remapped buffer) into a PCH at `pch_out`. The recorded bounds
-// are the ones ClangComputePreamble derives with the real
-// LangOptions of the invocation.
+// are the ones ComputePreamble derives with the real LangOptions
+// of the invocation.
 export PreambleBuild run_preamble_build(
         const std::vector<std::string>& driver_argv,
         const std::map<std::string, std::string>& remapped_files,
@@ -169,14 +166,6 @@ bool role_has(clang::index::SymbolRoleSet set, clang::index::SymbolRole role) {
     return (set & static_cast<clang::index::SymbolRoleSet>(role)) != 0;
 }
 
-clang::CodeCompleteOptions base_options() {
-    clang::CodeCompleteOptions opts;
-    opts.IncludeMacros = true;
-    opts.IncludeGlobals = true;
-    opts.IncludeBriefComments = false;
-    return opts;
-}
-
 std::string severity_name(clang::DiagnosticsEngine::Level level) {
     switch (level) {
         case clang::DiagnosticsEngine::Fatal:    return "fatal";
@@ -186,6 +175,14 @@ std::string severity_name(clang::DiagnosticsEngine::Level level) {
         case clang::DiagnosticsEngine::Remark:   return "remark";
         default:                                 return "ignored";
     }
+}
+
+clang::CodeCompleteOptions completion_base_options() {
+    clang::CodeCompleteOptions opts;
+    opts.IncludeMacros = true;
+    opts.IncludeGlobals = true;
+    opts.IncludeBriefComments = false;
+    return opts;
 }
 
 class CollectingDiagnostics : public clang::DiagnosticConsumer {
@@ -222,9 +219,9 @@ private:
 class CollectingCompletion : public clang::CodeCompleteConsumer {
 public:
     explicit CollectingCompletion(std::vector<CompletionItemData>* out)
-        : clang::CodeCompleteConsumer(base_options()), m_out(out),
-          m_cctu_info(m_allocator) {}
-public:
+        : clang::CodeCompleteConsumer(completion_base_options()),
+          m_out(out), m_cctu_info(m_allocator) {}
+
     void ProcessCodeCompleteResults(
             clang::Sema& sema, clang::CodeCompletionContext context,
             clang::CodeCompletionResult* results,
@@ -261,14 +258,13 @@ public:
             clang::Sema& sema, unsigned current_arg,
             [[maybe_unused]] clang::CodeCompleteConsumer::OverloadCandidate*
                 candidates,
-            unsigned num_candidates,
+            [[maybe_unused]] unsigned num_candidates,
             [[maybe_unused]] clang::SourceLocation open_paren,
             [[maybe_unused]] bool braced) override {
         // Overload chunks are not offered yet; the candidate count
         // is kept for future use.
         (void)sema;
         (void)current_arg;
-        (void)num_candidates;
     }
 
     clang::CodeCompletionAllocator& getAllocator() override {
@@ -287,7 +283,7 @@ private:
 
 class CollectingIndex : public clang::index::IndexDataConsumer {
 public:
-    CollectingIndex(std::vector<SymbolOccurrence>* out)
+    explicit CollectingIndex(std::vector<SymbolOccurrence>* out)
         : m_out(out) {}
 
     void initialize(clang::ASTContext& ctx) override {
@@ -300,18 +296,18 @@ public:
             clang::SourceLocation loc,
             [[maybe_unused]] ASTNodeInfo node) override {
         (void)relations;
-        if (!m_sm || loc.isInvalid()) return true;
+        if (loc.isInvalid() || !m_sm) return true;
+
         const clang::SourceManager& sm = *m_sm;
+        if (sm.isInSystemHeader(loc)) return true;
 
         clang::PresumedLoc presumed = sm.getPresumedLoc(loc);
         const bool presumed_ok = presumed.isValid() &&
                                  presumed.getFilename() &&
                                  *presumed.getFilename();
-        const bool is_sys = sm.isInSystemHeader(loc);
+        if (!presumed_ok) return true;
 
-        if (is_sys || !presumed_ok) return true;
-
-        // Name first (USR synthesis needs it as a fallback identity).
+        // Name first (the fallback identity needs it).
         std::string name;
         if (const auto* named = llvm::dyn_cast<clang::NamedDecl>(decl)) {
             name = named->getDeclName().getAsString();
@@ -323,17 +319,29 @@ public:
 
         SymbolOccurrence occ;
         llvm::SmallString<128> usr;
-        if (!clang::index::generateUSRForDecl(decl, usr)) {
+        // The bool is extracted and the result validated: the vendored
+        // libclangIndex boundary can return a garbage truth value that
+        // depends on the call site's register allocation (an ABI drift
+        // between the installed archive and its headers). A well-formed
+        // USR always starts with the C-language tag, so garbage fails
+        // the prefix check and takes the stable fallback instead of
+        // poisoning the index.
+        const bool generated_ok =
+            !clang::index::generateUSRForDecl(decl, usr);
+        const bool usr_ok =
+            generated_ok && llvm::StringRef(usr).starts_with("c:");
+        if (!usr_ok) {
             // Fallback identity: the declaration's own location (the
             // `decl` received for a reference IS the referenced
             // declaration, so definitions and references agree).
             clang::PresumedLoc decl_loc =
                 sm.getPresumedLoc(decl->getLocation());
-            std::string where = decl_loc.isValid() && decl_loc.getFilename()
-                ? std::string(decl_loc.getFilename()) + ":" +
-                  std::to_string(decl_loc.getLine())
-                : std::string(presumed.getFilename()) + ":" +
-                  std::to_string(presumed.getLine());
+            std::string where =
+                decl_loc.isValid() && decl_loc.getFilename()
+                    ? std::string(decl_loc.getFilename()) + ":" +
+                      std::to_string(decl_loc.getLine())
+                    : std::string(presumed.getFilename()) + ":" +
+                      std::to_string(presumed.getLine());
             occ.usr = std::string(decl->getDeclKindName()) + ":" + name +
                       ":" + where;
         } else {
@@ -634,12 +642,11 @@ export std::vector<SymbolOccurrence> run_symbol_collection(
     std::lock_guard<std::mutex> lock(g_compile_mutex);
     std::vector<SymbolOccurrence> occurrences;
     CompileOutcome outcome;
+    (void)main_file;
 
     FrontendHooks hooks;
-    hooks.execute = [&occurrences, &main_file](
-                        clang::CompilerInstance& instance) -> int {
-        auto consumer =
-            std::make_shared<CollectingIndex>(&occurrences);
+    hooks.execute = [&occurrences](clang::CompilerInstance& instance) -> int {
+        auto consumer = std::make_shared<CollectingIndex>(&occurrences);
         clang::index::IndexingOptions index_opts;
         index_opts.IndexFunctionLocals = false;
         index_opts.IndexParametersInDeclarations = true;

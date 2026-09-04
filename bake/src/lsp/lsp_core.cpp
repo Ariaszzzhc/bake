@@ -23,7 +23,6 @@ import std;
 import bake.util;
 import bake.toolchain.target;
 import bake.toolchain.compilation;
-import bake.toolchain.runtime;
 import bake.buildsystem.query;
 import bake.lsp.index;
 
@@ -501,9 +500,11 @@ private:
             return;
         }
         m_db = std::move(*db);
+        // Project-scoped caches live beside the other build
+        // intermediates: `bake clean` clears them with everything
+        // else, and their keys already embed project paths.
         m_index = std::make_unique<ProjectIndex>(
-            get_toolchain_cache_root() / m_db->target_triple /
-            "lsp-index");
+            m_db->out_dir / ".bake" / "lsp-index");
         std::println(std::cerr, "bake lsp: {} compile entries, "
                                 "{} index shards from cache",
                      m_db->entries.size(), m_index->shard_count());
@@ -522,8 +523,7 @@ private:
     }
 
     Path preamble_cache_dir(const std::string& key) {
-        return get_toolchain_cache_root() / m_db->target_triple /
-               "lsp-preamble" / "o" / key;
+        return m_db->out_dir / ".bake" / "lsp-preamble" / "o" / key;
     }
 
     // Compile the file's current preamble into the cache and
