@@ -19,6 +19,8 @@ bake <subcommand> --help
 | `bake clean` | 删除 `out/` |
 | `bake cc` / `bake c++` / `bake ar` | 直接调用内嵌的 Clang/LLVM 工具（`zig cc` 风格） |
 | `bake audit` | 验证工具链的自包含性 |
+| `bake compdb` | 从已解析的构建图写出 `compile_commands.json`（不执行构建） |
+| `bake lsp` | stdio 语言服务器（仅自举二进制） |
 
 ## 全局选项
 
@@ -99,6 +101,31 @@ bake test [name] [--all] [-p <member>] [-j <n>]
 ## `bake run`
 
 构建后运行所选内容的唯一可执行文件。工作区中存在多个可执行文件时，bake 会列出候选项并要求指定 `-p`。末尾位置参数会转发给程序。
+
+## `bake compdb`
+
+```
+bake compdb [--release | --profile <name>] [-t <triple>] [--offline] [output]
+```
+
+- 与 `bake build` 完全相同地解析构建图（选择、profile、target 语义一致）但不执行任何动作，然后写出
+  [JSON 编译数据库](https://clang.llvm.org/docs/JSONCompilationDatabase.html)——
+  默认写到项目根的 `compile_commands.json`，给了 `[output]` 则写到该路径。
+- `bake build` 每次构建后都会刷新同一文件；`bake compdb` 是免构建路径（也是语言服务器编译查询所用的面）。
+- `--offline`（LSP 的默认行为）拒绝网络解析；未解析的依赖会报错并提示 `bake update`。
+
+## `bake lsp`
+
+```
+bake lsp
+```
+
+- 在 stdio 上讲语言服务器协议（JSON-RPC、Content-Length 分帧）。编辑器像任何 LSP server 一样启动它；
+  工作区根来自 `initialize` 握手。
+- 当前能力：生命周期（`initialize`/`shutdown`/`exit`）、全量文档同步
+  （`didOpen`/`didChange`/`didClose`）与诊断。编译在进程内按 `bake build` 会用的命令执行，
+  编辑器缓冲区重映射到文件之上——诊断永远反映构建真相，而不是猜测的编译数据库。
+- 仅存在于自举（self-hosted）二进制中（依赖 kotatsu 异步运行时）；stage0 引导会打印说明性错误。
 
 ## 退出码
 

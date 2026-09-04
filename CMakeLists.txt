@@ -70,10 +70,13 @@ target_sources(bake
             bake/src/net.cppm
             bake/src/archive.cppm
             bake/src/util.cppm
+            bake/src/util/filetable.cppm
+            bake/src/util/cachestore.cppm
             bake/src/buildsystem/project.cppm
             bake/src/buildsystem/semver.cppm
             bake/src/buildsystem/moid.cppm
             bake/src/buildsystem/graph.cppm
+            bake/src/buildsystem/sched.cppm
             bake/src/toolchain/lld.cppm
             bake/src/toolchain/target.cppm
             bake/src/buildsystem/cmdgen.cppm
@@ -81,8 +84,11 @@ target_sources(bake
             bake/src/toolchain/cc1.cppm
             bake/src/toolchain/cc1as.cppm
             bake/src/toolchain/driver.cppm
+            bake/src/toolchain/compilation.cppm
             bake/src/buildsystem/engine.cppm
             bake/src/buildsystem/package.cppm
+            bake/src/buildsystem/query.cppm
+            bake/src/lsp/lsp.cppm
 )
 
 # stage0 implementation units of bake.json / bake.toml / bake.net /
@@ -96,6 +102,7 @@ target_sources(bake PRIVATE
     bake/src/stage0/toml.cpp
     bake/src/stage0/net_cli.cpp
     bake/src/stage0/archive_cli.cpp
+    bake/src/stage0/lsp_stub.cpp
 )
 
 target_compile_features(bake PRIVATE cxx_std_23)

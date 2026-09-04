@@ -13,6 +13,8 @@ import bake.buildsystem.graph;
 import bake.buildsystem.cmdgen;
 import bake.buildsystem.engine;
 import bake.buildsystem.package;
+import bake.buildsystem.query;
+import bake.lsp;
 
 #ifndef BAKE_VERSION
 #define BAKE_VERSION "0.1.0"
@@ -202,6 +204,8 @@ void print_help() {
       "    c++             Invoke embedded Clang C++ driver\n"
       "    ar              Create static archive\n"
       "    audit           Verify toolchain self-containment\n"
+      "    compdb          Write compile_commands.json (no build)\n"
+      "    lsp             Language server over stdio (stage1)\n"
       "\n"
       "GLOBAL OPTIONS:\n"
       "    -V, --version   Print version and exit\n"
@@ -432,29 +436,8 @@ int cmd_init(const ParsedArgs &args) {
   return 0;
 }
 
-// Resolve the lockfile and content cache into the SourceIndex consumed by
-// graph resolution: every locked remote dep keyed by normalized URL + ref,
-// mapped to its content-addressed cache directory. The bridge between the
-// dependency domain (package) and the graph.
-SourceIndex build_source_index(const Path &root) {
-  SourceIndex index;
-  auto lockfile = Lockfile::load(root / "bake.lock");
-  if (!lockfile) return index;
-  const Path cache_dir = get_cache_dir();
-  for (auto &[key, dep] : lockfile->deps) {
-    if (!dep.is_remote()) continue;
-    LockedSource source;
-    source.url = normalize_dependency_url(dep.url);
-    source.ref = dep.is_archive() ? "" : dep.ref;
-    source.ref_type = dep.is_archive() ? "archive" : dep.ref_type;
-    source.commit = dep.commit;
-    source.integrity = dep.integrity;
-    source.cache_hash = dep.cache_hash();
-    source.cache_dir = cache_dir / source.cache_hash;
-    index.entries.push_back(std::move(source));
-  }
-  return index;
-}
+// (source_index_from_lock lives in bake.buildsystem.query — the
+// lockfile→SourceIndex bridge shared by build, run, test, compdb, lsp.)
 
 
 // The triple used for target-scoped dependency filtering — same convention
@@ -610,7 +593,7 @@ int cmd_build(const ParsedArgs &args) {
   policy.offline = args.has_option("offline") || args.has_option("frozen");
 
   auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
-                          build_source_index(*root));
+                          source_index_from_lock(*root));
   if (!outer_graph) {
     std::println(std::cerr, "bake: {}", outer_graph.error());
     return 1;
@@ -697,7 +680,8 @@ int cmd_build(const ParsedArgs &args) {
 
   // Write graph.json and compile_commands.json.
   write_graph_json(*graph, bake_dir / "graph.json");
-  write_compile_commands(*graph, *root / "compile_commands.json");
+  write_compdb_json(compile_db_from_graph(*graph, *root),
+                    *root / "compile_commands.json");
 
   // Execute.
   int jobs = 0;
@@ -825,6 +809,48 @@ int cmd_audit(const ParsedArgs &args) {
   }
 }
 
+// ===== compdb command =====
+
+// Print/refresh compile_commands.json from the resolved build graph —
+// the same view the LSP serves queries from. No build is executed.
+int cmd_compdb(const ParsedArgs &args) {
+  auto root = find_project_root();
+  if (!root) {
+    std::println(std::cerr, "bake: no bake.toml found");
+    return 1;
+  }
+
+  TargetSpec target = detect_host_target();
+  if (auto t = args.get_option("target"))
+    target = parse_target(*t);
+  else if (auto t = args.get_option("t"))
+    target = parse_target(*t);
+
+  std::string profile = "dev";
+  if (args.has_option("release"))
+    profile = "release";
+  if (auto p = args.get_option("profile"))
+    profile = *p;
+
+  const bool offline =
+      args.has_option("offline") || args.has_option("frozen");
+
+  auto db = build_compile_db(*root, target, profile, offline);
+  if (!db) {
+    std::println(std::cerr, "bake: {}", db.error());
+    return 1;
+  }
+
+  Path output = *root / "compile_commands.json";
+  if (!args.positional.empty())
+    output = Path(args.positional[0]).absolute();
+
+  write_compdb_json(*db, output);
+  std::println("Wrote {} ({} entries)", output.string(),
+               db->entries.size());
+  return 0;
+}
+
 // ===== run command =====
 
 int cmd_run(const ParsedArgs &args) {
@@ -858,7 +884,7 @@ int cmd_run(const ParsedArgs &args) {
   ResolvePolicy policy;
   policy.offline = args.has_option("offline") || args.has_option("frozen");
   auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
-                          build_source_index(*root));
+                          source_index_from_lock(*root));
   if (!outer_graph) {
     std::println(std::cerr, "bake: {}", outer_graph.error());
     return 1;
@@ -1459,7 +1485,7 @@ int cmd_test(const ParsedArgs &args) {
   ResolvePolicy policy;
   policy.offline = args.has_option("offline") || args.has_option("frozen");
   auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
-                          build_source_index(*root));
+                          source_index_from_lock(*root));
   if (!outer_graph) {
     std::println(std::cerr, "bake: {}", outer_graph.error());
     return 1;
@@ -1604,6 +1630,10 @@ int run(int argc, char *argv[]) {
     return cmd_clean(args);
   if (args.command == "audit")
     return cmd_audit(args);
+  if (args.command == "compdb")
+    return cmd_compdb(args);
+  if (args.command == "lsp")
+    return bake::lsp_main(args.positional);
 
   // Pass raw argv to the embedded Clang driver.
   if (args.command == "cc" || args.command == "c++") {

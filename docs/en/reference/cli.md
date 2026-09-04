@@ -19,6 +19,8 @@ bake <subcommand> --help
 | `bake clean` | Remove `out/` |
 | `bake cc` / `bake c++` / `bake ar` | Invoke the embedded Clang/LLVM tools directly (`zig cc` style) |
 | `bake audit` | Verify toolchain self-containment |
+| `bake compdb` | Write `compile_commands.json` from the resolved build graph (no build) |
+| `bake lsp` | Language server over stdio (self-hosted binary only) |
 
 ## Global options
 
@@ -99,6 +101,39 @@ bake test [name] [--all] [-p <member>] [-j <n>]
 ## `bake run`
 
 Builds, then runs the single executable of the selection. With several executables in the workspace, bake lists candidates and asks for `-p`. Trailing positional arguments are forwarded to the program; `-`-prefixed ones are consumed as bake options (no `--` separator).
+
+## `bake compdb`
+
+```
+bake compdb [--release | --profile <name>] [-t <triple>] [--offline] [output]
+```
+
+- Resolves the build graph exactly like `bake build` (same selection, profile
+  and target handling) but executes nothing, then writes a
+  [JSON compilation database](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
+  — `compile_commands.json` at the project root, or `[output]` when given.
+- `bake build` refreshes the same file after every build; `bake compdb` is
+  the no-build path (and what the language server's compile queries use).
+- `--offline` (default behavior for the LSP) refuses network resolution;
+  unresolved dependencies surface as errors pointing at `bake update`.
+
+## `bake lsp`
+
+```
+bake lsp
+```
+
+- Speaks the Language Server Protocol over stdio (JSON-RPC, Content-Length
+  framing). Editors launch it like any LSP server; the workspace root comes
+  from the `initialize` handshake.
+- Current surface: lifecycle (`initialize`/`shutdown`/`exit`), full document
+  sync (`didOpen`/`didChange`/`didClose`), and diagnostics. Compiles run
+  in-process against the command `bake build` would use, with the editor
+  buffer remapped over the file — diagnostics always reflect build truth,
+  never a guessed compilation database.
+- Only present in the self-hosted binary (it rides on the kotatsu async
+  runtime); the stage0 bootstrap prints an explanatory error.
+
 
 ## Exit codes
 

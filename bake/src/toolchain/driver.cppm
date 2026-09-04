@@ -987,12 +987,17 @@ static void inject_vendored_headers(
   }
 }
 
-//===----------------------------------------------------------------------===//
-// clang_main — driver entry point
-//===----------------------------------------------------------------------===//
+// Optional override for the in-process cc1 execution: when set, the
+// driver's CC1Main callback routes lowered -cc1 argument vectors here
+// instead of the stock ExecuteCC1Tool. argv[1] is "-cc1"; the cc1
+// arguments follow. Toolchain-internal seam used by
+// bake.toolchain.compilation to inject VFS remaps and diagnostic
+// collectors (LSP). Plain argv at the boundary, no LLVM types.
+export using Cc1Hook = std::function<int(const char *const *argv, int argc)>;
 
 static int clang_main(int Argc, const char **Argv,
-                      const llvm::ToolContext &ToolContext) {
+                      const llvm::ToolContext &ToolContext,
+                      const Cc1Hook &Cc1Override = nullptr) {
   noteBottomOfStack();
   llvm::setBugReportMsg("PLEASE submit a bug report to " BUG_REPORT_URL
                         " and include the crash backtrace, preprocessed "
@@ -1142,7 +1147,9 @@ static int clang_main(int Argc, const char **Argv,
     return 1;
 
   auto ExecuteCC1WithContext =
-      [&ToolContext](SmallVectorImpl<const char *> &ArgV) {
+      [&ToolContext, &Cc1Override](SmallVectorImpl<const char *> &ArgV) {
+        if (Cc1Override)
+          return Cc1Override(ArgV.data(), static_cast<int>(ArgV.size()));
         return ExecuteCC1Tool(ArgV, ToolContext);
       };
   if (!UseNewCC1Process) {
@@ -1376,4 +1383,12 @@ static int clang_main(int Argc, const char **Argv,
 
 export int bake_clang_main(int argc, const char **argv) {
   return clang_main(argc, argv, {argv[0], nullptr, false});
+}
+
+// Driver entry with the cc1 execution overridden (see Cc1Hook). The
+// hook replaces the in-process cc1 for every compile job this
+// invocation lowers to; link jobs and assembly still take the stock
+// paths.
+export int bake_clang_main_ex(int argc, const char **argv, Cc1Hook cc1) {
+  return clang_main(argc, argv, {argv[0], nullptr, false}, std::move(cc1));
 }

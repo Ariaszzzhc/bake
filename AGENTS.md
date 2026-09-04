@@ -36,7 +36,8 @@ cmake -G Ninja -B build && cmake --build build
 # Run the test suite (e2e + graph + parser units)
 ctest --test-dir build --output-on-failure
 
-# Self-host needs the two bake-pkgs packages fetched first (json, tomlplusplus)
+# Self-host fetches the bake-pkgs packages first (json, tomlplusplus, curl,
+# libarchive, kotatsu — the async/LSP runtime)
 ./build/bake update
 
 # Self-host: stage 0 bake builds itself → out/bin/bake
@@ -135,6 +136,9 @@ bake/
 │   └── src/
 │       ├── main.cpp             composition root: multicall dispatch + build commands
 │       ├── util.cppm            Path, SHA-256, glob, process spawn, bake_exe_path
+│       ├── util/                bake.util.* — file identity + cache store
+│       │   ├── filetable.cppm             stamps, digest trust, FileTable
+│       │   └── cachestore.cppm            quota/LRU eviction for product stores
 │       ├── json.cppm            bake.json interface (DOM, accessors)
 │       ├── toml.cppm            bake.toml interface (Table/Node model)
 │       ├── json.cpp             bake.json impl: nlohmann/json (self-host, via bake-pkgs)
@@ -146,14 +150,20 @@ bake/
 │       │   ├── runtime.cppm               ensure_* runtime builders, toolchain cache
 │       │   ├── cc1.cppm                   cc1 frontend (stock Clang cc1_main.cpp)
 │       │   ├── cc1as.cppm                 integrated assembler (stock cc1as_main.cpp)
-│       │   └── driver.cppm                Clang driver shim (bake cc / bake c++)
-│       └── buildsystem/         bake.buildsystem.* — the build system (policy)
-│           ├── project.cppm               Manifest, Lockfile, layout
-│           ├── cmdgen.cppm                build intent → compiler argv/flags/macros
-│           ├── moid.cppm                  MoidDeclaration model, JSON codec
-│           ├── graph.cppm                 MoidGraph, dependency resolution
-│           ├── engine.cppm                configure, source discovery, DAG, executor
-│           └── package.cppm               Resolver, Fetcher, Cache, lockfile
+│       │   ├── driver.cppm                Clang driver shim (bake cc / bake c++) + Cc1Hook seam
+│       │   └── compilation.cppm           injectable in-process frontend (remaps + diagnostics)
+│       ├── buildsystem/         bake.buildsystem.* — the build system (policy)
+│       │   ├── project.cppm               Manifest, Lockfile, layout
+│       │   ├── cmdgen.cppm                build intent → compiler argv/flags/macros
+│       │   ├── moid.cppm                  MoidDeclaration model, JSON codec
+│       │   ├── graph.cppm                 MoidGraph, dependency resolution
+│       │   ├── sched.cppm                 bounded task-graph executor (shared with LSP)
+│       │   ├── engine.cppm                configure, source discovery, DAG, executor policy
+│       │   ├── package.cppm               Resolver, Fetcher, Cache, lockfile
+│       │   └── query.cppm                 file→command surface: CompileDb, compdb, LSP
+│       └── lsp/                 bake.lsp — LSP server (stage1-only; stage0 stub in stage0/)
+│           ├── lsp.cppm                   entry interface (bake lsp)
+│           └── lsp_core.cpp               server on kotatsu (kota::ipc::lsp)
 ├── lib/                   vendored runtime (distributed with bake)
 │   ├── bake/                    bake.build.cppm (build.cpp API)
 │   ├── libcxx/                  libc++ (include/, src/, modules/)
@@ -287,8 +297,8 @@ no manual bump markers. Managed by `toolchain_cache_lookup`/`finish`.
 - **C++23**, strict standard (`CMAKE_CXX_EXTENSIONS OFF`), Clang + libc++.
 - **`import std;`** — all standard library access via `import std;`, not `#include`. The only `#include` in module files are platform/OS headers (`<errno.h>`, `<sys/wait.h>`, `<windows.h>`) in the **global module fragment** (`module;` before `export module`).
 - **I/O**: `std::println(...)` for stdout, `std::println(std::cerr, ...)` for stderr. `{}` format placeholders, not printf. No `fprintf`/`printf`/bare `stderr`/`stdout`.
-- **Module naming**: `bake.<scope>.<name>` with two scopes — `bake.toolchain.*` (the embedded toolchain: mechanism, must never import `bake.buildsystem.*`) and `bake.buildsystem.*` (build system: policy, may import `bake.toolchain.*`). Module files carry only their leaf name; the scope comes from the directory (`toolchain/target.cppm` → `bake.toolchain.target`, `util.cppm` at src/ root → `bake.util`). `bake.build.cppm` (downstream build.cpp API, in lib/bake/) keeps its full name.
-- **Module chain**: { `bake.json`, `bake.toml` } (two impls per module: hand-written `src/stage0/*.cpp` for the CMake bootstrap, nlohmann/json + toml++ via bake-pkgs for the self-host) → `bake.util` → { `bake.net`, `bake.archive` } (two impls per module: stage0 spawns system curl/tar/unzip for the CMake bootstrap, libcurl + libarchive via bake-pkgs for the self-host) → { `bake.toolchain.target`, `bake.buildsystem.project` } → { `bake.toolchain.lld`, `bake.buildsystem.cmdgen` } → `bake.toolchain.runtime` → { `bake.toolchain.cc1`, `bake.toolchain.cc1as` } → `bake.toolchain.driver` → { `bake.buildsystem.moid` / `graph`, `engine` / `package` } → `main.cpp` (composition root, no CLI module). The two scopes meet only at `TargetSpec` + plain argv strings.
+- **Module naming**: `bake.<scope>.<name>` with three scopes — `bake.toolchain.*` (the embedded toolchain: mechanism, must never import `bake.buildsystem.*`), `bake.buildsystem.*` (build system: policy, may import `bake.toolchain.*`), and `bake.lsp` (the language server: top consumer, may import both; stage1-only, `src/stage0/lsp_stub.cpp` stands in for the bootstrap). Module files carry only their leaf name; the scope comes from the directory (`toolchain/target.cppm` → `bake.toolchain.target`, `util.cppm` at src/ root → `bake.util`, `util/filetable.cppm` → `bake.util.filetable`). `bake.build.cppm` (downstream build.cpp API, in lib/bake/) keeps its full name.
+- **Module chain**: { `bake.json`, `bake.toml` } (two impls per module: hand-written `src/stage0/*.cpp` for the CMake bootstrap, nlohmann/json + toml++ via bake-pkgs for the self-host) → `bake.util` → `bake.util.{filetable, cachestore}` → { `bake.net`, `bake.archive` } (two impls per module: stage0 spawns system curl/tar/unzip for the CMake bootstrap, libcurl + libarchive via bake-pkgs for the self-host) → { `bake.toolchain.target`, `bake.buildsystem.project` } → { `bake.toolchain.lld`, `bake.buildsystem.cmdgen` } → `bake.toolchain.runtime` → { `bake.toolchain.cc1`, `bake.toolchain.cc1as` } → `bake.toolchain.driver` → `bake.toolchain.compilation` → { `bake.buildsystem.moid` / `graph`, `sched`, `engine` / `package` / `query` } → `bake.lsp` (kotatsu: kota headers + libuv, bake-pkgs) → `main.cpp` (composition root, no CLI module). The toolchain/buildsystem scopes meet only at `TargetSpec` + plain argv strings; `bake.lsp` consumes `run_syntax_check` (compilation) + `build_compile_db` (query).
 - **User-facing output uses `macos`** not `darwin` for platform names.
 - **Commit messages**: conventional commits, subject-only ≤ 50 chars. Describe what changed, not why.
 

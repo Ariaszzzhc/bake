@@ -32,6 +32,12 @@ Shared across projects, keyed by target and content:
 
 The first `bake build -t <triple>` pays the runtime build cost once; every later build — in any project — reuses the cached products. Targets with a version suffix (`x86_64-linux-gnu.2.36`) get their own cache entry, separate from the unsuffixed triple.
 
+Toolchain products are bounded: after each insertion the target namespace is
+trimmed to a least-recently-used quota (8 GiB by default, override with the
+`BAKE_CACHE_LIMIT_MB` environment variable). Eviction only removes
+content-addressed product directories — a removed product simply rebuilds on
+the next miss, and the source cache under `src/` is never trimmed.
+
 ## Fingerprinting and incrementality
 
 - Every build action is fingerprinted by content: inputs, flags, defines, target, profile.
