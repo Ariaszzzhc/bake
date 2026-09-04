@@ -71,6 +71,7 @@ target_sources(bake
             bake/src/archive.cppm
             bake/src/util.cppm
             bake/src/buildsystem/project.cppm
+            bake/src/buildsystem/semver.cppm
             bake/src/buildsystem/moid.cppm
             bake/src/buildsystem/graph.cppm
             bake/src/toolchain/lld.cppm
@@ -204,6 +205,7 @@ target_sources(graph_test
             bake/src/util.cppm
             bake/src/toolchain/target.cppm
             bake/src/buildsystem/project.cppm
+            bake/src/buildsystem/semver.cppm
             bake/src/buildsystem/moid.cppm
             bake/src/buildsystem/graph.cppm
 )

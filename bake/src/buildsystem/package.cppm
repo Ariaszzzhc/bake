@@ -5,6 +5,7 @@ import bake.util;
 import bake.net;
 import bake.archive;
 import bake.buildsystem.project;
+import bake.buildsystem.semver;
 import bake.json;
 namespace json = bake::json;
 
@@ -137,6 +138,24 @@ export struct Lockfile {
         return nullptr;
     }
 
+    // The unique tag entry locked for a URL, if exactly one exists.
+    // Version-constrained dependencies resolve to this under a
+    // pre-existing lock; ambiguity (two tags of one URL) returns null so
+    // callers solve fresh or report.
+    const LockDep* find_tag_entry(const std::string& dep_url) const {
+        std::string norm = normalize_dependency_url(dep_url);
+        const LockDep* found = nullptr;
+        for (auto& [key, dep] : deps) {
+            if (!dep.is_remote()) continue;
+            if (normalize_dependency_url(dep.url) == norm &&
+                dep.ref_type == "tag") {
+                if (found) return nullptr;
+                found = &dep;
+            }
+        }
+        return found;
+    }
+
     // Recursively check staleness across every declared scope (global and
     // all [target.*] tables): every remote dep in the closure must have a
     // matching lock entry with a resolved commit (git) and integrity.
@@ -190,7 +209,26 @@ export struct Lockfile {
                     ref_type = pair.first;
                     ref = pair.second;
                 }
-                const LockDep* locked = find_remote(dep.url, ref_type, ref);
+
+                const LockDep* locked = nullptr;
+                if (!dep.version.empty()) {
+                    // Version-constrained: the lock must pin a tag for
+                    // this URL that still satisfies the requirement.
+                    locked = find_tag_entry(dep.url);
+                    if (locked) {
+                        auto req = semver::Req::parse(dep.version);
+                        auto got = semver::Version::parse(locked->ref);
+                        if (!req || !got) {
+                            locked = nullptr;
+                        } else {
+                            std::vector<semver::Req> only{*req};
+                            if (!semver::satisfies_all(*got, only))
+                                locked = nullptr;
+                        }
+                    }
+                } else {
+                    locked = find_remote(dep.url, ref_type, ref);
+                }
                 if (!locked) return false;
                 if (locked->integrity.empty()) return false;
                 if (!dep.is_archive() && locked->commit.empty()) return false;
@@ -654,6 +692,10 @@ inline std::optional<Path> Resolver::fetch_sources(const std::string& url,
 inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep) {
     if (!dep.is_remote()) return std::nullopt;  // path deps are manifest-only
 
+    // Version requirements are solved (rewritten to a concrete tag)
+    // before queueing; reaching here unsolved is an internal error.
+    if (!dep.version.empty()) return std::nullopt;
+
     const bool is_archive = dep.is_archive();
     std::string ref_type = is_archive ? "archive" : "";
     std::string ref;
@@ -779,8 +821,62 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
 
     Lockfile lockfile;
 
+    // ===== Version solving ==============================================
+    //
+    // `version = "..."` dependencies carry a semver requirement instead
+    // of a git ref. The solver registers every requirement seen in the
+    // closure, then picks a tag per URL:
+    //
+    //   1. a tag carried by an existing lock (hints) that satisfies all
+    //      registered requirements — builds never move a locked choice;
+    //   2. otherwise the highest version tag satisfying every
+    //      requirement (and any exact tag pinned on the same URL),
+    //      never below a choice made by an earlier pass.
+    //
+    // Requirements are discovered while walking manifests, so a choice
+    // can be invalidated by a constraint arriving after the package was
+    // already expanded. The BFS then restarts with the stale selection
+    // as a floor; selections are monotone, so passes converge.
+
+    // Tag lists per normalized URL — shared across passes (one
+    // ls-remote per URL per resolve()).
+    std::map<std::string, std::vector<std::string>> tag_lists;
+
+    // Selection floors per URL: tag chosen by any pass. Never lowered.
+    std::map<std::string, std::string> floors;
+
+    auto list_tags = [&](const std::string& url) {
+        std::string key = normalize_dependency_url(url);
+        if (auto it = tag_lists.find(key); it != tag_lists.end())
+            return it->second;
+        std::vector<std::string> tags;
+        auto result =
+            run_process({"git", "ls-remote", "--tags", url}, Path(), true);
+        if (result.success()) {
+            auto& out = result.stdout_output;
+            std::size_t pos = 0;
+            while (pos < out.size()) {
+                std::size_t tab = out.find('\t', pos);
+                if (tab == std::string::npos) break;
+                std::size_t eol = out.find('\n', tab);
+                if (eol == std::string::npos) eol = out.size();
+                std::string ref = out.substr(tab + 1, eol - tab - 1);
+                constexpr std::string_view prefix = "refs/tags/";
+                if (ref.starts_with(prefix) &&
+                    ref.find("^{}") == std::string::npos)
+                    tags.push_back(ref.substr(prefix.size()));
+                pos = eol + 1;
+            }
+        } else {
+            std::println(std::cerr, "bake: failed to list tags of {}",
+                         url);
+        }
+        tag_lists.emplace(key, tags);
+        return tags;
+    };
+
     // BFS queue: (dep, parent manifest dir, features the consumer
-    // activated on this dependency).
+    // activated on this dependency, parent display name).
     //
     // The lock carries the union over every target and every reachable
     // feature activation: default features always, explicit activations
@@ -791,12 +887,23 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
         Dependency dep;
         Path manifest_dir;
         std::set<std::string> features;
+        std::string parent;
     };
     std::vector<QueueEntry> queue;
 
-    // Accumulated activation per package identity (dedup key / path).
+    // Per-pass state, rebuilt on every restart.
     std::map<std::string, std::set<std::string>> activated_by_key;
     std::map<Path, std::set<std::string>> activated_by_path;
+    // Requirements registered this pass: url -> (requirement, parent).
+    struct Requirement {
+        semver::Req req;
+        std::string parent;
+    };
+    std::map<std::string, std::vector<Requirement>> requirements;
+    // Exact tag pins seen this pass: url -> (tag, parent).
+    std::map<std::string, std::pair<std::string, std::string>> pins;
+    // URL -> tag whose sources were expanded this pass.
+    std::map<std::string, std::string> expanded;
 
     auto active_features_of = [&](const Manifest& m,
                                   const std::set<std::string>& extra)
@@ -818,7 +925,8 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
     };
 
     auto enqueue_scopes = [&](const Manifest& m,
-                              const std::set<std::string>& active) {
+                              const std::set<std::string>& active,
+                              const std::string& parent) {
         std::vector<const std::map<std::string, Dependency>*> scopes;
         scopes.push_back(&m.dependencies);
         for (const auto& condition : m.targets)
@@ -828,143 +936,314 @@ inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
         for (auto* scope : scopes)
             for (auto& [name, dep] : *scope)
                 queue.push_back({dep, m.project_dir,
-                                 {dep.features.begin(), dep.features.end()}});
-    };
-    {
-        // CLI root features participate in lock resolution: their
-        // conditional dependencies must be resolved and locked.
-        auto root_active =
-            active_features_of(manifest, root_features);
-        if (!root_active) return std::nullopt;
-        enqueue_scopes(manifest, *root_active);
-
-        // Workspace members are first-class dependency scopes: their
-        // declarations resolve and lock exactly like the root's.
-        for (auto& member : Manifest::member_manifests(manifest)) {
-            auto member_active = active_features_of(member, {});
-            if (!member_active) return std::nullopt;
-            enqueue_scopes(member, *member_active);
-        }
-    }
-
-    // Dedupe by normalized url + ref identity within this run.
-    std::set<std::string> seen_refs;
-    auto dedup_key = [](const Dependency& dep) {
-        if (dep.is_archive())
-            return normalize_dependency_url(dep.url) + "\narchive\n";
-        auto pair = dep.git_ref();
-        return normalize_dependency_url(dep.url) + "\n" + pair.first + "\n" +
-               pair.second;
+                                 {dep.features.begin(), dep.features.end()},
+                                 parent});
     };
 
-    const std::size_t MAX_ENTRIES = 256;
-    std::size_t entry_count = 0;
+    // Pick a tag for a version-constrained dependency. Registers the
+    // requirement, folds same-URL tag pins in as exact constraints, and
+    // prefers a satisfying carried lock entry over the maximum.
+    auto choose_tag = [&](const Dependency& dep,
+                          const std::string& parent)
+            -> std::optional<std::string> {
+        std::string key = normalize_dependency_url(dep.url);
 
-    while (!queue.empty()) {
-        if (entry_count >= MAX_ENTRIES) {
-            std::println(std::cerr, "bake: dependency graph exceeds limit ({} entries)",
-                         MAX_ENTRIES);
+        auto req = semver::Req::parse(dep.version);
+        if (!req) {
+            std::println(std::cerr,
+                         "bake: dependency '{}' has invalid version "
+                         "requirement '{}' in {}",
+                         dep.name, dep.version, parent);
             return std::nullopt;
         }
+        auto& list = requirements[key];
+        bool known = false;
+        for (const auto& r : list)
+            if (r.req.text == req->text) known = true;
+        if (!known) list.push_back({*req, parent});
 
-        auto entry = queue.front();
-        queue.erase(queue.begin());
-        const Dependency& dep = entry.dep;
+        // A same-URL exact tag participates as an equality constraint.
+        if (auto pin = pins.find(key); pin != pins.end()) {
+            if (auto pinned = semver::Version::parse(pin->second.first)) {
+                bool have = false;
+                for (const auto& r : list)
+                    if (r.req.kind == semver::Req::Kind::Exact &&
+                        r.req.lo == *pinned)
+                        have = true;
+                if (!have)
+                    list.push_back({semver::Req::parse("=" + pin->second.first)
+                                        .value_or(semver::Req{}),
+                                    pin->second.second});
+            } else {
+                std::println(std::cerr,
+                             "bake: dependency '{}' pins tag '{}' while "
+                             "'{}' constrains the same URL by version — "
+                             "unify or pin a semver tag",
+                             pin->second.second, pin->second.first, parent);
+                return std::nullopt;
+            }
+        }
 
-        if (dep.is_path_dep) {
-            // Path deps are manifest-only (never locked); recurse into
-            // native ones to reach their remote dependencies.
-            Path dep_dir = (entry.manifest_dir / dep.path.c_str())
-                               .lexically_normal();
-            Path dep_toml = dep_dir / "bake.toml";
-            if (dep_toml.is_regular_file()) {
-                auto sub_manifest = Manifest::load_moid(dep_dir);
-                if (sub_manifest) {
-                    sub_manifest->project_dir = dep_dir;
-                    auto& seen = activated_by_path[dep_dir.absolute()];
-                    bool grew = false;
-                    for (const auto& name : entry.features)
-                        if (seen.insert(name).second) grew = true;
-                    if (grew || seen.empty()) {
-                        auto active =
-                            active_features_of(*sub_manifest, seen);
-                        if (!active) return std::nullopt;
-                        enqueue_scopes(*sub_manifest, *active);
-                    }
+        auto satisfies_all = [&](const semver::Version& v) {
+            std::vector<semver::Req> reqs;
+            reqs.reserve(list.size());
+            for (const auto& r : list) reqs.push_back(r.req);
+            return semver::satisfies_all(v, reqs);
+        };
+
+        // Prefer the locked choice while it satisfies everything.
+        if (hints) {
+            if (const LockDep* hint = hints->find_tag_entry(dep.url)) {
+                auto got = semver::Version::parse(hint->ref);
+                if (got) {
+                    std::vector<semver::Req> only;
+                    only.push_back(*req);
+                    if (semver::satisfies_all(*got, only)) return hint->ref;
                 }
             }
-            continue;
         }
 
-        // A first visit resolves over the network; a later visit only
-        // matters when it activated additional features, in which case the
-        // newly reachable feature dependencies are enqueued below.
-        auto& accumulated = activated_by_key[dedup_key(dep)];
-        bool grew = false;
-        for (const auto& name : entry.features)
-            if (accumulated.insert(name).second) grew = true;
-        if (!seen_refs.insert(dedup_key(dep)).second && !grew) continue;
+        const auto& tags = list_tags(dep.url);
+        std::vector<std::pair<semver::Version, std::string>> candidates;
+        for (const auto& tag : tags)
+            if (auto v = semver::Version::parse(tag))
+                candidates.emplace_back(*v, tag);
+        // Highest first.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& a, const auto& b) {
+                      if (auto c = a.first <=> b.first; c != 0)
+                          return c > 0;
+                      return a.second > b.second;
+                  });
 
-        std::string ref_type = dep.is_archive() ? "archive" : "";
-        std::string ref;
-        if (ref_type.empty()) {
+        std::optional<semver::Version> floor;
+        if (auto f = floors.find(key); f != floors.end())
+            floor = semver::Version::parse(f->second);
+
+        for (const auto& [v, tag] : candidates) {
+            if (!satisfies_all(v)) continue;
+            if (floor && v < *floor) continue;
+            return tag;
+        }
+
+        std::println(std::cerr,
+                     "bake: no version of '{}' satisfies:", dep.url);
+        for (const auto& r : list)
+            std::println(std::cerr, "  '{}' (required by {})", r.req.text,
+                         r.parent);
+        if (candidates.empty()) {
+            std::println(std::cerr, "  (the repository has no semver tags)");
+        } else {
+            std::string available;
+            for (std::size_t i = 0;
+                 i < candidates.size() && i < 10; ++i) {
+                if (!available.empty()) available += ", ";
+                available += candidates[i].second;
+            }
+            std::println(std::cerr, "  available: {}", available);
+        }
+        return std::nullopt;
+    };
+
+    for (int pass = 0;; ++pass) {
+        if (pass > 32) {
+            std::println(std::cerr,
+                         "bake: version resolution did not converge");
+            return std::nullopt;
+        }
+        bool restart = false;
+        queue.clear();
+        activated_by_key.clear();
+        activated_by_path.clear();
+        requirements.clear();
+        pins.clear();
+        expanded.clear();
+        lockfile = Lockfile{};
+        std::size_t entry_count = 0;
+        std::set<std::string> seen_refs;
+
+        auto dedup_key = [](const Dependency& dep) {
+            if (dep.is_archive())
+                return normalize_dependency_url(dep.url) + "\narchive\n";
             auto pair = dep.git_ref();
-            ref_type = pair.first;
-            ref = pair.second;
+            return normalize_dependency_url(dep.url) + "\n" + pair.first +
+                   "\n" + pair.second;
+        };
+
+        {
+            // CLI root features participate in lock resolution: their
+            // conditional dependencies must be resolved and locked.
+            std::string root_name =
+                manifest.moid ? manifest.moid->name : std::string("root");
+            auto root_active =
+                active_features_of(manifest, root_features);
+            if (!root_active) return std::nullopt;
+            enqueue_scopes(manifest, *root_active, root_name);
+
+            // Workspace members are first-class dependency scopes: their
+            // declarations resolve and lock exactly like the root's.
+            for (auto& member : Manifest::member_manifests(manifest)) {
+                auto member_active = active_features_of(member, {});
+                if (!member_active) return std::nullopt;
+                enqueue_scopes(member, *member_active,
+                               member.moid ? member.moid->name
+                                           : std::string("member"));
+            }
         }
 
-        // Locked-as-hints: url+ref unchanged → carry the entry verbatim.
-        // No ls-remote, no download. The closure through the carried
-        // entry is still re-enqueued: the hint lock may have been pruned
-        // since it was written, and missing transitives then resolve
-        // normally instead of failing the graph later.
-        if (hints && !grew) {
-            const LockDep* hint = hints->find_remote(dep.url, ref_type, ref);
-            if (hint && !hint->integrity.empty() &&
-                (dep.is_archive() || !hint->commit.empty())) {
-                if (lockfile.deps.emplace(hint->key, *hint).second)
-                entry_count++;
-                // Fresh machine with a committed lock: the carried entry
-                // may have no local cache. Fetch by locked identity (no
-                // ref movement) so the closure walk below — and the graph
-                // build later — both find the sources. Offline/frozen
-                // builds skip this and fail at cache verification.
-                if (!config.offline && !config.frozen &&
-                    !ensure_cached(*hint))
-                    return std::nullopt;
-                std::string hash = hint->cache_hash();
-                if (!hash.empty()) {
-                    Path dep_cache = cache_dir_ / hash;
-                    if (auto sub_manifest = Manifest::load_moid(dep_cache)) {
-                        sub_manifest->project_dir = dep_cache;
-                        auto active = active_features_of(*sub_manifest,
-                                                         accumulated);
-                        if (!active) return std::nullopt;
-                        enqueue_scopes(*sub_manifest, *active);
+        const std::size_t MAX_ENTRIES = 256;
+
+        while (!queue.empty()) {
+            if (entry_count >= MAX_ENTRIES) {
+                std::println(std::cerr,
+                             "bake: dependency graph exceeds limit ({} entries)",
+                             MAX_ENTRIES);
+                return std::nullopt;
+            }
+
+            auto entry = queue.front();
+            queue.erase(queue.begin());
+            Dependency dep = entry.dep;
+            std::string norm_url =
+                dep.is_remote() ? normalize_dependency_url(dep.url) : "";
+
+            // Version-constrained: pick the tag now, then flow through
+            // the regular tag path below.
+            if (!dep.version.empty()) {
+                auto tag = choose_tag(dep, entry.parent);
+                if (!tag) return std::nullopt;
+                if (auto done = expanded.find(norm_url);
+                    done != expanded.end() && done->second != *tag) {
+                    restart = true;  // expanded a superseded selection
+                    break;
+                }
+                floors[norm_url] = *tag;
+                dep.tag = *tag;
+                dep.version.clear();
+            } else if (dep.is_remote() && !dep.is_archive() &&
+                       !dep.tag.empty()) {
+                // Remember exact pins so later same-URL version
+                // constraints can fold them in (and refuse non-semver
+                // mixes).
+                pins.emplace(norm_url, std::pair{dep.tag, entry.parent});
+            }
+
+            if (dep.is_path_dep) {
+                Path dep_dir = (entry.manifest_dir / dep.path.c_str())
+                                   .lexically_normal();
+                Path dep_toml = dep_dir / "bake.toml";
+                if (dep_toml.is_regular_file()) {
+                    auto sub_manifest = Manifest::load_moid(dep_dir);
+                    if (sub_manifest) {
+                        sub_manifest->project_dir = dep_dir;
+                        auto& seen = activated_by_path[dep_dir.absolute()];
+                        bool grew = false;
+                        for (const auto& name : entry.features)
+                            if (seen.insert(name).second) grew = true;
+                        if (grew || seen.empty()) {
+                            auto active =
+                                active_features_of(*sub_manifest, seen);
+                            if (!active) return std::nullopt;
+                            enqueue_scopes(*sub_manifest, *active,
+                                           sub_manifest->moid
+                                               ? sub_manifest->moid->name
+                                               : dep.name);
+                        }
                     }
                 }
                 continue;
             }
-        }
 
-        // Resolve the dependency (network).
-        auto lock_dep = resolve_dependency(dep);
-        if (!lock_dep) return std::nullopt;
+            // A first visit resolves over the network; a later visit
+            // only matters when it activated additional features, in
+            // which case the newly reachable feature dependencies are
+            // enqueued below.
+            auto& accumulated = activated_by_key[dedup_key(dep)];
+            bool grew = false;
+            for (const auto& name : entry.features)
+                if (accumulated.insert(name).second) grew = true;
+            if (!seen_refs.insert(dedup_key(dep)).second && !grew) continue;
 
-        lockfile.deps[lock_dep->key] = *lock_dep;
-        entry_count++;
+            std::string ref_type = dep.is_archive() ? "archive" : "";
+            std::string ref;
+            if (ref_type.empty()) {
+                auto pair = dep.git_ref();
+                ref_type = pair.first;
+                ref = pair.second;
+            }
 
-        // Recurse into native cached sources for transitive deps.
-        std::string hash = lock_dep->cache_hash();
-        if (!hash.empty()) {
-            Path dep_cache = cache_dir_ / hash;
-            if (auto sub_manifest = Manifest::load_moid(dep_cache)) {
-                sub_manifest->project_dir = dep_cache;
-                auto active = active_features_of(*sub_manifest, accumulated);
-                if (!active) return std::nullopt;
-                enqueue_scopes(*sub_manifest, *active);
+            // Locked-as-hints: url+ref unchanged → carry the entry
+            // verbatim. No ls-remote, no download. The closure through
+            // the carried entry is still re-enqueued: the hint lock may
+            // have been pruned since it was written, and missing
+            // transitives then resolve normally instead of failing the
+            // graph later.
+            if (hints && !grew) {
+                const LockDep* hint =
+                    hints->find_remote(dep.url, ref_type, ref);
+                if (hint && !hint->integrity.empty() &&
+                    (dep.is_archive() || !hint->commit.empty())) {
+                    if (lockfile.deps.emplace(hint->key, *hint).second)
+                    entry_count++;
+                    if (ref_type == "tag")
+                        expanded[norm_url] = ref;
+                    // Fresh machine with a committed lock: the carried
+                    // entry may have no local cache. Fetch by locked
+                    // identity (no ref movement) so the closure walk
+                    // below — and the graph build later — both find the
+                    // sources. Offline/frozen builds skip this and fail
+                    // at cache verification.
+                    if (!config.offline && !config.frozen &&
+                        !ensure_cached(*hint))
+                        return std::nullopt;
+                    std::string hash = hint->cache_hash();
+                    if (!hash.empty()) {
+                        Path dep_cache = cache_dir_ / hash;
+                        if (auto sub_manifest =
+                                Manifest::load_moid(dep_cache)) {
+                            sub_manifest->project_dir = dep_cache;
+                            auto active = active_features_of(*sub_manifest,
+                                                             accumulated);
+                            if (!active) return std::nullopt;
+                            enqueue_scopes(
+                                *sub_manifest, *active,
+                                sub_manifest->moid
+                                    ? sub_manifest->moid->name
+                                    : hint->name);
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Resolve the dependency (network).
+            auto lock_dep = resolve_dependency(dep);
+            if (!lock_dep) return std::nullopt;
+
+            lockfile.deps[lock_dep->key] = *lock_dep;
+            entry_count++;
+            if (ref_type == "tag") expanded[norm_url] = ref;
+
+            // Recurse into native cached sources for transitive deps.
+            std::string hash = lock_dep->cache_hash();
+            if (!hash.empty()) {
+                Path dep_cache = cache_dir_ / hash;
+                if (auto sub_manifest = Manifest::load_moid(dep_cache)) {
+                    sub_manifest->project_dir = dep_cache;
+                    auto active =
+                        active_features_of(*sub_manifest, accumulated);
+                    if (!active) return std::nullopt;
+                    enqueue_scopes(*sub_manifest, *active,
+                                   sub_manifest->moid
+                                       ? sub_manifest->moid->name
+                                       : lock_dep->name);
+                }
             }
         }
+
+        if (!restart) break;
+        std::println("  version constraints moved a resolved package; "
+                     "re-resolving");
     }
 
     return lockfile;
@@ -1023,7 +1302,9 @@ export Lockfile prune_lock(const Manifest& manifest, const Lockfile& lock) {
                         ref = pair.second;
                     }
                     const LockDep* entry =
-                        lock.find_remote(dep.url, ref_type, ref);
+                        dep.version.empty()
+                            ? lock.find_remote(dep.url, ref_type, ref)
+                            : lock.find_tag_entry(dep.url);
                     if (!entry) continue;  // lock was already stale here
                     pruned.deps.emplace(entry->key, *entry);
 

@@ -1376,6 +1376,7 @@ int cmd_update(const ParsedArgs &args) {
       ref_type = pair.first;
       ref = pair.second;
     }
+    if (!dep.version.empty()) return lock->find_tag_entry(dep.url);
     return lock->find_remote(dep.url, ref_type, ref);
   };
   auto report_change = [&](const std::string &name,

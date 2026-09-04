@@ -56,6 +56,7 @@ int main() {
         "src/util.cppm",
         "src/buildsystem/project.cppm",
         "src/buildsystem/moid.cppm",
+        "src/buildsystem/semver.cppm",
         "src/buildsystem/graph.cppm",
         "src/toolchain/lld.cppm",
         "src/toolchain/cc1.cppm",

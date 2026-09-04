@@ -11,6 +11,7 @@ mylib = { path = "../mylib" }
 fmt = { url = "https://github.com/fmtlib/fmt", tag = "11.0.2" }
 catch2 = { url = "https://github.com/catchorg/Catch2", branch = "devel" }
 fixed = { url = "https://github.com/org/repo", rev = "d5598e0f03e13c0b" }
+ranged = { url = "https://github.com/bake-pkgs/zstd", version = "^1.5" }
 
 # An archive URL is a direct archive dependency; it has no ref.
 headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
@@ -43,9 +44,52 @@ default_branch = { url = "https://github.com/org/repo" }
 - `tag` selects a tag.
 - `branch` selects a branch.
 - `rev` selects an exact Git revision.
+- `version` declares a semver requirement; the resolver picks the tag.
 - With no ref, bake resolves the remote's default-branch `HEAD` at build time.
 
-`tag`, `branch`, and `rev` are mutually exclusive: an entry may contain at most one of them. Each selected Git ref is resolved to a commit in the lockfile, so ordinary builds keep using that commit until `bake update` moves it.
+`tag`, `branch`, `rev`, and `version` are mutually exclusive: an entry may contain at most one of them. Each selected Git ref (the tag chosen for a `version` requirement included) is resolved to a commit in the lockfile, so ordinary builds keep using that commit until `bake update` moves it.
+
+### Version constraints
+
+Instead of a fixed ref, a Git dependency may declare a semver requirement:
+
+```toml
+[dependencies]
+zstd = { url = "https://github.com/bake-pkgs/zstd", version = "^1.5" }
+```
+
+The resolver enumerates the repository's semver tags (`git ls-remote --tags`)
+and selects one tag per URL:
+
+- an already-locked tag that still satisfies every requirement in the
+  graph — ordinary builds never move a locked choice;
+- otherwise the highest version satisfying all requirements registered
+  for that URL. An exact `tag` pinned on the same URL participates as an
+  equality constraint, so ranges and pins cannot silently disagree.
+
+Requirements are discovered while walking package manifests, so a
+constraint arriving after a package was already expanded can invalidate
+the earlier pick; resolution then restarts with the old choice as a
+floor. Selections only ever rise, so this converges. When nothing
+satisfies, bake lists each requirement together with the package that
+declared it.
+
+Requirement syntax: `1.2.3` exact (a leading `=` is accepted), `^1.2.3`
+caret (bump the leftmost nonzero component: `^0.2.3` is `< 0.3.0`,
+`^0.0.3` is `< 0.0.4`), `~1.2.3` tilde (patch-level: `< 1.3.0`), partials
+(`1.2` ≡ `~1.2`, `1` ≡ `~1`), and `*` (any release). A leading `v` on
+the operand is accepted. Prerelease candidates follow node-semver's rule:
+a prerelease only satisfies a requirement whose operand carries a
+prerelease of the same `major.minor.patch` — `^1.2.3` never matches
+`1.3.0-beta`, while `^0.0.0-bbc0631` matches `0.0.0-bbc0631-r1`.
+Comparator lists (`>=1.2 <2`) are not accepted.
+
+`version` is mutually exclusive with `tag`, `branch`, and `rev`, and may
+not be combined with archive URLs. The lockfile records the chosen tag as
+ref type `tag`; `bake update` is the only routine that reconsiders it,
+moving each constrained dependency to the highest tag satisfying the
+current requirements. `--locked` fails when the locked tag no longer
+satisfies a requirement.
 
 Fetching: bake first downloads a Git dependency through the host's source
 archive endpoint (GitHub/GitLab style `<repo>/archive/<commit>.tar.gz`) at
@@ -56,7 +100,7 @@ on which one was used.
 
 ### Archive dependencies
 
-A URL ending in `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar.zst`, `.tzst`, or `.zip` is recognized as a direct archive dependency. Do not specify `tag`, `branch`, or `rev` for an archive URL; a ref on an archive dependency is an error.
+A URL ending in `.tar.gz`, `.tgz`, `.tar.bz2`, `.tbz2`, `.tar.xz`, `.txz`, `.tar.zst`, `.tzst`, or `.zip` is recognized as a direct archive dependency. Do not specify `tag`, `branch`, `rev`, or `version` for an archive URL; a ref on an archive dependency is an error.
 
 Downloads and extraction run in process in the self-hosted bake, which links libcurl and libarchive; the stage-0 bootstrap binary shells out to the system `curl`, `tar`, and `unzip` instead. Git transport (ref resolution, clone fallback) still uses the `git` binary. The archive URL is locked by URL and its downloaded content is recorded with an integrity value.
 

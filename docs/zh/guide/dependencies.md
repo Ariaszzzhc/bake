@@ -11,6 +11,7 @@ mylib = { path = "../mylib" }
 fmt = { url = "https://github.com/fmtlib/fmt", tag = "11.0.2" }
 catch2 = { url = "https://github.com/catchorg/Catch2", branch = "devel" }
 fixed = { url = "https://github.com/org/repo", rev = "d5598e0f03e13c0b" }
+ranged = { url = "https://github.com/bake-pkgs/zstd", version = "^1.5" }
 
 # 归档 URL 是直接归档依赖；不带 ref。
 headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
@@ -43,9 +44,40 @@ default_branch = { url = "https://github.com/org/repo" }
 - `tag` 选择标签。
 - `branch` 选择分支。
 - `rev` 选择确切的 Git revision。
+- `version` 声明 semver 要求，由解析器选定标签。
 - 不带 ref 时，bake 会在构建时解析远端默认分支的 `HEAD`。
 
-`tag`、`branch` 和 `rev` 互斥：一个条目至多包含其中一个。每个选定的 Git ref 都会在锁文件中解析为 commit，因此普通构建会持续使用该 commit，直到 `bake update` 移动它。
+`tag`、`branch`、`rev` 与 `version` 互斥：一个条目至多包含其中一个。每个选定的 Git ref（包括为 `version` 要求选定的标签）都会在锁文件中解析为 commit，因此普通构建会持续使用该 commit，直到 `bake update` 移动它。
+
+### 版本约束
+
+Git 依赖可以不写固定 ref，而是声明一个 semver 要求：
+
+```toml
+[dependencies]
+zstd = { url = "https://github.com/bake-pkgs/zstd", version = "^1.5" }
+```
+
+解析器枚举仓库的 semver 标签（`git ls-remote --tags`），并为每个 URL 选定一个标签：
+
+- 已在锁中、且仍满足图中全部要求的标签 —— 普通构建从不移动已锁定的选择；
+- 否则取满足该 URL 全部要求的最高版本。同一 URL 上钉死的 `tag`
+  以等式约束参与求解，范围与钉死不会静默分歧。
+
+要求是在遍历包 manifest 的过程中发现的，因此某个包已展开后才到达的约束可能使先前
+的选择失效；此时解析以旧选择为下限重启。选择只升不降，因此必然收敛。无版本可满足时，
+bake 会列出每条要求及其声明它的包。
+
+要求语法：`1.2.3` 精确（允许前缀 `=`）、`^1.2.3` 脱字符（提升最左侧非零分量：
+`^0.2.3` 即 `< 0.3.0`，`^0.0.3` 即 `< 0.0.4`）、`~1.2.3` 波浪线（补丁级：
+`< 1.3.0`）、部分形式（`1.2` ≡ `~1.2`，`1` ≡ `~1`）与 `*`（任意发布版）。
+操作数允许前缀 `v`。预发布候选遵循 node-semver 规则：预发布版本只满足操作数在同一
+`major.minor.patch` 上也带预发布的那些要求 —— `^1.2.3` 永不匹配 `1.3.0-beta`，
+而 `^0.0.0-bbc0631` 能匹配 `0.0.0-bbc0631-r1`。不接受比较符列表（`>=1.2 <2`）。
+
+`version` 与 `tag`、`branch`、`rev` 互斥，也不能用于归档 URL。锁文件以 ref 类型
+`tag` 记录选定的标签；只有 `bake update` 会重新考虑它，把每个带约束的依赖移动到满足
+当前要求的最高标签。当锁定的标签不再满足要求时 `--locked` 会失败。
 
 取回方式：bake 优先通过托管方的源码归档端点（GitHub/GitLab 风格的
 `<仓库>/archive/<commit>.tar.gz`）按锁定的 commit 下载 Git 依赖；端点不存在或不可用时回退到完整
@@ -53,7 +85,7 @@ default_branch = { url = "https://github.com/org/repo" }
 
 ### 归档依赖
 
-以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz`、`.tar.zst`、`.tzst` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch` 或 `rev`；归档依赖带 ref 会报错。
+以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz`、`.tar.zst`、`.tzst` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch`、`rev` 或 `version`；归档依赖带 ref 会报错。
 
 自举后的 bake 内嵌 libcurl 与 libarchive，下载与解压都在进程内完成；stage-0 引导二进制则调用系统 `curl`、`tar`、`unzip`。Git 传输（ref 解析、clone 兜底）仍使用 `git` 二进制。归档 URL 按 URL 锁定，已下载内容会记录完整性值。
 

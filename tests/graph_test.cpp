@@ -1,6 +1,7 @@
 import std;
 import bake.util;
 import bake.buildsystem.project;
+import bake.buildsystem.semver;
 import bake.buildsystem.graph;
 import bake.buildsystem.moid;
 
@@ -294,6 +295,90 @@ bool glob_tests() {
     return ok;
 }
 
+bool semver_tests() {
+    using bake::semver::Req;
+    using bake::semver::Version;
+    bool ok = true;
+    auto V = [&](const char* s) {
+        auto v = Version::parse(s);
+        if (!v) ok = false;
+        return v.value_or(Version{});
+    };
+    auto R = [&](const char* s) {
+        auto r = Req::parse(s);
+        if (!r) ok = false;
+        return r.value_or(Req{});
+    };
+    auto sat = [&](const char* r, const char* v) {
+        std::vector<Req> set{R(r)};
+        return bake::semver::satisfies_all(V(v), set);
+    };
+
+    // Parsing: tolerant 'v', strict otherwise.
+    ok &= ((V("1.2.3").to_string() == "1.2.3"));
+    ok &= ((V("v1.2.3").major == 1));
+    ok &= (!Version::parse("1.2").has_value());         // missing patch
+    ok &= (!Version::parse("1.2.3.4").has_value());     // quad
+    ok &= (!Version::parse("01.2.3").has_value());      // leading zero
+    ok &= (!Version::parse("1.2.3-").has_value());      // empty prerelease
+    ok &= ((V("1.2.3-beta.2").pre.size() == 2));
+    ok &= ((V("1.2.3+meta").build == "meta"));
+
+    // Precedence: numeric fields, release > prerelease, numeric
+    // identifiers < alphanumeric, longer identifier list wins.
+    ok &= ((V("2.0.0") > V("1.99.99")));
+    ok &= ((V("1.2.3") > V("1.2.3-rc.1")));
+    ok &= ((V("1.2.3-alpha") < V("1.2.3-beta")));
+    ok &= ((V("1.2.3-1") < V("1.2.3-alpha")));   // numeric < alpha
+    ok &= ((V("1.2.3-rc.1") < V("1.2.3-rc.1.1")));
+    ok &= ((V("1.2.3+build.1") == V("1.2.3")));  // build ignored
+
+    // Requirement kinds.
+    ok &= (sat("1.2.3", "1.2.3"));
+    ok &= (!sat("1.2.3", "1.2.4"));
+    ok &= (sat("^1.2.3", "1.2.3") && sat("^1.2.3", "1.9.9"));
+    ok &= (!sat("^1.2.3", "2.0.0") && !sat("^1.2.3", "1.2.2"));
+    ok &= (sat("^0.2.3", "0.2.9") && !sat("^0.2.3", "0.3.0"));
+    ok &= (sat("^0.0.3", "0.0.3") && !sat("^0.0.3", "0.0.4"));
+    ok &= (sat("~1.2.3", "1.2.9") && !sat("~1.2.3", "1.3.0"));
+    ok &= (sat("~1.2", "1.2.0") && !sat("~1.2", "1.3.0"));
+    ok &= (sat("~1", "1.9.9") && !sat("~1", "2.0.0"));
+    ok &= (sat("1.2", "1.2.5") && !sat("1.2", "1.3.0"));
+    ok &= (sat("1", "1.4.0") && !sat("1", "2.0.0"));
+    ok &= (sat("1.x", "1.4.0") && !sat("1.2.x", "1.3.0"));
+    ok &= (sat("*", "0.0.1") && sat("*", "99.0.0"));
+    ok &= (sat("=1.2.3", "1.2.3"));
+    ok &= (sat("^1.2.3-beta.1", "1.2.3-beta.4"));
+
+    // Prerelease gating: ranges never match prereleases of other
+    // triples, `*` never matches prereleases.
+    ok &= (!sat("^1.2.3", "1.9.0-beta"));
+    ok &= (!sat("*", "1.2.3-rc.1"));
+    ok &= (!sat("1.2", "1.2.4-rc"));
+
+    // Set-level prerelease rule: one admitting requirement unblocks the
+    // whole set (node-semver semantics).
+    {
+        std::vector<Req> both{R("1.5.7-r1"), R("^1.5")};
+        ok &= (bake::semver::satisfies_all(V("1.5.7-r1"), both));
+        ok &= (!bake::semver::satisfies_all(V("1.5.8-beta"), both));
+        std::vector<Req> star{R("*")};
+        ok &= (!bake::semver::satisfies_all(V("1.2.3-rc.1"), star));
+    }
+
+    // Rejected syntax.
+    ok &= (!Req::parse("").has_value());
+    ok &= (!Req::parse(">=1.2").has_value());   // comparator lists unsupported
+    ok &= (!Req::parse("^1.2.3 <2").has_value());
+    ok &= (Req::parse("^x")->kind == Req::Kind::Any);  // npm: ^x ≡ *
+    ok &= (sat("^0", "0.9.9") && !sat("^0", "1.0.0"));
+    ok &= (sat("^0.0", "0.0.9") && !sat("^0.0", "0.1.0"));
+    ok &= (!Req::parse("1.2.3.4").has_value());
+
+    if (!ok) std::println(std::cerr, "semver_tests failed");
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -307,6 +392,7 @@ int main() {
     if (!manifest_form_tests()) return 1;
     if (!effective_dependency_tests()) return 1;
     if (!glob_tests()) return 1;
+    if (!semver_tests()) return 1;
 
     return 0;
 }

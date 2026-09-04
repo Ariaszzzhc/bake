@@ -2,6 +2,7 @@ export module bake.buildsystem.graph;
 
 import std;
 import bake.util;
+import bake.buildsystem.semver;
 import bake.buildsystem.project;
 import bake.buildsystem.moid;
 
@@ -83,6 +84,26 @@ export struct SourceIndex {
     const LockedSource* find(const Dependency& dep) const {
         if (dep.is_archive())
             return find(normalize_dependency_url(dep.url), "archive", "");
+        if (!dep.version.empty()) {
+            // Version-constrained: the unique locked tag for the URL,
+            // provided it satisfies the requirement. An unsatisfying
+            // lock means the manifest moved under a stale lock.
+            auto req = semver::Req::parse(dep.version);
+            if (!req) return nullptr;
+            const LockedSource* found = nullptr;
+            for (const auto& entry : entries) {
+                if (entry.url != normalize_dependency_url(dep.url) ||
+                    entry.ref_type != "tag")
+                    continue;
+                auto got = semver::Version::parse(entry.ref);
+                if (!got) continue;
+                std::vector<semver::Req> only{*req};
+                if (!semver::satisfies_all(*got, only)) continue;
+                if (found) return nullptr;  // ambiguous — re-resolve
+                found = &entry;
+            }
+            return found;
+        }
         auto [type, value] = dep.git_ref();
         return find(normalize_dependency_url(dep.url), type, value);
     }

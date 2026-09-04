@@ -117,9 +117,10 @@ BAKE_MYAPP_VERSION_PATCH = 0
 |---|---|---|
 | `path` | 路径依赖 | 本地目录。每次构建都从磁盘解析，且永不写入 `bake.lock`。 |
 | `url` | Git 或归档依赖 | Git URL，除非其以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz`、`.tar.zst`、`.tzst` 或 `.zip` 结尾；这些后缀声明直接归档依赖。 |
-| `tag` | Git ref | 选择标签。与 `branch`、`rev` 互斥。 |
-| `branch` | Git ref | 选择分支。与 `tag`、`rev` 互斥。 |
-| `rev` | Git ref | 选择确切的 Git revision。与 `tag`、`branch` 互斥。 |
+| `tag` | Git ref | 选择标签。与 `branch`、`rev`、`version` 互斥。 |
+| `branch` | Git ref | 选择分支。与 `tag`、`rev`、`version` 互斥。 |
+| `rev` | Git ref | 选择确切的 Git revision。与 `tag`、`branch`、`version` 互斥。 |
+| `version` | semver 要求 | `"1.2.3"` 精确、`^`/`~` 范围、部分形式或 `*`。解析器枚举仓库的 semver 标签并锁定满足要求的最高版本（已锁定且仍满足的选择保持不变）。见[依赖](../guide/dependencies.md)。 |
 | `features` | 任意依赖 | 要在该依赖包上激活的 `[features]` 列表。 |
 | `default-features` | 任意依赖 | `false` 时该边不再贡献依赖包的 `default` 特性集——仅 `features` 显式点名的特性激活。并集语义：其他边（或将该包作为根构建）仍会贡献默认特性；混合时 bake 会警告。 |
 
