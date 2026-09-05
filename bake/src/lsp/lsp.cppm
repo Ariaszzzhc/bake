@@ -19,4 +19,8 @@ namespace bake {
 // subcommand.
 export int lsp_main(const std::vector<std::string>& args);
 
+// Entry point for `bake lsp-worker`, the process the master
+// spawns for every frontend job. Same argv shape as lsp_main.
+export int lsp_worker_main(const std::vector<std::string>& args);
+
 } // namespace bake

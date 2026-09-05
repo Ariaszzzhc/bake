@@ -9,6 +9,7 @@
 /bake/build/
 /external/llvm-build/
 /.codegraph/
+/.zed/
 /__cmake_systeminformation/
 /zig_native_cpp.o
 /external/llvm-install/

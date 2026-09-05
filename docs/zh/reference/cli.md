@@ -117,7 +117,7 @@ bake compdb [--release | --profile <name>] [-t <triple>] [--offline] [output]
 ## `bake lsp`
 
 ```
-bake lsp
+bake lsp [--target <三元组>] [--profile <名称>] [--index-jobs <n>]
 ```
 
 - 在 stdio 上讲语言服务器协议（JSON-RPC、Content-Length 分帧）。编辑器像任何 LSP server 一样启动它；
@@ -126,13 +126,23 @@ bake lsp
   （`didOpen`/`didChange`/`didClose`）、诊断、补全
   （`textDocument/completion`）、跳转与引用
   （`textDocument/definition`、`textDocument/references`）。
-- 编译在进程内按 `bake build` 会用的命令执行，编辑器缓冲区重映射到文件之上——
+- 每次前端编译都发生在 worker 进程里（`bake lsp-worker`，由当前二进制自身
+  派生）：一个专用交互 worker 以 FIFO 服务低延迟通道（preamble 构建、按键
+  诊断、补全），`--index-jobs` 个 worker（默认 clamp(核数/2, 1, 6)）并行
+  消化后台索引队列。事件循环绝不阻塞在编译上；陈旧诊断按文档代次丢弃；
+  worker 崩溃自动重生（每 10 秒最多 3 次，超限后该通道快速失败）。
+- 编译按 `bake build` 会用的命令执行，编辑器缓冲区重映射到文件之上——
   诊断永远反映构建真相，而不是猜测的编译数据库。
-- 文件头部（preamble）编译一次生成 PCH，按内容寻址存入全局缓存；按键编译只解析
-  正在编辑的函数体（含模块导入的 preamble 回退为整文件编译）。
-- 低优先级后台线程把项目源码索引成按编译单元的符号 shard；跳转/引用优先用打开
+- 文件头部（preamble）编译一次生成 PCH，按内容寻址存入
+  `out/<triple>/.bake/lsp-preamble/`；按键编译只解析正在编辑的函数体。
+  模块编译单元的 PCH 区域截断在首个模块构造之前（PCH 不能携带模块导入），
+  `import std;` 文件保留纯预处理器 preamble，其导入重新跑真实模块文件。
+- 后台索引经 worker 池采集按编译单元的符号 shard；跳转/引用优先用打开
   文件的实时索引，其次用 shard 集——冷索引下跨文件跳转同样可用。
-- 仅存在于自举（self-hosted）二进制中（依赖 kotatsu 异步运行时）；stage0 引导会打印说明性错误。
+- `--target` 选择编译上下文（任意交叉编译三元组——补全与诊断随之反映对应
+  libc）；`--profile` 选择构建 profile（默认 `dev`）。
+- 仅存在于自举（self-hosted）二进制中（依赖 kotatsu 异步运行时）；引导二进制
+  直接拒绝该命令。
 
 ## 退出码
 

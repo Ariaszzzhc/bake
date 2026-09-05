@@ -120,7 +120,7 @@ bake compdb [--release | --profile <name>] [-t <triple>] [--offline] [output]
 ## `bake lsp`
 
 ```
-bake lsp
+bake lsp [--target <triple>] [--profile <name>] [--index-jobs <n>]
 ```
 
 - Speaks the Language Server Protocol over stdio (JSON-RPC, Content-Length
@@ -130,17 +130,31 @@ bake lsp
   sync (`didOpen`/`didChange`/`didClose`), diagnostics, completion
   (`textDocument/completion`), definition and references
   (`textDocument/definition`, `textDocument/references`).
-- Compiles run in-process against the command `bake build` would use, with
-  the editor buffer remapped over the file — diagnostics always reflect
-  build truth, never a guessed compilation database.
-- Preamble regions compile once into PCHs, content-keyed in the global
-  cache; keystroke compiles parse the edited body only (module-importing
-  preambles fall back to whole-file compiles).
-- A low-priority background thread indexes project sources into per-TU
-  symbol shards; definition/references answer from the open file first
-  and the shard set second, so cross-file jumps work on a cold index too.
+- Every Clang frontend run happens in a worker process (`bake lsp-worker`,
+  spawned from the running binary): one dedicated interactive worker serves
+  the latency lane (preamble builds, keystroke diagnostics, completion)
+  FIFO, and `--index-jobs` workers (default: clamp(cores/2, 1, 6)) drain
+  the background indexing queue in parallel. The event loop never blocks
+  on a compile; stale diagnostics are dropped per document generation; a
+  crashed worker is respawned (up to 3 times per 10 seconds, then its lane
+  fails fast).
+- Compiles run against the command `bake build` would use, with the editor
+  buffer remapped over the file — diagnostics always reflect build truth,
+  never a guessed compilation database.
+- Preamble regions compile once into PCHs, content-keyed under
+  `out/<triple>/.bake/lsp-preamble/`; keystroke compiles parse the edited
+  body only. For module TUs the PCH region is capped before the first
+  module construct (PCHs cannot carry module imports), so `import std;`
+  files keep a preprocessor-only preamble and their imports re-run against
+  real module files.
+- Background indexing collects per-TU symbol shards through the worker
+  pool; definition/references answer from the open file first and the
+  shard set second, so cross-file jumps work on a cold index too.
+- `--target` selects the compile context (any cross-compilation triple —
+  completions and diagnostics then reflect that libc); `--profile` picks
+  the build profile (default `dev`).
 - Only present in the self-hosted binary (it rides on the kotatsu async
-  runtime); the stage0 bootstrap prints an explanatory error.
+  runtime); the bootstrap binary refuses the command outright.
 
 ## Exit codes
 0 on success; 1 on any failure (build error, failed test, unsatisfiable `--locked`/`--offline`, missing manifest). Test failures propagate the failing binary's exit code semantics through `bake test`'s own non-zero exit.

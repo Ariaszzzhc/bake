@@ -58,7 +58,7 @@ endif()
 # ---- bake (single executable: CLI + compiler + engine + package) ----
 
 add_executable(bake
-    bake/src/main.cpp
+    bake/src/stage0/main.cpp
 )
 
 target_sources(bake
@@ -85,12 +85,19 @@ target_sources(bake
             bake/src/toolchain/cc1.cppm
             bake/src/toolchain/cc1as.cppm
             bake/src/toolchain/driver.cppm
-            bake/src/toolchain/compilation.cppm
             bake/src/buildsystem/engine.cppm
             bake/src/buildsystem/package.cppm
             bake/src/buildsystem/query.cppm
-            bake/src/lsp/lsp.cppm
-            bake/src/lsp/index.cppm
+            bake/src/cli.cppm
+            bake/src/cli/dep_edit.cppm
+            bake/src/cli/init.cppm
+            bake/src/cli/build.cppm
+            bake/src/cli/clean.cppm
+            bake/src/cli/add.cppm
+            bake/src/cli/remove.cppm
+            bake/src/cli/update.cppm
+            bake/src/cli/run.cppm
+            bake/src/cli/test.cppm
 )
 
 # stage0 implementation units of bake.json / bake.toml / bake.net /
@@ -104,7 +111,6 @@ target_sources(bake PRIVATE
     bake/src/stage0/toml.cpp
     bake/src/stage0/net_cli.cpp
     bake/src/stage0/archive_cli.cpp
-    bake/src/stage0/lsp_stub.cpp
 )
 
 target_compile_features(bake PRIVATE cxx_std_23)

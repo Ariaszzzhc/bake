@@ -79,13 +79,17 @@ export struct CompileOutcome {
     std::vector<SourceDiagnostic> diagnostics;
 };
 
-// Load a cached preamble PCH while parsing: the implicit include
-// plus the recorded byte range the preprocessor must skip because
-// the PCH already covers it.
+// Load a cached preamble PCH while parsing: the implicit include,
+// the recorded byte range the preprocessor must skip because the
+// PCH already covers it, and the region cap the PCH was built
+// under (natural bounds when unset). Module-importing files use a
+// cap so the PCH stops before the first import/module line and
+// the imports re-run against real module files.
 export struct PchLoad {
     std::string path;
     unsigned preamble_size = 0;
     bool preamble_ends_at_start_of_line = false;
+    std::size_t region_limit = std::size_t(-1);
 
     bool empty() const { return path.empty(); }
 };
@@ -101,20 +105,23 @@ export CompileOutcome run_syntax_check(
 
 export struct PreambleBuild {
     bool ok = false;
-    unsigned preamble_size = 0;             // clang-exact preamble bounds
+    unsigned preamble_size = 0;    // effective region size
     bool preamble_ends_at_start_of_line = false;
     CompileOutcome outcome;
 };
 
 // Compile the preamble region of `main_file` (taken from the
-// remapped buffer) into a PCH at `pch_out`. The recorded bounds
-// are the ones ComputePreamble derives with the real LangOptions
-// of the invocation.
+// remapped buffer) into a PCH at `pch_out`. The region is
+// min(ComputePreamble, region_limit): callers cap it before the
+// first import/module line for module TUs (PCHs cannot carry
+// module imports), so the skipped bytes and the PCH content stay
+// in lockstep. The recorded bounds are the effective region's.
 export PreambleBuild run_preamble_build(
         const std::vector<std::string>& driver_argv,
         const std::map<std::string, std::string>& remapped_files,
         const std::string& main_file,
-        const std::string& pch_out);
+        const std::string& pch_out,
+        std::size_t region_limit);
 
 export struct CompletionItemData {
     std::string label;        // text to type (the TypedText chunks)
@@ -541,20 +548,37 @@ export CompileOutcome run_syntax_check(
             [&options](clang::CompilerInvocation& invocation,
                        std::map<std::string, llvm::MemoryBuffer*>& bufs) {
                 // Safety: the PCH is only valid when the current
-                // text's preamble is byte-identical to the one it
-                // was built from. Recompute the exact bounds with
-                // the real LangOptions and compare.
-                auto it = bufs.find(options.pch.path);
-                if (it == bufs.end()) return;
-                llvm::MemoryBuffer* main = it->second;
+                // text's preamble region is byte-identical to the
+                // one it was built from. Remaps here are aliases of
+                // the one main file (spelling + absolute path); pick
+                // the input filename's alias when it matches, else
+                // any (the driver may resolve either spelling).
+                if (bufs.empty()) return;
+                std::string input;
+                if (!invocation.getFrontendOpts().Inputs.empty())
+                    input = invocation.getFrontendOpts()
+                                .Inputs.front()
+                                .getFile();
+                llvm::MemoryBuffer* main = nullptr;
+                for (auto& [key, buffer] : bufs) {
+                    (void)key;
+                    if (buffer->getBufferIdentifier() == input) {
+                        main = buffer;
+                        break;
+                    }
+                }
+                if (!main) main = bufs.begin()->second;
+
                 clang::PreambleBounds bounds = clang::Lexer::ComputePreamble(
                     main->getBuffer(), invocation.getLangOpts());
-                if (bounds.Size != options.pch.preamble_size) return;
+                std::size_t effective = std::min<std::size_t>(
+                    bounds.Size, options.pch.region_limit);
+                if (effective != options.pch.preamble_size) return;
 
                 auto& pp_opts = invocation.getPreprocessorOpts();
                 pp_opts.ImplicitPCHInclude = options.pch.path;
                 pp_opts.PrecompiledPreambleBytes = std::make_pair(
-                    bounds.Size, bounds.PreambleEndsAtStartOfLine);
+                    effective, options.pch.preamble_ends_at_start_of_line);
             };
     }
 
@@ -566,7 +590,8 @@ export PreambleBuild run_preamble_build(
         const std::vector<std::string>& driver_argv,
         const std::map<std::string, std::string>& remapped_files,
         const std::string& main_file,
-        const std::string& pch_out) {
+        const std::string& pch_out,
+        std::size_t region_limit) {
     std::lock_guard<std::mutex> lock(g_compile_mutex);
     PreambleBuild result;
     std::unique_ptr<llvm::MemoryBuffer> preamble_buffer;
@@ -579,19 +604,31 @@ export PreambleBuild run_preamble_build(
             if (it == bufs.end()) return;
             clang::PreambleBounds bounds = clang::Lexer::ComputePreamble(
                 it->second->getBuffer(), invocation.getLangOpts());
-            result.preamble_size = bounds.Size;
+            std::size_t effective = std::min<std::size_t>(
+                bounds.Size, region_limit);
+            result.preamble_size = static_cast<unsigned>(effective);
             result.preamble_ends_at_start_of_line =
-                bounds.PreambleEndsAtStartOfLine;
-
-            // Replace the main-file buffer with its preamble region:
-            // the PCH is generated from exactly those bytes.
+                effective < bounds.Size
+                    ? true  // a cap always lands on a line boundary
+                    : bounds.PreambleEndsAtStartOfLine;
+            // Replace the main-file buffer with the effective
+            // preamble region: the PCH is generated from exactly
+            // those bytes. Every remap alias of the main file
+            // (spelling and absolute path — the driver resolves
+            // relative inputs) must swap together, or the cc1
+            // input filename picks up an untruncated alias.
             std::string preamble_text(
-                it->second->getBuffer().substr(0, bounds.Size));
+                it->second->getBuffer().substr(0, effective));
             preamble_buffer =
                 llvm::MemoryBuffer::getMemBufferCopy(
                     llvm::StringRef(preamble_text),
                     it->second->getBufferIdentifier());
-            bufs[main_file] = preamble_buffer.get();
+            llvm::MemoryBuffer* full = it->second;
+            for (auto& [key, buffer] : bufs) {
+                (void)key;
+                if (buffer->getBuffer() == full->getBuffer())
+                    buffer = preamble_buffer.get();
+            }
 
             auto& front = invocation.getFrontendOpts();
             front.ProgramAction = clang::frontend::GeneratePCH;

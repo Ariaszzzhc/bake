@@ -73,9 +73,23 @@ int main() {
         "src/buildsystem/engine.cppm",
         "src/buildsystem/package.cppm",
         "src/buildsystem/query.cppm",
+        "src/cli.cppm",
+        "src/cli/dep_edit.cppm",
+        "src/cli/init.cppm",
+        "src/cli/build.cppm",
+        "src/cli/clean.cppm",
+        "src/cli/audit.cppm",
+        "src/cli/compdb.cppm",
+        "src/cli/run.cppm",
+        "src/cli/add.cppm",
+        "src/cli/remove.cppm",
+        "src/cli/update.cppm",
+        "src/cli/test.cppm",
         "src/lsp/lsp.cppm",
+        "src/lsp/proto.cppm",
         "src/lsp/index.cppm",
         "src/lsp/lsp_core.cpp",
+        "src/lsp/lsp_worker.cpp",
     });
     b.sources("src/main.cpp");
     b.include_dirs({

@@ -5,18 +5,20 @@ import bake.json;
 import bake.util;
 import bake.util.blobdb;
 import bake.util.cachestore;
-import bake.toolchain.compilation;
 import bake.buildsystem.query;
+import bake.toolchain.compilation;  // SymbolOccurrence record
 
 // ============================================================
-// bake.lsp.index — per-TU symbol collection, cross-TU lookup
+// bake.lsp.index — shard storage, cross-TU lookup
 //
-// One indexing compile per translation unit (run through
-// bake.toolchain.compilation with the indexing action injected)
-// yields the TU's symbol occurrences. Shards — the occurrence
-// list of one TU, keyed by the content hash of its main file
-// plus its compile command — persist in a BlobDatabase, so
-// cross-session reuse is a key lookup, not a recompile.
+// Shards — the symbol-occurrence list of one translation unit,
+// keyed by the content hash of its main file plus its compile
+// command — persist in a BlobDatabase, so cross-session reuse is
+// a key lookup, not a recompile. The indexing compiles that
+// produce occurrences run in worker processes; the server calls
+// shard_key/has_shard, collects occurrences via the worker pool,
+// and hands them to adopt(). This module never runs a compile — the compilation
+// import carries only the shared SymbolOccurrence record.
 //
 // The in-memory project index merges the shards loaded this
 // session: occurrences grouped by file (for position → symbol)
@@ -63,38 +65,42 @@ public:
         load_all_shards();
     }
 
-    // Index one translation unit (unsaved text overrides the file
-    // on disk). Returns the shard key that was built or reused.
-    std::string index_tu(const CompileEntry& entry,
-                         const std::string* text) {
+    // Shard identity for one TU's current content (the stored
+    // text, or the on-disk file when `text` is null).
+    std::string shard_key_of(const CompileEntry& entry,
+                             const std::string* text) {
+        return shard_key(entry, text ? *text : read_or_empty(entry.file));
+    }
+
+    // True when a shard exists for the entry's current on-disk
+    // content — the freshness check background indexing starts
+    // from.
+    bool has_current_shard(const CompileEntry& entry) {
+        return has_shard(shard_key(entry, read_or_empty(entry.file)));
+    }
+
+    // True when the shard for `key` is already known — the check
+    // every indexing path starts from.
+    bool has_shard(const std::string& key) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        return m_shards.contains(key) || m_db.has(key);
+    }
+
+    // Store one TU's collected occurrences under the entry's
+    // current-content key. Compilation happened in a worker; this
+    // side only persists and integrates. Existing shards win.
+    std::string adopt(const CompileEntry& entry, const std::string* text,
+                      std::vector<SymbolOccurrence> occurrences) {
         std::string content = text ? *text : read_or_empty(entry.file);
         std::string key = shard_key(entry, content);
-
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_shards.contains(key)) return key;  // in memory
+        if (m_shards.contains(key)) return key;
         if (m_db.has(key)) {
             load_shard(key);
             return key;
         }
-
-        std::map<std::string, std::string> remapped;
-        std::string file_spelling = entry.file.string();
-        if (text) {
-            remapped[file_spelling] = content;
-        }
-        auto occurrences = run_symbol_collection(
-            syntax_command(entry.command), remapped, file_spelling);
         store_shard(key, occurrences);
         return key;
-    }
-
-    // True when a shard exists for the entry's current content —
-    // the freshness check background indexing starts from.
-    bool has_current_shard(const CompileEntry& entry) {
-        std::string content = read_or_empty(entry.file);
-        std::string key = shard_key(entry, content);
-        std::lock_guard<std::mutex> lock(m_mutex);
-        return m_shards.contains(key) || m_db.has(key);
     }
 
     // The occurrence at (or covering) a 1-based position.
