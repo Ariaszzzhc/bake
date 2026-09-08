@@ -1,10 +1,10 @@
-# Build Scripts (`build.cpp`)
+# Programmable Inputs (`build.cpp`)
 
-Default discovery covers the standard layout. When your inputs need logic — generated file lists, unusual trees, extra binaries — add a `build.cpp` to the package root. It is bake's equivalent of a Cargo build script, but inverted: instead of running arbitrary commands at build time, a build.cpp *describes inputs* declaratively, and bake's normal pipeline does the rest.
+`bake.toml` defines the project and its build configuration. Default discovery covers the standard source layout. When input selection needs logic, add a `build.cpp` to the package root to describe source lists, nonstandard source trees, extra binaries, and tests. bake merges these declarations with the manifest and builds the resulting graph.
 
 ```cpp
 // build.cpp
-import bake;
+import bake.build;
 
 int main() {
     bake::Builder b;
@@ -43,9 +43,9 @@ This split is deliberate: input discovery can be arbitrarily project-specific, w
 
 ## How the script runs
 
-`build.cpp` is compiled by bake itself, fresh per project (like a header), and executed with context in environment variables — `BAKE_SOURCE_DIR`, `BAKE_TARGET`, `BAKE_MOID_NAME`, … The result is a declaration JSON consumed by the build pipeline. Scripts are cached: bake only recompiles a `build.cpp` when it, `bake.toml`, or the `bake.build` module is newer than the cached declaration.
+When a project declaration needs preparation, bake compiles and evaluates `build.cpp` with context in environment variables: `BAKE_SOURCE_DIR`, `BAKE_TARGET`, `BAKE_MOID_NAME`, and others. The result is a declaration JSON consumed by the build pipeline. The shared project snapshot records the exact existence and filesystem mtime of the relevant `build.cpp`, every workspace/member `bake.toml`, and the actual workspace `bake.lock`; any mismatch causes declaration preparation to run again.
 
-Note for editor users: clangd cannot resolve `import bake;` in these files — that diagnostic is expected noise. bake compiles the script itself with the right module path.
+bake supplies the `bake.build` module path when compiling `build.cpp`. CLI commands forward the evaluated program's stdout and stderr to their corresponding streams. Reusing a cached declaration does not rerun the program or replay its output.
 
 The full `Builder` API is documented in the [build.cpp API reference](../reference/builder-api.md).
 
@@ -65,7 +65,7 @@ b.binary("mytool")
 return b.build();
 ```
 
-Each `b.binary()` becomes its own synthetic moid: it compiles its sources, links the main library (and everything the library depends on), inherits the merged configuration, and can `import` the main moid's public modules. The binary lands in `out/<triple>/bin/`.
+Each `b.binary()` becomes its own synthetic moid: it compiles its sources, links the main library (and everything the library depends on), inherits the merged configuration, and can `import` the main moid's public modules. The binary lands in `out/<full-target>/<profile>/bin/`.
 
 Binaries build only for the moid being built (or a workspace member) —
 **libraries pulled in as dependencies never produce their binaries**

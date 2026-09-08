@@ -33,15 +33,25 @@ instincts, these rules win:
 # Stage 0: bootstrap with system Clang (requires CMake ≥ 3.30, Ninja, Clang ≥ 22 + libc++)
 cmake -G Ninja -B build && cmake --build build
 
-# Run the test suite (e2e + graph + parser units)
+# Stage 0 tests only: bootstrap smoke/rejection + bootstrap graph/parser units
 ctest --test-dir build --output-on-failure
 
-# Self-host fetches the bake-pkgs packages first (json, tomlplusplus, curl,
-# libarchive, kotatsu — the async/LSP runtime)
-./build/bake update
+# Stage 0 builds the full Stage 1 product. It fetches uncached sources and
+# honors an existing valid lock without refreshing its refs.
+./build/bake build -j 2
 
-# Self-host: stage 0 bake builds itself → out/bin/bake
-./build/bake build
+# Once pinned dependencies are cached, this repeat requires that cache.
+./build/bake build --offline --locked -j 2
+
+# Stage 1 tests use the self-hosted binary; select the host target directory.
+bake_stage1="$(pwd)/out/aarch64-apple-darwin/dev/bin/bake"
+(
+  cd tests/stage1
+  BAKE_TEST_BAKE="$bake_stage1" "$bake_stage1" test --all --frozen -j 2
+)
+
+# CLI/e2e fixtures against the same Stage 1 binary
+./build/test_runner "$bake_stage1"
 
 # Clean self-hosted output
 rm -rf out/
@@ -91,28 +101,36 @@ A "moid" (模具) is bake's unit of compilation — one `bake.toml` describes on
 
 | Type | Produces | Consumers get |
 |---|---|---|
-| `executable` (default) | Binary in `out/bin/` | — |
-| `lib` | Static archive in `out/lib/` + module PCMs | Public headers, module interfaces, linked objects |
-| `dylib` | Shared library in `out/lib/` | Public headers, module interfaces |
+| `executable` (default) | Binary in `out/<full-target>/<profile>/bin/` | — |
+| `lib` | Static archive in `out/<full-target>/<profile>/lib/` + module PCMs | Public headers, module interfaces, linked objects |
+| `dylib` | Shared library in `out/<full-target>/<profile>/lib/` | Public headers, module interfaces |
 
 ### Build pipeline (single path)
 
-Every moid follows one configure and build pipeline:
+Every build/analysis project command uses the same production Core pipeline:
 
-1. **resolve_moid_graph** — resolve workspace + dependencies into a topological `MoidGraph`.
-2. **configure_moid_graph** — for each moid: obtain inputs from default discovery or `build.cpp`, merge authoritative `bake.toml` configuration, then write one `MoidDeclaration` JSON in `out/.bake/`.
-3. **build_graph** — translate declarations into a flat `BuildAction` list (compile, compile_module, archive, link) with dependency edges.
-4. **execute_graph** — parallel executor with content-based fingerprinting. Dirty detection + propagation, thread pool, incremental rebuilds.
+1. **`ProjectCore::open`** — form one `ProjectContext` from workspace/member, features, target, profile, and compiler identity; reuse or publish a validated `ProjectSnapshot`.
+2. **`prepare_moid_declarations`** — obtain inputs from default discovery or `build.cpp`, then merge authoritative `bake.toml` configuration into the unified `MoidDeclaration` graph.
+3. **`build_graph`** — translate declarations into a flat `BuildAction` DAG (compile, compile_module, archive, link) and shared compilation descriptions.
+4. **`CoreBuildService`** — submit dirty actions through `CoreRuntime`, stage outputs per request, and revalidate captured inputs under the target/profile publication lock. Preflight the publication set, promote each staged product, verify its digest and size, publish action receipts, then publish the immutable ready `BuildResult` last.
+
+`bake build`, `run`, `test`, `compdb`, and `lsp` consume this shared project lifecycle. `compdb` opens the project but does not start build actions. LSP is a protocol/session adapter over Core project, analysis, runtime, and persistence services; it does not resolve a private graph.
 
 ### Integrated compiler toolchain
 
-bake embeds LLVM + Clang + LLD as linked libraries. No subprocesses:
+bake embeds LLVM + Clang + LLD as linked libraries. Core may isolate scheduled
+work in Bake-owned child processes, but each compiler, assembler, archiver, or
+linker invocation still runs the embedded toolchain through the same bake
+binary; no external compiler toolchain is used:
 
 - **Compilation**: `driver.cppm` shims the Clang driver; `cc1.cppm` / `cc1as.cppm` are the in-process cc1/assembler entries (stock Clang sources).
 - **Linking**: `bake.toolchain.lld` (`toolchain/lld.cppm`) invokes LLD in-process (Darwin, MinGW, GNU flavors).
-- **Module scanning**: text-based in-process scanner in `bake.engine`. No `clang-scan-deps`.
+- **Module scanning**: text-based source scanning in `bake.buildsystem.source` and Core analysis. No `clang-scan-deps`.
 - **`import std`**: `ensure_std_modules()` pre-builds `std.pcm` from vendored libc++ sources, cached in `~/.cache/bake/<key>/std/`.
 - **Static libc++**: `ensure_libcxx_objects()` compiles libc++ + libc++abi + libunwind from vendored sources, cached in `~/.cache/bake/libcxx-objects/`.
+
+The standalone `bake cc`, `bake c++`, and `bake ar` entry points remain below
+Core. They do not open a project, read manifests/locks, or create project state.
 
 ### Workspace
 
@@ -134,21 +152,23 @@ bake/
 │   ├── bake.toml
 │   ├── build.cpp           self-hosting build script
 │   └── src/
-│       ├── cli.cppm            bake.cli — arg parsing, help, lock enforcement
-│       ├── cli/                bake.cli.* — one module per command (init, build, …)
+│       ├── cli.cppm            bake.cli — lightweight argument parsing and help
+│       ├── cli/                bake.cli.* — command adapters
+│       │   ├── project.cppm              ParsedArgs → ProjectCore request helper
 │       │   └── dep_edit.cppm             manifest TOML edits shared by add/remove
 │       ├── main.cpp             stage1 composition root (all commands + lsp)
 │       ├── util.cppm            Path, SHA-256, glob, process spawn, bake_exe_path
 │       ├── util/                bake.util.* — file identity + cache store
 │       │   ├── filetable.cppm             stamps, digest trust, FileTable
-│       │   ├── cachestore.cppm            quota/LRU eviction for product stores
-│       │   └── blobdb.cppm                key/blob store (single-writer tx, snapshot reads)
+│       │   └── cachestore.cppm            quota/LRU eviction for product stores
 │       ├── json.cppm            bake.json interface (DOM, accessors)
 │       ├── toml.cppm            bake.toml interface (Table/Node model)
 │       ├── json.cpp             bake.json impl: nlohmann/json (self-host, via bake-pkgs)
 │       ├── toml.cpp             bake.toml impl: toml++ (self-host, via bake-pkgs)
-│       ├── stage0/              hand-written bake.json/bake.toml impls (CMake bootstrap)
-│       │   └── main.cpp                  stage0 composition root: bootstrap surface only
+│       ├── stage0/              independent permanent CMake bootstrap
+│       │   ├── main.cpp                  stage0 composition root: build/update/cc/c++/ar only
+│       │   ├── json.cpp / toml.cpp       hand-written bootstrap parsers
+│       │   └── bootstrap/                 bake.stage0.* project/package/graph/engine modules
 │       ├── toolchain/           bake.toolchain.* — the embedded toolchain (mechanism)
 │       │   ├── target.cppm                TargetSpec, triple parsing/matching
 │       │   ├── lld.cppm                   in-process LLD link + archive write
@@ -158,19 +178,29 @@ bake/
 │       │   ├── driver.cppm                Clang driver shim (bake cc / bake c++) + Cc1Hook seam
 │       │   └── compilation.cppm           injectable in-process frontend (remaps + diagnostics)
 │       ├── buildsystem/         bake.buildsystem.* — the build system (policy)
-│       │   ├── project.cppm               Manifest, Lockfile, layout
+│       │   ├── project.cppm               Manifest, profiles, workspace layout
 │       │   ├── cmdgen.cppm                build intent → compiler argv/flags/macros
 │       │   ├── moid.cppm                  MoidDeclaration model, JSON codec
 │       │   ├── graph.cppm                 MoidGraph, dependency resolution
-│       │   ├── sched.cppm                 bounded task-graph executor (shared with LSP)
-│       │   ├── engine.cppm                configure, source discovery, DAG, executor policy
-│       │   ├── package.cppm               Resolver, Fetcher, Cache, lockfile
-│       └── lsp/                 bake.lsp.* — language server (stage1-only)
-│           ├── lsp.cppm                   entry interface (bake lsp / lsp-worker)
-│           ├── proto.cppm                bake.lsp.proto — master↔worker wire protocol
-│           ├── index.cppm                bake.lsp.index — symbol shards, project index
-│           ├── lsp_core.cpp               master on kotatsu: protocol, worker pool, index
-│           └── lsp_worker.cpp             worker: one frontend job per framed request
+│       │   ├── source.cppm                discovery, header/module source facts
+│       │   ├── declaration.cppm           default/build.cpp declaration preparation
+│       │   ├── plan.cppm                  declaration graph → BuildAction DAG
+│       │   └── package.cppm               Lockfile, Resolver, Fetcher, Cache
+│       ├── core/                bake.core.* — shared project lifecycle and execution
+│       │   ├── model.cppm                 context/request/result identities and paths
+│       │   ├── state.cppm                 immutable snapshots/results + publication locks
+│       │   ├── snapshot.cppm              ProjectSnapshot codec and validity records
+│       │   ├── project.cppm               ProjectCore open/reuse/refresh lifecycle
+│       │   ├── runtime.cppm               scheduling, cancellation, owned processes/workers
+│       │   ├── build.cppm                 staged build execution and validated publication
+│       │   ├── occurrences.cppm           shared symbol occurrence encoding
+│       │   ├── analysis_proto.cppm         bake.core.analysis.proto worker wire contract
+│       │   ├── index.cppm                 persistent analysis symbol shards
+│       │   └── analysis.cppm              SourceView/PCH/BMI/index analysis service
+│       └── lsp/                 bake.lsp — thin Stage1 protocol/session adapter
+│           ├── lsp.cppm                   public entry interface
+│           ├── lsp_core.cpp               LSP lifecycle, document sessions, Core calls
+│           └── lsp_worker.cpp              frontend worker for analysis.proto requests
 ├── lib/                   vendored runtime (distributed with bake)
 │   ├── bake/                    bake.build.cppm (build.cpp API)
 │   ├── libcxx/                  libc++ (include/, src/, modules/)
@@ -194,10 +224,14 @@ bake/
 │   ├── glibc-abi-gen.py         tarball .abilist files → abilists (host-side)
 │   └── update-runtime.sh        update vendored libc++/libcxxabi/libunwind/compiler-rt
 ├── tests/
-│   ├── test_runner.cpp          custom test framework, spawns bake binary
-│   ├── graph_test.cpp           unit tests for graph/moid logic
-│   ├── parser_test.cpp          contract tests for bake.json / bake.toml
-│   └── projects/                fixture projects (64 test cases)
+│   ├── bootstrap/              Stage0-only graph and command-surface tests
+│   ├── core_*_test.cpp         Core model/state/runtime/snapshot/project/build/analysis tests
+│   ├── test_runner.cpp         Stage1 CLI/e2e framework, spawns the production bake binary
+│   ├── graph_test.cpp          production graph/plan units
+│   ├── parser_test.cpp         shared bake.json / bake.toml contract
+│   ├── util_test.cpp           shared file I/O and SHA-256 contract
+│   ├── stage1/                 real package-backed Stage1 contract project
+│   └── projects/               CLI/e2e fixtures
 └── external/              LLVM source + prebuilt install (git submodule)
 ```
 
@@ -248,14 +282,20 @@ Profiles (`--release` / `--profile <name>`, default `dev`) control compiler flag
 
 ```
 out/
-├── <target-triple>/          # e.g. aarch64-apple-darwin
-│   ├── bin/                  executables
-│   ├── lib/                  .a / .dylib / .so / .dll
-│   ├── .obj/                 object files
-│   ├── .bmi/                 module PCMs
-│   └── .bake/                declarations, fingerprints, graph.json,
-│                              lsp-preamble/ + lsp-index/ (LSP caches)
-└── .bake/                    host-level (build.cpp compiled scripts)
+├── <full-target>/            # e.g. aarch64-apple-darwin or x86_64-linux-gnu.2.36
+│   └── <profile>/            dev, release, or a custom profile
+│       ├── bin/              executables
+│       ├── lib/              .a / .dylib / .so / .dll
+│       ├── .obj/             object files
+│       ├── .bmi/             module PCMs
+│       └── .bake/
+│           ├── core/<context-key>/
+│           │   ├── snapshots/    immutable ProjectSnapshot JSON
+│           │   ├── results/      immutable request results
+│           │   └── work/         request-scoped staging
+│           ├── lsp-preamble/     target/profile analysis PCH products
+│           └── lsp-index/        target/profile analysis symbol shards
+```
 
 ## Global Toolchain Cache
 
@@ -305,8 +345,8 @@ no manual bump markers. Managed by `toolchain_cache_lookup`/`finish`.
 - **C++23**, strict standard (`CMAKE_CXX_EXTENSIONS OFF`), Clang + libc++.
 - **`import std;`** — all standard library access via `import std;`, not `#include`. The only `#include` in module files are platform/OS headers (`<errno.h>`, `<sys/wait.h>`, `<windows.h>`) in the **global module fragment** (`module;` before `export module`).
 - **I/O**: `std::println(...)` for stdout, `std::println(std::cerr, ...)` for stderr. `{}` format placeholders, not printf. No `fprintf`/`printf`/bare `stderr`/`stdout`.
-- **Module naming**: `bake.<scope>.<name>` with four scopes — `bake.toolchain.*` (the embedded toolchain: mechanism, must never import `bake.buildsystem.*`), `bake.buildsystem.*` (build system: policy, may import `bake.toolchain.*`), `bake.cli` + `bake.cli.*` (arg parsing/help plus one module per command; roots compose these), and `bake.lsp.*` (the language server: top consumer, may import both; stage1-only — the bootstrap binary has no lsp commands at all). Module files carry only their leaf name; the scope comes from the directory (`toolchain/target.cppm` → `bake.toolchain.target`, `cli.cppm` at src/ root → `bake.cli`, `cli/build.cppm` → `bake.cli.build`, `util/filetable.cppm` → `bake.util.filetable`). `bake.build.cppm` (downstream build.cpp API, in lib/bake/) keeps its full name.
-- **Module chain**: { `bake.json`, `bake.toml` } (two impls per module: hand-written `src/stage0/*.cpp` for the CMake bootstrap, nlohmann/json + toml++ via bake-pkgs for the self-host) → `bake.util` → `bake.util.{filetable, cachestore, blobdb}` → { `bake.net`, `bake.archive` } (two impls per module: stage0 spawns system curl/tar/unzip for the CMake bootstrap, libcurl + libarchive via bake-pkgs for the self-host) → { `bake.toolchain.target`, `bake.buildsystem.project` } → { `bake.toolchain.lld`, `bake.buildsystem.cmdgen` } → `bake.toolchain.runtime` → { `bake.toolchain.cc1`, `bake.toolchain.cc1as` } → `bake.toolchain.driver` → `bake.toolchain.compilation` → { `bake.buildsystem.moid` / `graph`, `sched`, `engine` / `package` / `query` } → { `bake.cli` + `bake.cli.*` } → { `bake.lsp.proto`, `bake.lsp.index` } → `bake.lsp` (kotatsu: kota headers + libuv, bake-pkgs) → composition roots (`src/main.cpp` full surface, `src/stage0/main.cpp` bootstrap-only). The toolchain/buildsystem scopes meet only at `TargetSpec` + plain argv strings; `bake.lsp` masters every frontend job out to `bake lsp-worker` processes over `bake.lsp.proto` (the compilation seam runs in workers) + `build_compile_db` (query).
+- **Module naming**: production modules use `bake.toolchain.*` (embedded compiler mechanism), `bake.buildsystem.*` (manifest/declaration/planning policy), `bake.core.*` (shared project lifecycle, persistence, runtime, build, and analysis), `bake.cli` + `bake.cli.*` (command adapters), and `bake.lsp` (the Stage1 protocol/session adapter). Most files carry their directory-derived leaf (`core/state.cppm` → `bake.core.state`); `core/analysis_proto.cppm` intentionally exports `bake.core.analysis.proto`. The permanent bootstrap uses the independent `bake.stage0.*` namespace. `bake.build.cppm` (the downstream build.cpp API in `lib/bake/`) keeps its full name.
+- **Production layer chain**: { `bake.json`, `bake.toml` } → `bake.util.*` / network/archive → `bake.toolchain.*` + `bake.buildsystem.*` → `bake.core.{model,state,snapshot,runtime,project,build,occurrences,index,analysis.proto,analysis}` → `bake.cli.*` and thin `bake.lsp` → `src/main.cpp`. Toolchain modules never import buildsystem or Core. Buildsystem describes project policy and action DAGs; Core owns context identity, snapshot validity, scheduling, cancellation, publication, and analysis. LSP sends frontend work to Bake-owned `lsp-worker` processes over `bake.core.analysis.proto`; compiler operations remain in `bake.toolchain.compilation`. `cc`/`c++`/`ar` dispatch below Core. Stage0 composes its own `bake.stage0.*` project/package/graph/engine path in `src/stage0/main.cpp` and never imports production Core.
 - **User-facing output uses `macos`** not `darwin` for platform names.
 - **Commit messages**: conventional commits, subject-only ≤ 50 chars. Describe what changed, not why.
 

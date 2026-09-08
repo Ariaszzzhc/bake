@@ -61,7 +61,7 @@ header_ext = [".h", ".hpp", ".hxx", ".hh"]
 |---|---|---|---|
 | `name` | string | 必填 | moid 名称；决定输出文件名和选项宏 |
 | `version` | string | `"0.1.0"` | 近似 SemVer；通过 `BAKE_<NAME>_VERSION` 宏暴露 |
-| `type` | string | `"executable"` | `executable` → `out/<t>/bin/`；`lib` → 静态归档 + 公开接口；`dylib` → 共享库 |
+| `type` | string | `"executable"` | `executable` → `out/<full-target>/<profile>/bin/`；`lib` → 静态归档 + 公开接口；`dylib` → 共享库 |
 
 ## `[language]`
 
@@ -89,7 +89,7 @@ zlib = {}                             # 纯宏特性：只产生 BAKE_<MOID>_ZLI
 
 - **并集合一**：包的有效集 = 自身 `default` ∪ 所有入边激活 ∪ CLI。`build.cpp` 用 `b.feature("zlib")` 查询
 - 每个声明的特性都产生宏 `BAKE_<MOID>_<FEATURE>`，激活为 `1`、未激活为 `0`
-- **conflicts** 遵循显式胜默认：与显式激活（依赖边/CLI）冲突的默认特性被静默降级（打印一条提示，其依赖与 defines 随之消失）——消费者可以替换包的默认后端；两个显式激活或两个默认特性互相冲突才在 configure 期报错，并点名两条激活来源
+- **conflicts** 遵循显式胜默认：与显式激活（依赖边/CLI）冲突的默认特性被静默降级（打印一条提示，其依赖与 defines 随之消失）——消费者可以替换包的默认后端；两个显式激活或两个默认特性互相冲突才在准备项目时报错，并点名两条激活来源
 - **platforms** 是生效白名单：默认集里不匹配当前目标的特性静默不贡献；显式激活（依赖边或 `--feature`）不匹配则报错
 - 不激活的特性，其依赖不进图、不进锁、不下载
 

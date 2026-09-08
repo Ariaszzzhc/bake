@@ -46,7 +46,9 @@ warnings = "extra"
 | `sanitize` | array | Sanitizers, e.g. `["address"]` |
 | `warnings` | string | `"none"` \| `"all"` \| `"extra"` \| `"error"` |
 
-Only fields you set are overridden; the rest of the base profile stands. Profile selection does not invalidate other profiles' output — each (`profile`, `target`) combination is fingerprinted independently.
+Only fields you set are overridden; the rest of the base profile stands. Each
+(`target`, `profile`) combination has its own
+`out/<full-target>/<profile>/` tree and Core project-state context.
 
 ## Features
 

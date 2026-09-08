@@ -72,12 +72,13 @@ bake run some-file.txt
 
 ```
 out/
-└── aarch64-apple-darwin/    # one directory per target triple
-    ├── bin/                 # executables
-    ├── lib/                 # .a / .dylib
-    ├── .obj/                # object files
-    ├── .bmi/                # module PCMs
-    └── .bake/               # resolved declarations, fingerprints
+└── aarch64-apple-darwin/    # 每个完整目标一个目录
+    └── dev/                 # dev、release 或自定义 profile
+        ├── bin/             # executables
+        ├── lib/             # .a / .dylib
+        ├── .obj/            # object files
+        ├── .bmi/            # module PCMs
+        └── .bake/           # 共享项目状态与构建收据
 ```
 
 `bake clean` 会移除 `out/`。完整细节参见[输出与缓存布局](../reference/output-and-cache.md)。
@@ -114,5 +115,5 @@ int main() {
 ## 下一步
 
 - [依赖](../guide/dependencies.md)
-- [构建脚本](../guide/build-scripts.md)——当默认发现不足时
+- [可编程输入](../guide/build-scripts.md)——当默认发现不足时
 - [测试](../guide/testing.md)

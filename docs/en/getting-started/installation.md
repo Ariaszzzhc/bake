@@ -20,11 +20,17 @@ cd bake
 cmake -G Ninja -B build
 cmake --build build
 
-# Stage 1: bake builds itself (verifies self-hosting)
-./build/bake build
+# Stage 1: normal build fetches uncached sources and honors a valid lock
+./build/bake build -j 2
+
+# Once pinned dependencies are cached, the repeat can require that cache
+./build/bake build --offline --locked -j 2
 ```
 
-The stage-0 binary lands in `build/bake`; the self-hosted binary in `out/<triple>/bin/bake`. Both are full-featured. Add one of them to your `PATH`.
+The permanent stage-0 binary lands in `build/bake`. Its deliberately small
+surface is `build`, `update`, `cc`, `c++`, and `ar`; commands such as `run`,
+`test`, `compdb`, and `lsp` are not part of the bootstrap. The full self-hosted
+binary lands in `out/<host-triple>/dev/bin/bake`; add that binary to your `PATH`.
 
 ```bash
 bake --version

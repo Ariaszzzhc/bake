@@ -19,7 +19,7 @@ headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
 
 ## Path dependencies and bare source packages
 
-Path dependencies point at a local directory and are resolved from disk on every build. They bypass the package cache, so edits to the dependency participate in the next build immediately. This is how workspace members depend on each other; see [Workspaces](workspaces.md). Path dependencies are never written to `bake.lock`.
+Path dependencies point at a local directory and bypass the package cache. Local source edits participate in the next build, including when the project declaration is reused. This is how workspace members depend on each other; see [Workspaces](workspaces.md). Path dependencies are never written to `bake.lock`.
 
 A path or fetched dependency without a `[package]` declaration is a *bare source package*. Consume its source directory from `build.cpp` with `b.dep_src_dir(alias)`:
 
@@ -27,7 +27,7 @@ A path or fetched dependency without a `[package]` declaration is a *bare source
 auto source_dir = b.dep_src_dir("headers");
 ```
 
-This lets the build script decide how the checked-out source is used. bake emits a configure-time warning containing `never consumed` when a declared bare source dependency is never queried through `dep_src_dir`.
+This lets `build.cpp` describe how the checked-out source is used. Project commands emit a warning containing `never consumed` when a declared bare source dependency is never queried through `dep_src_dir`. The warning also appears when the command reuses a cached project declaration.
 
 ## Git dependencies
 
@@ -149,7 +149,7 @@ An alias may not have different definitions across scopes. If, for example, both
 
 ### Incremental resolution
 
-When a build or update refreshes a lockfile, an existing entry whose URL and ref are unchanged is carried over unchanged. bake does not run `git ls-remote` or re-resolve it. Only newly added or changed dependencies, and dependencies explicitly selected by `bake update <dep>`, need network resolution. If a carried entry has no local cache (e.g. a fresh clone with a committed lockfile), `bake build` re-downloads it by its locked commit/URL and verifies the tree hash — the ref does not move.
+When a build or update refreshes a lockfile, an existing entry whose URL and ref are unchanged is carried over unchanged. bake does not run `git ls-remote` or re-resolve it. Only newly added or changed dependencies, and dependencies explicitly selected by `bake update <dep>`, need network resolution. Full Bake (self-hosted) project commands verify each remote cached source tree against the lock's integrity value, even when its marker, size, and modification time are unchanged. If a carried entry has no local cache, or its content no longer matches, an ordinary `bake build` restores it from the locked URL and commit and verifies the original tree hash — the ref does not move.
 
 `bake update` is the only command that can move locked refs. Without a dependency name, it re-resolves every dependency and can move every locked ref; `bake build` does not move locked refs.
 
@@ -157,9 +157,9 @@ When a build or update refreshes a lockfile, an existing entry whose URL and ref
 
 | Flag | Meaning |
 |---|---|
-| `--locked` | Fail if `bake.lock` is missing or stale. |
-| `--offline` | Never touch the network; fail if required content is not already available locally. |
-| `--frozen` | Both of the above — the CI configuration. |
+| `--locked` | Fail if `bake.lock` is missing or stale, or if a locked remote source is missing or fails its integrity check. |
+| `--offline` | Never touch the network; when `bake.lock` exists, verify cached remote sources against its integrity values and fail if required content is missing or corrupted. `--offline` does not imply `--locked`. |
+| `--frozen` | Both of the above — missing or stale lock data and invalid locked remote sources fail without network access. |
 
 ```bash
 bake build --frozen     # exactly what the lock says, no network, no surprises
@@ -193,4 +193,4 @@ If your package is a `lib`, dependents get your public headers (your `public/` d
 
 ## Options across the graph
 
-`[features]` are named capability bundles, unified by union across the whole dependency graph (see [Profiles and Features](../reference/profiles.md)). Activating `tls-openssl` on your `curl` dependency resolves that feature's dependencies (the openssl port), injects its `defines` (note: `defines` apply only to the dependency's own translation units; reaching yours requires `public_defines`), and compiles the dependency with `BAKE_CURL_TLS_OPENSSL=1`; conflicts follow explicit-beats-default — an explicit activation demotes a conflicting default (the default `tls-mbedtls` yields to your explicit `tls-openssl`); only two explicit activations clashing fail at configure time. To trim a dependency's default features, declare `default-features = false` on it — that edge then contributes only the features explicitly named in `features`, and the union from other edges is unaffected (bake warns on mixed edges). For example, freetype without PNG: `freetype = { url = "...", tag = "v2.14.3", default-features = false }`.
+`[features]` are named capability bundles, unified by union across the whole dependency graph (see [Profiles and Features](../reference/profiles.md)). Activating `tls-openssl` on your `curl` dependency resolves that feature's dependencies (the openssl port), injects its `defines` (note: `defines` apply only to the dependency's own translation units; reaching yours requires `public_defines`), and compiles the dependency with `BAKE_CURL_TLS_OPENSSL=1`; conflicts follow explicit-beats-default — an explicit activation demotes a conflicting default (the default `tls-mbedtls` yields to your explicit `tls-openssl`); only two explicit activations clashing fail during project preparation. To trim a dependency's default features, declare `default-features = false` on it — that edge then contributes only the features explicitly named in `features`, and the union from other edges is unaffected (bake warns on mixed edges). For example, freetype without PNG: `freetype = { url = "...", tag = "v2.14.3", default-features = false }`.

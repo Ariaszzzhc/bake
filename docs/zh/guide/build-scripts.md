@@ -1,10 +1,10 @@
-# 构建脚本（`build.cpp`）
+# 可编程输入（`build.cpp`）
 
-默认发现覆盖了标准布局。当输入需要逻辑处理——生成的文件列表、非标准目录树、额外 binary——请在包根目录添加 `build.cpp`。它相当于 bake 版本的 Cargo 构建脚本，但方向相反：它不在构建时运行任意命令，而是通过 build.cpp 以声明式方式*描述输入*，其余工作由 bake 的常规流水线完成。
+`bake.toml` 定义项目及其构建配置。默认发现覆盖标准源码布局。当输入选择需要逻辑处理时，可以在包根目录添加 `build.cpp`，描述源码列表、非标准源码目录、额外 binary 和测试。bake 将这些声明与清单合并，再构建由此生成的图。
 
 ```cpp
 // build.cpp
-import bake;
+import bake.build;
 
 int main() {
     bake::Builder b;
@@ -43,9 +43,9 @@ int main() {
 
 ## 脚本如何运行
 
-`build.cpp` 由 bake 自行编译，并针对每个项目重新处理（如同头文件），它会在带有环境变量上下文的情况下执行——`BAKE_SOURCE_DIR`、`BAKE_TARGET`、`BAKE_MOID_NAME`，……结果是构建流水线所使用的声明 JSON。脚本会被缓存：仅当 `build.cpp`、`bake.toml` 或 `bake.build` 模块比缓存的声明更新时，bake 才会重新编译 `build.cpp`。
+项目声明需要准备时，bake 会自行编译并执行 `build.cpp`，通过 `BAKE_SOURCE_DIR`、`BAKE_TARGET`、`BAKE_MOID_NAME` 等环境变量提供上下文。结果是构建流水线所使用的声明 JSON。共享项目快照记录相关 `build.cpp`、每个 workspace/member `bake.toml` 与实际 workspace `bake.lock` 的精确存在状态和文件系统 mtime；任一不匹配都会重新准备声明。
 
-给编辑器用户的说明：clangd 无法在这些文件中解析 `import bake;`——该诊断是预期的噪声。bake 会自行使用正确的模块路径编译脚本。
+bake 在编译 `build.cpp` 时提供 `bake.build` 的模块路径。CLI 命令会将程序执行产生的 stdout 和 stderr 转发到对应输出流。复用缓存声明时不会重新执行程序，也不会重放此前的输出。
 
 完整的 `Builder` API 见 [build.cpp API reference](../reference/builder-api.md)。
 
@@ -65,7 +65,7 @@ b.binary("mytool")
 return b.build();
 ```
 
-每个 `b.binary()` 都会成为独立的合成 moid：它会编译自己的源文件，链接主库（以及该库所依赖的全部内容），继承合并后的配置，并且可以 `import` 主 moid 的公开模块。binary 会位于 `out/<triple>/bin/`。
+每个 `b.binary()` 都会成为独立的合成 moid：它会编译自己的源文件，链接主库（以及该库所依赖的全部内容），继承合并后的配置，并且可以 `import` 主 moid 的公开模块。binary 位于 `out/<full-target>/<profile>/bin/`。
 
 binary 只在被构建的 moid 自身（或 workspace 成员）中产生——**依赖带进来的库不会产出它的 binary**（与 Cargo 一致：依赖的 bin 不构建）。想要某个 port 的 CLI 工具，就把它的仓库当作项目根来构建。
 

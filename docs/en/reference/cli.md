@@ -20,7 +20,7 @@ bake <subcommand> --help
 | `bake cc` / `bake c++` / `bake ar` | Invoke the embedded Clang/LLVM tools directly (`zig cc` style) |
 | `bake audit` | Verify toolchain self-containment |
 | `bake compdb` | Write `compile_commands.json` from the resolved build graph (no build) |
-| `bake lsp` | Language server over stdio (self-hosted binary only) |
+| `bake lsp` | Language server over stdio (full Stage 1 binary only) |
 
 ## Global options
 
@@ -28,6 +28,23 @@ bake <subcommand> --help
 |---|---|
 | `-V`, `--version` | Print version |
 | `-h`, `--help` | Print help |
+
+`bake cc`, `bake c++`, and `bake ar` are standalone toolchain entry points.
+They do not open a project, read `bake.toml` or `bake.lock`, or create project
+Core state; their inputs and outputs come only from the compiler/archive
+arguments.
+
+## Bootstrap and full binaries
+
+The permanent Stage 0 binary at `build/bake` contains only `build`, `update`,
+`cc`, `c++`, and `ar` (plus the internal Clang `-cc1`/`-cc1as` modes used by
+compilation). Its direct forms are `build/bake cc ...`, `build/bake c++ ...`,
+and `build/bake ar rcs [--darwin] <archive> <members...>`. Other commands are
+rejected as outside the bootstrap binary.
+
+Stage 0 builds the full Stage 1 binary at
+`out/<host-triple>/dev/bin/bake`. The remaining sections describe that full
+binary.
 
 ## Build options (`build`, `run`, `test`)
 
@@ -105,15 +122,18 @@ Builds, then runs the single executable of the selection. With several executabl
 ## `bake compdb`
 
 ```
-bake compdb [--release | --profile <name>] [-t <triple>] [--offline] [output]
+bake compdb [-p <member>] [--feature <name>]
+            [--release | --profile <name>] [-t <triple>]
+            [--locked] [--offline] [--frozen] [output]
 ```
 
-- Resolves the build graph exactly like `bake build` (same selection, profile
-  and target handling) but executes nothing, then writes a
+- Opens the same shared project context as `bake build` (same selection,
+  profile, and target handling) but executes no project build actions, then writes a
   [JSON compilation database](https://clang.llvm.org/docs/JSONCompilationDatabase.html)
   — `compile_commands.json` at the project root, or `[output]` when given.
-- `bake build` refreshes the same file after every build; `bake compdb` is
-  the no-build path (and what the language server's compile queries use).
+- `bake build` refreshes the same file after every successful build; explicit
+  `bake compdb` is the no-project-build path. It may prepare a missing input
+  declaration while opening the selected Core context.
 - `--offline` (default behavior for the LSP) refuses network resolution;
   unresolved dependencies surface as errors pointing at `bake update`.
 
@@ -138,11 +158,11 @@ bake lsp [--target <triple>] [--profile <name>] [--index-jobs <n>]
   on a compile; stale diagnostics are dropped per document generation; a
   crashed worker is respawned (up to 3 times per 10 seconds, then its lane
   fails fast).
-- Compiles run against the command `bake build` would use, with the editor
-  buffer remapped over the file — diagnostics always reflect build truth,
-  never a guessed compilation database.
+- Compiles use the descriptions in the same Core project snapshot as builds.
+  Every open main file, header, and module buffer in the session is collected
+  into one content-keyed source view and remapped over disk.
 - Preamble regions compile once into PCHs, content-keyed under
-  `out/<triple>/.bake/lsp-preamble/`; keystroke compiles parse the edited
+  `out/<full-target>/<profile>/.bake/lsp-preamble/`; keystroke compiles parse the edited
   body only. For module TUs the PCH region is capped before the first
   module construct (PCHs cannot carry module imports), so `import std;`
   files keep a preprocessor-only preamble and their imports re-run against
@@ -150,9 +170,13 @@ bake lsp [--target <triple>] [--profile <name>] [--index-jobs <n>]
 - Background indexing collects per-TU symbol shards through the worker
   pool; definition/references answer from the open file first and the
   shard set second, so cross-file jumps work on a cold index too.
-- `--target` selects the compile context (any cross-compilation triple —
-  completions and diagnostics then reflect that libc); `--profile` picks
-  the build profile (default `dev`).
+- Every asynchronous analysis result is bound to its target/profile context,
+  project snapshot, source view, and document version; stale or cancelled
+  results are discarded rather than published.
+- With no flags, LSP always opens the native target and `dev` profile. It does
+  not follow whichever target or profile was built most recently. Use
+  `--target` and `--profile` explicitly when editor analysis should use another
+  context; `--index-jobs` controls background index concurrency.
 - Only present in the self-hosted binary (it rides on the kotatsu async
   runtime); the bootstrap binary refuses the command outright.
 

@@ -20,11 +20,17 @@ cd bake
 cmake -G Ninja -B build
 cmake --build build
 
-# Stage 1: bake builds itself (verifies self-hosting)
-./build/bake build
+# Stage 1：普通构建会获取未缓存源码，并遵从有效 lock
+./build/bake build -j 2
+
+# 固定依赖已缓存后，重复构建可要求该缓存存在
+./build/bake build --offline --locked -j 2
 ```
 
-stage-0 binary 位于 `build/bake`；自举构建的 binary 位于 `out/<triple>/bin/bake`。二者均具备完整功能。将其中之一加入 `PATH`。
+永久保留的 stage-0 binary 位于 `build/bake`，其刻意缩小的命令面只有
+`build`、`update`、`cc`、`c++`、`ar`；`run`、`test`、`compdb`、`lsp`
+等命令不属于引导程序。完整的自举 binary 位于
+`out/<host-triple>/dev/bin/bake`；请将它加入 `PATH`。
 
 ```bash
 bake --version

@@ -19,7 +19,7 @@ headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
 
 ## 路径依赖与裸源码包
 
-路径依赖指向本地目录，并在每次构建时从磁盘解析。它们绕过包缓存，因此对依赖的编辑会立即参与下一次构建。这是工作区成员彼此依赖的方式；参见[工作区](workspaces.md)。路径依赖永不写入 `bake.lock`。
+路径依赖指向本地目录并绕过包缓存。对本地源码的编辑会参与下一次构建，复用项目声明时也如此。这是工作区成员彼此依赖的方式；参见[工作区](workspaces.md)。路径依赖永不写入 `bake.lock`。
 
 不带 `[package]` 声明的路径或已获取依赖是*裸源码包*。在 `build.cpp` 中通过 `b.dep_src_dir(alias)` 使用其源码目录：
 
@@ -27,7 +27,7 @@ headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
 auto source_dir = b.dep_src_dir("headers");
 ```
 
-这样由构建脚本决定如何使用检出的源码。如果一个已声明的裸源码依赖从未通过 `dep_src_dir` 查询，bake 会在 configure 阶段发出包含 `never consumed` 的警告。
+这样由 `build.cpp` 描述如何使用检出的源码。如果一个已声明的裸源码依赖从未通过 `dep_src_dir` 查询，项目命令会发出包含 `never consumed` 的警告。复用缓存的项目声明时也会显示该警告。
 
 ## Git 依赖
 
@@ -134,7 +134,7 @@ musl_helpers = { url = "https://github.com/org/musl-helpers", branch = "main" }
 
 ### 增量解析
 
-当构建或更新需要刷新锁文件时，URL 和 ref 未变的已有条目会原样搬运。bake 不会再次运行 `git ls-remote`，也不会重新解析它。只有新增或变更的依赖，以及由 `bake update <dep>` 显式选中的依赖，才需要网络解析。若搬运条目在本机没有缓存（例如新克隆的仓库带着已提交的锁文件），`bake build` 会按锁定的 commit/URL 重新下载并校验树哈希——ref 不发生移动。
+当构建或更新需要刷新锁文件时，URL 和 ref 未变的已有条目会原样搬运。bake 不会再次运行 `git ls-remote`，也不会重新解析它。只有新增或变更的依赖，以及由 `bake update <dep>` 显式选中的依赖，才需要网络解析。完整 Bake（自托管）项目命令会根据锁文件中的完整性值校验每个远程缓存源码树，即使缓存标记、大小和修改时间都未变化。若搬运条目在本机没有缓存，或缓存内容不再匹配，普通 `bake build` 会按锁定的 URL 和 commit 恢复缓存，并校验原始树哈希——ref 不发生移动。
 
 `bake update` 是唯一会移动已锁定 ref 的命令。不带依赖名称时，它会重新解析所有依赖，并可能移动所有已锁定 ref；`bake build` 不会移动已锁定的 ref。
 
@@ -142,9 +142,9 @@ musl_helpers = { url = "https://github.com/org/musl-helpers", branch = "main" }
 
 | 标志 | 含义 |
 |---|---|
-| `--locked` | 若 `bake.lock` 缺失或已过期，则失败。 |
-| `--offline` | 绝不访问网络；若所需内容尚未在本地可用，则失败。 |
-| `--frozen` | 同时启用上述两项——适用于 CI 的配置。 |
+| `--locked` | 若 `bake.lock` 缺失或已过期，或已锁定的远程源码缺失或完整性校验失败，则失败。 |
+| `--offline` | 绝不访问网络；若存在 `bake.lock`，会按其完整性值校验缓存的远程源码，所需内容缺失或损坏时失败。`--offline` 不等同于 `--locked`。 |
+| `--frozen` | 同时启用上述两项——锁文件缺失或过期、已锁定的远程源码无效时，均会在不访问网络的情况下失败。 |
 
 ```bash
 bake build --frozen     # 完全遵从锁文件，不访问网络，不出意外

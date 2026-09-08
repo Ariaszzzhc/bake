@@ -4,11 +4,11 @@ bake 的测试机制以注册表为基础：一个包注册具名测试，每项
 
 ## 注册测试
 
-测试在 `build.cpp` 中声明（第 2 或第 3 档——参见[构建脚本](build-scripts.md)）。每个注册项会命名一个测试及其实现该测试的 binary：
+测试在 `build.cpp` 中声明（第 2 或第 3 档——参见[可编程输入](build-scripts.md)）。每个注册项会命名一个测试及其实现该测试的 binary：
 
 ```cpp
 // build.cpp
-import bake;
+import bake.build;
 
 int main() {
     bake::Builder b;

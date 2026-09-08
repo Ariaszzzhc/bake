@@ -56,7 +56,7 @@ libraries = ["ws2_32"]
 
 ## Running and testing
 
-Cross-built binaries land in `out/<triple>/bin/`. `bake run` and `bake test` select the same directory via `-t`, so on a mac:
+Cross-built binaries land in `out/<full-target>/<profile>/bin/` (`dev` by default). `bake run` and `bake test` select the same target and profile via `-t` and `--profile`/`--release`, so on a mac:
 
 ```bash
 bake build -t x86_64-linux-musl    # produces a Linux binary
@@ -68,4 +68,4 @@ bake does not provide an emulator; run foreign binaries with your own (qemu, win
 
 ## Output isolation
 
-Each target gets its own subtree (`out/<triple>/…`), so switching targets never invalidates other targets' incremental state — build for the host, cross-build for three others, and all four trees stay warm.
+Each target and profile pair gets its own subtree (`out/<full-target>/<profile>/…`), so switching either dimension preserves the other trees' incremental state.

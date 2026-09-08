@@ -3,7 +3,7 @@
 A `build.cpp` imports the `bake` module and drives a `bake::Builder`:
 
 ```cpp
-import bake;
+import bake.build;
 
 int main() {
     bake::Builder b;
@@ -60,14 +60,14 @@ Registers a named test backed by a binary (declared via `binary()`). `set_defaul
 |---|---|
 | `b.feature("name")` | Whether the `[features]` feature is active (graph-unified) |
 | `b.source_dir()` | Package root (absolute) |
-| `b.build_dir()` | `out/` directory (absolute) |
+| `b.build_dir()` | Active `out/<full-target>/<profile>/` context (absolute) |
 | `b.target()` | Active target triple — native builds carry the host triple (e.g. `aarch64-apple-darwin`) too, never empty; branch per-platform source selection directly on it |
 | `b.dep_src_dir("alias")` | Source directory of a resolved dependency (empty if unknown) — useful for globbing a dependency's headers |
 
 ## Execution model
 
-- The script is compiled by bake as C++23 and cached; it recompiles only when `build.cpp`, `bake.toml`, or the `bake.build` module changes.
+- The script is compiled by bake as C++23. Declaration reuse requires an exact existence-and-mtime match for the relevant `build.cpp`, workspace/member manifests, and actual workspace lockfile in the same Core context.
 - Context arrives via environment variables (`BAKE_SOURCE_DIR`, `BAKE_TARGET`, `BAKE_OPTIONS`, `BAKE_DEPS`, …) — the constructor reads them; you normally never touch them.
 - `b.build()` writes the declaration and returns 0 on success. Returning anything else fails the build with the script's stderr shown.
-- Tier selection is data-driven: a script that declares no main-moid inputs leaves default discovery active (incremental tier); any `sources`/`public_modules`/`public_headers` call switches to full custom input. See [Build Scripts](../guide/build-scripts.md).
+- Tier selection is data-driven: a script that declares no main-moid inputs leaves default discovery active (incremental tier); any `sources`/`public_modules`/`public_headers` call switches to full custom input. See [Programmable Inputs](../guide/build-scripts.md).
 - Editor note: clangd will report `Module 'bake' not found` for `build.cpp` — expected; bake compiles the script itself.
