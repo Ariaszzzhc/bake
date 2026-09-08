@@ -12,6 +12,8 @@ export module bake.toolchain.runtime;
 
 import std;
 import bake.util;
+import bake.util.filetable;
+import bake.util.cachestore;
 import bake.toolchain.target;
 import bake.toolchain.lld;
 
@@ -124,24 +126,7 @@ void collect_input_files(const Path& p, std::vector<Path>& out) {
             out.emplace_back(e.path());
 }
 
-struct FileStamp {
-    std::uintmax_t size = 0;
-    std::int64_t mtime = 0;
-    bool valid = false;
-};
-
-FileStamp stat_stamp(const Path& p) {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    FileStamp s;
-    if (auto st = fs::status(p.fs(), ec); fs::exists(st)) {
-        s.size = fs::file_size(p.fs(), ec);
-        s.mtime = std::int64_t(
-            fs::last_write_time(p.fs(), ec).time_since_epoch().count());
-        s.valid = !ec;
-    }
-    return s;
-}
+// File stamps and digest trust live in bake.util.filetable.
 
 } // namespace
 
@@ -189,10 +174,8 @@ ToolchainCacheEntry toolchain_cache_lookup(
     }
 
     for (const auto& f : files) {
-        FileStamp st = stat_stamp(f);
-        std::string size_mtime = st.valid
-            ? std::to_string(st.size) + " " + std::to_string(st.mtime)
-            : "- -";
+        FileStamp st = file_stamp(f);
+        std::string size_mtime = format_stamp(st);
 
         std::string line;
         std::string digest;
@@ -245,7 +228,10 @@ void toolchain_cache_finish(ToolchainCacheEntry& entry) {
     std::string content;
     for (auto& l : entry.lines)
         content += l + "\n";
-    write_file(entry.manifest_path, content);
+    atomic_write_file(entry.manifest_path, content);
+    // Bound the namespace; never evict what this process just wrote.
+    cache_enforce_quota(entry.manifest_path.parent().parent(),
+                        CacheQuota::from_env(), entry.output_dir);
 }
 
 // Capture compiler identity + version + target triple as a stable string.

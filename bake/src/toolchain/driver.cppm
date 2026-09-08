@@ -452,10 +452,8 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
         bake::prepare_runtime(target, needs_cxx_runtime, link_mode);
 
     bool is_shared_lib = false;
-    bool has_no_pie = false;
     for (auto& A : user_args) {
       if (A == "-shared" || A == "-Bshareable") is_shared_lib = true;
-      if (A == "-no-pie") has_no_pie = true;
     }
 
     std::vector<std::string> Prefix;  // before user args
@@ -987,12 +985,17 @@ static void inject_vendored_headers(
   }
 }
 
-//===----------------------------------------------------------------------===//
-// clang_main — driver entry point
-//===----------------------------------------------------------------------===//
+// Optional override for the in-process cc1 execution: when set, the
+// driver's CC1Main callback routes lowered -cc1 argument vectors here
+// instead of the stock ExecuteCC1Tool. argv[1] is "-cc1"; the cc1
+// arguments follow. Toolchain-internal seam used by
+// bake.toolchain.compilation to inject VFS remaps and diagnostic
+// collectors (LSP). Plain argv at the boundary, no LLVM types.
+export using Cc1Hook = std::function<int(const char *const *argv, int argc)>;
 
 static int clang_main(int Argc, const char **Argv,
-                      const llvm::ToolContext &ToolContext) {
+                      const llvm::ToolContext &ToolContext,
+                      const Cc1Hook &Cc1Override = nullptr) {
   noteBottomOfStack();
   llvm::setBugReportMsg("PLEASE submit a bug report to " BUG_REPORT_URL
                         " and include the crash backtrace, preprocessed "
@@ -1142,7 +1145,9 @@ static int clang_main(int Argc, const char **Argv,
     return 1;
 
   auto ExecuteCC1WithContext =
-      [&ToolContext](SmallVectorImpl<const char *> &ArgV) {
+      [&ToolContext, &Cc1Override](SmallVectorImpl<const char *> &ArgV) {
+        if (Cc1Override)
+          return Cc1Override(ArgV.data(), static_cast<int>(ArgV.size()));
         return ExecuteCC1Tool(ArgV, ToolContext);
       };
   if (!UseNewCC1Process) {
@@ -1159,12 +1164,10 @@ static int clang_main(int Argc, const char **Argv,
   // "x86_64-linux-gnu.2.31") is kept for the link interception — LLVM's
   // normalized Triple cannot carry the version.
   std::string target_triple;
-  bool has_explicit_target = false;
   for (size_t i = 0; i + 1 < Args.size(); ++i) {
     if (StringRef(Args[i]) == "-target") {
       StringRef Spec(Args[i + 1]);
       g_explicit_target = bake::parse_target(Spec.str());
-      has_explicit_target = true;
       // Strip the version suffix before the driver parses the triple —
       // ".2.31" (glibc) and ".12" (darwin) are not valid LLVM environment
       // or OS components.
@@ -1376,4 +1379,12 @@ static int clang_main(int Argc, const char **Argv,
 
 export int bake_clang_main(int argc, const char **argv) {
   return clang_main(argc, argv, {argv[0], nullptr, false});
+}
+
+// Driver entry with the cc1 execution overridden (see Cc1Hook). The
+// hook replaces the in-process cc1 for every compile job this
+// invocation lowers to; link jobs and assembly still take the stock
+// paths.
+export int bake_clang_main_ex(int argc, const char **argv, Cc1Hook cc1) {
+  return clang_main(argc, argv, {argv[0], nullptr, false}, std::move(cc1));
 }

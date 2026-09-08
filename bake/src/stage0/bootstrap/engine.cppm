@@ -12,14 +12,15 @@ module;
 #include <unistd.h>
 #endif
 
-export module bake.buildsystem.engine;
+export module bake.stage0.engine;
 
 import std;
 import bake.util;
-import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
-import bake.buildsystem.cmdgen;
+import bake.stage0.project;
+import bake.stage0.moid;
+import bake.stage0.graph;
+import bake.stage0.cmdgen;
+import bake.stage0.sched;
 import bake.toolchain.target;
 import bake.toolchain.runtime;
 import bake.json;
@@ -27,7 +28,7 @@ namespace json = bake::json;
 
 
 // ============================================================
-// bake.buildsystem.engine — MoidDeclaration, unified DAG, executor
+// bake.stage0.engine — MoidDeclaration, unified DAG, executor
 //
 // Two-phase architecture:
 //   Configure: resolve inputs + merge bake.toml config → MoidDeclaration JSON
@@ -417,74 +418,6 @@ export std::optional<ModuleInfo> scan_module_file(const Path& source) {
     return info;
 }
 
-// ===== Module topological sort =====
-
-// Compute the full transitive closure of module imports.
-export std::vector<std::string> module_import_closure(
-        const std::vector<std::string>& roots,
-        const std::map<std::string, std::vector<std::string>>& imports) {
-    std::set<std::string> visited;
-    std::vector<std::string> queue(roots.begin(), roots.end());
-    while (!queue.empty()) {
-        std::string mod = std::move(queue.back());
-        queue.pop_back();
-        if (!visited.insert(mod).second) continue;
-        auto it = imports.find(mod);
-        if (it != imports.end()) {
-            for (const auto& imp : it->second) {
-                if (!visited.count(imp)) queue.push_back(imp);
-            }
-        }
-    }
-    return std::vector<std::string>(visited.begin(), visited.end());
-}
-
-// Topological sort of module interfaces using Kahn's algorithm.
-// Returns module names in dependency order.
-inline std::vector<std::string> topo_sort_modules(
-        const std::map<std::string, ModuleInfo>& modules) {
-    std::map<std::string, int> in_degree;
-    std::map<std::string, std::vector<std::string>> adj;
-
-    for (auto& [name, info] : modules)
-        in_degree[name] = 0;
-
-    for (auto& [name, info] : modules) {
-        for (auto& imp : info.imports) {
-            if (modules.count(imp)) {
-                adj[imp].push_back(name);
-                in_degree[name]++;
-            }
-        }
-    }
-
-    std::vector<std::string> queue;
-    for (auto& [name, deg] : in_degree)
-        if (deg == 0) queue.push_back(name);
-    std::sort(queue.begin(), queue.end());
-
-    std::vector<std::string> sorted;
-    while (!queue.empty()) {
-        std::string node = queue.front();
-        queue.erase(queue.begin());
-        sorted.push_back(node);
-
-        for (auto& dependent : adj[node]) {
-            if (--in_degree[dependent] == 0)
-                queue.push_back(dependent);
-        }
-        std::sort(queue.begin(), queue.end());
-    }
-
-    if (sorted.size() != modules.size()) {
-        for (auto& [name, info] : modules)
-            if (std::find(sorted.begin(), sorted.end(), name) == sorted.end())
-                sorted.push_back(name);
-    }
-
-    return sorted;
-}
-
 // ===== Build action =====
 
 export struct BuildAction {
@@ -821,10 +754,6 @@ Path find_bake_build_source() {
     Path installed = prefix / "lib" / "bake" / "bake.build.cppm";
     if (installed.is_regular_file())
       return installed;
-    // 3. <prefix>/share/bake/bake.build.cppm (legacy)
-    Path shared = prefix / "share" / "bake" / "bake.build.cppm";
-    if (shared.is_regular_file())
-      return shared;
   }
   return {};
 }
@@ -2503,10 +2432,7 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
         return 0;
     }
 
-    if (jobs <= 0) {
-        jobs = static_cast<int>(std::thread::hardware_concurrency());
-        if (jobs == 0) jobs = 4;
-    }
+    // Worker-count policy lives in sched (hardware concurrency fallback).
 
     Path state_path = graph.state_dir / "fingerprints.json";
     auto previous = load_fingerprints(state_path);
@@ -2546,12 +2472,7 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
         return 0;
     }
 
-    std::vector<int> status(graph.actions.size(), 0);  // 0=pending, 1=done, -1=failed
-    for (std::size_t i = 0; i < graph.actions.size(); ++i)
-        if (!dirty[i]) status[i] = 1;
-
     std::mutex output_mutex;
-    std::atomic<int> failed{0};
 
     // Per-moid progress is keyed by identity; names are display-only.
     std::map<std::string, int> moid_total;
@@ -2577,174 +2498,115 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
         }
     };
 
-    // Build reverse dependency edges for O(1) dependent lookup.
-    std::vector<std::vector<std::size_t>> dependents(graph.actions.size());
-    for (std::size_t i = 0; i < graph.actions.size(); ++i) {
-        for (auto dep : graph.actions[i].depends_on) {
-            if (dep < graph.actions.size())
-                dependents[dep].push_back(i);
-        }
-    }
+    // The scheduling mechanics (ready queue, worker pool, fail-fast)
+    // live in bake.stage0.sched; this closure is the per-action
+    // policy: announce, stage archive outputs, run, publish.
+    TaskGraphSpec spec;
+    spec.node_count = graph.actions.size();
+    spec.deps.resize(graph.actions.size());
+    for (std::size_t i = 0; i < graph.actions.size(); ++i)
+        spec.deps[i] = graph.actions[i].depends_on;
+    spec.active = dirty;
+    spec.jobs = jobs;
 
-    // Count unresolved dirty dependencies per action.
-    std::vector<int> pending_deps(graph.actions.size(), 0);
-    for (std::size_t i = 0; i < graph.actions.size(); ++i) {
-        if (!dirty[i]) continue;
-        for (auto dep : graph.actions[i].depends_on) {
-            if (dep < dirty.size() && dirty[dep])
-                ++pending_deps[i];
-        }
-    }
+    int failed = run_task_graph(spec, [&](std::size_t idx) -> bool {
+        bool ok = true;
+        auto& action = graph.actions[idx];
+        announce(action);
 
-    // Shared ready queue: degree-based scheduling over the flat action DAG —
-    // moid-level and intra-moid parallelism are both just "no edge, no
-    // order" here.
-    std::deque<std::size_t> ready_queue;
-    std::mutex queue_mutex;
-    std::condition_variable queue_cv;
-    std::atomic<int> completed{0};
-    std::atomic<bool> stop{false};
+        std::vector<std::string> command = action.command;
+        std::optional<Path> archive_output;
+        std::optional<Path> archive_temp;
 
-    for (std::size_t i = 0; i < graph.actions.size(); ++i) {
-        if (dirty[i] && pending_deps[i] == 0)
-            ready_queue.push_back(i);
-    }
+        if (action.type == BuildAction::Type::Archive) {
+            if (action.outputs.size() != 1) {
+                {
+                    std::lock_guard<std::mutex> lock(output_mutex);
+                    std::println(
+                        std::cerr,
+                        "bake: archive action '{}' must have exactly one output",
+                        action.id);
+                }
+                ok = false;
+            } else {
+                archive_output = action.outputs.front();
+                archive_temp = Path(
+                    archive_output->string() + ".bake-archive-tmp");
 
-    auto worker = [&]() {
-        while (true) {
-            std::size_t idx;
-            {
-                std::unique_lock<std::mutex> lock(queue_mutex);
-                queue_cv.wait(lock, [&] {
-                    return stop.load() || !ready_queue.empty();
-                });
-                if (stop.load()) return;
-                idx = ready_queue.front();
-                ready_queue.pop_front();
-            }
-
-            bool ok = true;
-            auto& action = graph.actions[idx];
-            announce(action);
-
-            std::vector<std::string> command = action.command;
-            std::optional<Path> archive_output;
-            std::optional<Path> archive_temp;
-
-            if (action.type == BuildAction::Type::Archive) {
-                if (action.outputs.size() != 1) {
+                std::error_code error;
+                std::filesystem::remove(archive_temp->fs(), error);
+                if (error) {
                     {
                         std::lock_guard<std::mutex> lock(output_mutex);
                         std::println(
                             std::cerr,
-                            "bake: archive action '{}' must have exactly one output",
-                            action.id);
+                            "bake: failed to remove temporary archive '{}': {}",
+                            archive_temp->string(), error.message());
                     }
                     ok = false;
+                    archive_temp.reset();
                 } else {
-                    archive_output = action.outputs.front();
-                    archive_temp = Path(
-                        archive_output->string() + ".bake-archive-tmp");
-
-                    std::error_code error;
-                    std::filesystem::remove(archive_temp->fs(), error);
-                    if (error) {
+                    auto output_arg = std::find(
+                        command.begin(), command.end(),
+                        archive_output->string());
+                    if (output_arg == command.end()) {
                         {
                             std::lock_guard<std::mutex> lock(output_mutex);
                             std::println(
                                 std::cerr,
-                                "bake: failed to remove temporary archive '{}': {}",
-                                archive_temp->string(), error.message());
+                                "bake: archive action '{}' has no output argument",
+                                action.id);
                         }
                         ok = false;
                         archive_temp.reset();
                     } else {
-                        auto output_arg = std::find(
-                            command.begin(), command.end(),
-                            archive_output->string());
-                        if (output_arg == command.end()) {
-                            {
-                                std::lock_guard<std::mutex> lock(output_mutex);
-                                std::println(
-                                    std::cerr,
-                                    "bake: archive action '{}' has no output argument",
-                                    action.id);
-                            }
-                            ok = false;
-                            archive_temp.reset();
-                        } else {
-                            *output_arg = archive_temp->string();
-                        }
+                        *output_arg = archive_temp->string();
                     }
                 }
-            }
-
-            if (ok) {
-                auto result = run_process(command, graph.project_root);
-                if (!result.success()) {
-                    if (archive_temp) {
-                        std::error_code cleanup_error;
-                        std::filesystem::remove(archive_temp->fs(),
-                                                cleanup_error);
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(output_mutex);
-                        if (!result.stderr_output.empty())
-                            std::print(std::cerr, "{}", result.stderr_output);
-                        std::println(std::cerr,
-                            "bake: action '{}' failed", action.id);
-                    }
-                    ok = false;
-                } else if (archive_temp) {
-                    auto replace_error =
-                        atomic_replace_file(*archive_temp, *archive_output);
-                    if (replace_error) {
-                        std::error_code cleanup_error;
-                        std::filesystem::remove(archive_temp->fs(),
-                                                cleanup_error);
-                        {
-                            std::lock_guard<std::mutex> lock(output_mutex);
-                            std::println(
-                                std::cerr,
-                                "bake: failed to publish archive '{}': {}",
-                                archive_output->string(),
-                                replace_error.message());
-                        }
-                        ok = false;
-                    }
-                }
-            }
-
-            status[idx] = ok ? 1 : -1;
-            if (!ok) failed.fetch_add(1);
-
-            {
-                std::lock_guard<std::mutex> lock(queue_mutex);
-                if (ok) {
-                    completed.fetch_add(1);
-                    for (auto dep_idx : dependents[idx]) {
-                        if (dirty[dep_idx] &&
-                            --pending_deps[dep_idx] == 0) {
-                            ready_queue.push_back(dep_idx);
-                        }
-                    }
-                }
-                if (failed.load() > 0 || completed.load() >= pending) {
-                    stop.store(true);
-                }
-                queue_cv.notify_all();
             }
         }
-    };
 
-    // Launch a persistent shared thread pool.
-    int n_workers = std::min(jobs, pending);
-    std::vector<std::thread> pool;
-    for (int t = 0; t < n_workers; ++t)
-        pool.emplace_back(worker);
-    for (auto& th : pool) th.join();
+        if (ok) {
+            auto result = run_process(command, graph.project_root);
+            if (!result.success()) {
+                if (archive_temp) {
+                    std::error_code cleanup_error;
+                    std::filesystem::remove(archive_temp->fs(),
+                                            cleanup_error);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(output_mutex);
+                    if (!result.stderr_output.empty())
+                        std::print(std::cerr, "{}", result.stderr_output);
+                    std::println(std::cerr,
+                        "bake: action '{}' failed", action.id);
+                }
+                ok = false;
+            } else if (archive_temp) {
+                auto replace_error =
+                    atomic_replace_file(*archive_temp, *archive_output);
+                if (replace_error) {
+                    std::error_code cleanup_error;
+                    std::filesystem::remove(archive_temp->fs(),
+                                            cleanup_error);
+                    {
+                        std::lock_guard<std::mutex> lock(output_mutex);
+                        std::println(
+                            std::cerr,
+                            "bake: failed to publish archive '{}': {}",
+                            archive_output->string(),
+                            replace_error.message());
+                    }
+                    ok = false;
+                }
+            }
+        }
 
-    if (failed.load() > 0) {
+        return ok;
+    });
+
+
+    if (failed > 0) {
         std::println(std::cerr, "bake: build failed");
         return 1;
     }
@@ -2762,31 +2624,5 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
     return 0;
 }
 
-// ===== compile_commands.json =====
-
-export void write_compile_commands(const BuildGraph& graph, const Path& output_path) {
-    json::Value commands = json::Value::array();
-
-    for (auto& action : graph.actions) {
-        if (!action.is_compile()) continue;
-        if (action.inputs.empty() || action.outputs.empty()) continue;
-
-        json::Value entry;
-        entry["directory"] = graph.project_root.absolute().string();
-
-        std::string cmd_str;
-        for (std::size_t i = 0; i < action.command.size(); ++i) {
-            if (i > 0) cmd_str += " ";
-            cmd_str += action.command[i];
-        }
-        entry["command"] = cmd_str;
-        entry["file"] = action.inputs[0].absolute().string();
-        entry["output"] = action.outputs[0].absolute().string();
-
-        commands.push_back(entry);
-    }
-
-    write_file(output_path, commands.dump(2));
-}
 
 } // namespace bake

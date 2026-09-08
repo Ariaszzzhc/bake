@@ -10,7 +10,7 @@ import nlohmann.json;
 namespace bake::json {
 namespace {
 
-using Lib = nlohmann::json;
+using Lib = nlohmann::ordered_json;
 
 Value from_lib(const Lib& node) {
     switch (node.type()) {
@@ -63,6 +63,14 @@ Lib to_lib(const Value& value) {
 Value Value::parse(std::string_view text) {
     try {
         return from_lib(Lib::parse(text));
+    } catch (const Lib::parse_error& error) {
+        std::string_view message(error.what());
+        if (error.id == 101 &&
+            message.find("expected end of input") != std::string_view::npos) {
+            throw Error("bake.json: unexpected trailing content at byte " +
+                        std::to_string(error.byte));
+        }
+        throw Error(std::string("bake.json: ") + error.what());
     } catch (const Lib::exception& error) {
         throw Error(std::string("bake.json: ") + error.what());
     }

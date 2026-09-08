@@ -19,6 +19,8 @@ bake <subcommand> --help
 | `bake clean` | 删除 `out/` |
 | `bake cc` / `bake c++` / `bake ar` | 直接调用内嵌的 Clang/LLVM 工具（`zig cc` 风格） |
 | `bake audit` | 验证工具链的自包含性 |
+| `bake compdb` | 从已解析的构建图写出 `compile_commands.json`（不执行构建） |
+| `bake lsp` | stdio 语言服务器（仅完整 Stage 1 binary） |
 
 ## 全局选项
 
@@ -26,6 +28,20 @@ bake <subcommand> --help
 |---|---|
 | `-V`, `--version` | 打印版本 |
 | `-h`, `--help` | 打印帮助信息 |
+
+`bake cc`、`bake c++` 与 `bake ar` 是独立工具链入口。它们不会打开项目、
+读取 `bake.toml`/`bake.lock` 或创建项目 Core 状态；输入与输出仅由传入的
+编译器或归档参数决定。
+
+## 引导 binary 与完整 binary
+
+位于 `build/bake` 的永久 Stage 0 binary 只包含 `build`、`update`、`cc`、
+`c++`、`ar`，以及编译内部使用的 Clang `-cc1`/`-cc1as` 模式。直接调用形式为
+`build/bake cc ...`、`build/bake c++ ...` 与
+`build/bake ar rcs [--darwin] <archive> <members...>`；其他命令会被明确拒绝。
+
+Stage 0 将完整 Stage 1 binary 构建到
+`out/<host-triple>/dev/bin/bake`。以下其余章节描述这个完整 binary。
 
 ## 构建选项（`build`、`run`、`test`）
 
@@ -99,6 +115,54 @@ bake test [name] [--all] [-p <member>] [-j <n>]
 ## `bake run`
 
 构建后运行所选内容的唯一可执行文件。工作区中存在多个可执行文件时，bake 会列出候选项并要求指定 `-p`。末尾位置参数会转发给程序。
+
+## `bake compdb`
+
+```
+bake compdb [-p <member>] [--feature <name>]
+            [--release | --profile <name>] [-t <triple>]
+            [--locked] [--offline] [--frozen] [output]
+```
+
+- 打开与 `bake build` 相同的共享项目上下文（选择、profile、target 语义一致），但不执行任何项目构建动作，然后写出
+  [JSON 编译数据库](https://clang.llvm.org/docs/JSONCompilationDatabase.html)——
+  默认写到项目根的 `compile_commands.json`，给了 `[output]` 则写到该路径。
+- `bake build` 在每次成功构建后刷新同一文件；显式 `bake compdb` 是不执行
+  项目构建的路径。打开所选 Core 上下文时，它可能准备缺失的输入声明。
+- `--offline`（LSP 的默认行为）拒绝网络解析；未解析的依赖会报错并提示 `bake update`。
+
+## `bake lsp`
+
+```
+bake lsp [--target <三元组>] [--profile <名称>] [--index-jobs <n>]
+```
+
+- 在 stdio 上讲语言服务器协议（JSON-RPC、Content-Length 分帧）。编辑器像任何 LSP server 一样启动它；
+  工作区根来自 `initialize` 握手。
+- 当前能力：生命周期（`initialize`/`shutdown`/`exit`）、全量文档同步
+  （`didOpen`/`didChange`/`didClose`）、诊断、补全
+  （`textDocument/completion`）、跳转与引用
+  （`textDocument/definition`、`textDocument/references`）。
+- 每次前端编译都发生在 worker 进程里（`bake lsp-worker`，由当前二进制自身
+  派生）：一个专用交互 worker 以 FIFO 服务低延迟通道（preamble 构建、按键
+  诊断、补全），`--index-jobs` 个 worker（默认 clamp(核数/2, 1, 6)）并行
+  消化后台索引队列。事件循环绝不阻塞在编译上；陈旧诊断按文档代次丢弃；
+  worker 崩溃自动重生（每 10 秒最多 3 次，超限后该通道快速失败）。
+- 编译使用与构建相同的 Core 项目快照中的描述。会话中所有已打开的主文件、
+  头文件与模块缓冲区组成一个按内容标识的 source view，并覆盖磁盘内容。
+- 文件头部（preamble）编译一次生成 PCH，按内容寻址存入
+  `out/<full-target>/<profile>/.bake/lsp-preamble/`；按键编译只解析正在编辑的函数体。
+  模块编译单元的 PCH 区域截断在首个模块构造之前（PCH 不能携带模块导入），
+  `import std;` 文件保留纯预处理器 preamble，其导入重新跑真实模块文件。
+- 后台索引经 worker 池采集按编译单元的符号 shard；跳转/引用优先用打开
+  文件的实时索引，其次用 shard 集——冷索引下跨文件跳转同样可用。
+- 每个异步分析结果都绑定其目标/profile 上下文、项目快照、source view 与文档
+  版本；陈旧或已取消的结果会被丢弃，不会发布。
+- 不传旗标时，LSP 始终打开原生目标与 `dev` profile，不跟随最近一次构建所用的
+  目标或 profile。编辑器需要其他上下文时必须显式传 `--target` 与 `--profile`；
+  `--index-jobs` 控制后台索引并发数。
+- 仅存在于自举（self-hosted）二进制中（依赖 kotatsu 异步运行时）；引导二进制
+  直接拒绝该命令。
 
 ## 退出码
 

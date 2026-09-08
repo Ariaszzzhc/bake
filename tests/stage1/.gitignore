@@ -1,0 +1,4 @@
+/out/
+/build/
+/.bake/
+/compile_commands.json

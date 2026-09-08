@@ -3,7 +3,7 @@
 `build.cpp` 导入 `bake` 模块，并通过 `bake::Builder` 驱动构建：
 
 ```cpp
-import bake;
+import bake.build;
 
 int main() {
     bake::Builder b;
@@ -60,14 +60,14 @@ b.add_test("suite-name", "binary-name").set_default();
 |---|---|
 | `b.feature("name")` | `[features]` 特性是否激活（图上并集合一） |
 | `b.source_dir()` | 包根目录（绝对路径） |
-| `b.build_dir()` | `out/` 目录（绝对路径） |
+| `b.build_dir()` | 当前 `out/<full-target>/<profile>/` 上下文（绝对路径） |
 | `b.target()` | 活动目标三元组——原生构建也始终携带宿主三元组（如 `aarch64-apple-darwin`），永不为空；跨平台源选择可直接按它分支 |
 | `b.dep_src_dir("alias")` | 已解析依赖的源目录（若未知则为空）——可用于 glob 依赖的头文件 |
 
 ## 执行模型
 
-- 脚本会由 bake 按 C++23 编译并缓存；仅在 `build.cpp`、`bake.toml` 或 `bake.build` 模块发生变化时重新编译。
+- 脚本由 bake 按 C++23 编译。只有同一 Core 上下文中相关 `build.cpp`、workspace/member 清单与实际 workspace lockfile 的存在状态及 mtime 完全相同，声明才会复用。
 - 上下文通过环境变量传入（`BAKE_SOURCE_DIR`、`BAKE_TARGET`、`BAKE_OPTIONS`、`BAKE_DEPS`、…）——构造函数会读取它们；通常无需接触它们。
 - `b.build()` 会写入声明，并在成功时返回 0。返回其他值会使构建失败，同时显示脚本的 stderr。
-- 档位选择由数据驱动：若脚本没有声明主 moid 输入，默认发现仍处于活动状态（增量档位）；任何 `sources`/`public_modules`/`public_headers` 调用都会切换为完全自定义输入。参见[构建脚本](../guide/build-scripts.md)。
+- 档位选择由数据驱动：若脚本没有声明主 moid 输入，默认发现仍处于活动状态（增量档位）；任何 `sources`/`public_modules`/`public_headers` 调用都会切换为完全自定义输入。参见[可编程输入](../guide/build-scripts.md)。
 - 编辑器提示：clangd 会为 `build.cpp` 报告 `Module 'bake' not found`——这是预期行为；bake 会自行编译该脚本。

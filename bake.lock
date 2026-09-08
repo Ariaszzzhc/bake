@@ -20,6 +20,11 @@
       "ref_type": "archive",
       "integrity": "sha256-7086f214ca0af432c8e34f4d7482d5c3595a13f8fcff8046831b43542eebe4c9"
     },
+    "archive:https://github.com/libuv/libuv/archive/refs/tags/v1.52.1.tar.gz": {
+      "url": "https://github.com/libuv/libuv/archive/refs/tags/v1.52.1.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-0e788c54b35f5642cba7e1bef6087b18d38b578fb850cb614c20d8f2761c9b13"
+    },
     "archive:https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz": {
       "url": "https://github.com/marzer/tomlplusplus/archive/refs/tags/v3.4.0.tar.gz",
       "ref_type": "archive",
@@ -34,6 +39,11 @@
       "url": "https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz",
       "ref_type": "archive",
       "integrity": "sha256-91f46ec3117cbc44514187798b5f101c9ba4dff5fdbc63bc792a050e495d48ab"
+    },
+    "archive:https://github.com/simdjson/simdjson/archive/refs/tags/v4.2.4.tar.gz": {
+      "url": "https://github.com/simdjson/simdjson/archive/refs/tags/v4.2.4.tar.gz",
+      "ref_type": "archive",
+      "integrity": "sha256-83806d9b02df9b83fee2d282514db2c787bfcda6b394102d90ab83eb749d6c21"
     },
     "archive:https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz": {
       "url": "https://github.com/tukaani-project/xz/releases/download/v5.8.3/xz-5.8.3.tar.gz",
@@ -74,6 +84,14 @@
       "integrity": "sha256-07d8a80db5a4217fd264453084d9a1822780d91f7bfa5af0c0fd9505b3a73839",
       "name": "json"
     },
+    "git:https://github.com/bake-pkgs/kotatsu@a16f495bdeee043b41e5c3bcafcf84c4bdd63ed2": {
+      "url": "https://github.com/bake-pkgs/kotatsu",
+      "ref": "",
+      "ref_type": "head",
+      "commit": "a16f495bdeee043b41e5c3bcafcf84c4bdd63ed2",
+      "integrity": "sha256-0a5931dac684e888b4ba33e4f6cf44359b5590dc51c1e3bc850f2a0245ee68d9",
+      "name": "kotatsu"
+    },
     "git:https://github.com/bake-pkgs/libarchive@50bf9960b7eea943e16d2da12416da8bc8f5f27b": {
       "url": "https://github.com/bake-pkgs/libarchive",
       "ref": "v3.8.9-r1",
@@ -81,6 +99,14 @@
       "commit": "50bf9960b7eea943e16d2da12416da8bc8f5f27b",
       "integrity": "sha256-47d4b9e43c4e768ff55d1cbb141aed78854a5525186ccd6f8e3bb8f14d0c054a",
       "name": "libarchive"
+    },
+    "git:https://github.com/bake-pkgs/libuv@ef0ce2b6b57030f9db787248bf38efb7e57cdeed": {
+      "url": "https://github.com/bake-pkgs/libuv",
+      "ref": "v1.52.1",
+      "ref_type": "tag",
+      "commit": "ef0ce2b6b57030f9db787248bf38efb7e57cdeed",
+      "integrity": "sha256-ba1e036ca686e08fbb49b8c439099add5a2c077244f72db47bc8ef2476041c1b",
+      "name": "libuv"
     },
     "git:https://github.com/bake-pkgs/mbedtls@c1c0e7fb60a72cbf2e7c773ed82a97546b6ba121": {
       "url": "https://github.com/bake-pkgs/mbedtls",
@@ -97,6 +123,14 @@
       "commit": "d3101cab4cc64ae5c6091d6dc6521e5aee24bf01",
       "integrity": "sha256-95556355c29dccab847a8348e1b0da0c6ac95d02a739f0fbc9410a7eb918fbcf",
       "name": "nghttp2"
+    },
+    "git:https://github.com/bake-pkgs/simdjson@05345f7e33343bcc2a8454c7e7a8d37931da0da0": {
+      "url": "https://github.com/bake-pkgs/simdjson",
+      "ref": "v4.2.4",
+      "ref_type": "tag",
+      "commit": "05345f7e33343bcc2a8454c7e7a8d37931da0da0",
+      "integrity": "sha256-50579aa144a6b9f7b18ae0926111177257c7d4dfd4144a347cb937e629692f67",
+      "name": "simdjson"
     },
     "git:https://github.com/bake-pkgs/tomlplusplus@c5a9404e9fb963acf7b727c52e6b387df1b06da0": {
       "url": "https://github.com/bake-pkgs/tomlplusplus",
@@ -129,6 +163,13 @@
       "commit": "4ae7c115577b3e0b8270b5bf0cc543fabe0ab794",
       "integrity": "sha256-90357c199785abbf2ac0335666b565123698f12f76be2ad5e4769b3ca6ff1e71",
       "name": "zstd"
+    },
+    "git:https://github.com/clice-io/kotatsu@bbc0631fecf5d0aaa6022d0ab87fd6fa29b9539e": {
+      "url": "https://github.com/clice-io/kotatsu",
+      "ref": "",
+      "ref_type": "head",
+      "commit": "bbc0631fecf5d0aaa6022d0ab87fd6fa29b9539e",
+      "integrity": "sha256-596740abddac6da7ddb2201dcd4a0a169b32a635ac35e9d0005b7257a57bb8a1"
     }
   }
 }

@@ -56,7 +56,7 @@ libraries = ["ws2_32"]
 
 ## 运行和测试
 
-交叉构建的 binary 位于 `out/<triple>/bin/`。`bake run` 和 `bake test` 通过 `-t` 选择相同目录，因此在 mac 上：
+交叉构建的 binary 位于 `out/<full-target>/<profile>/bin/`（默认 profile 为 `dev`）。`bake run` 和 `bake test` 通过 `-t` 与 `--profile`/`--release` 选择相同的目标及 profile，因此在 mac 上：
 
 ```bash
 bake build -t x86_64-linux-musl    # produces a Linux binary
@@ -68,4 +68,4 @@ bake 不提供模拟器；请使用你自己的工具（qemu、wine、Docker）�
 
 ## 输出隔离
 
-每个目标均有自己的子树（`out/<triple>/…`），因此切换目标绝不会使其他目标的增量状态失效——可为主机构建，也可为另外三个目标进行交叉构建，各目录树都会保持预热状态。
+每个目标与 profile 组合都有自己的子树（`out/<full-target>/<profile>/…`），因此切换任一维度都会保留其他目录树的增量状态。

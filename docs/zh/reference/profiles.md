@@ -46,7 +46,9 @@ warnings = "extra"
 | `sanitize` | array | Sanitizer，例如 `["address"]` |
 | `warnings` | string | `"none"` \| `"all"` \| `"extra"` \| `"error"` |
 
-只有已设置的字段会被覆盖；基础 profile 的其余字段保持不变。Profile 的选择不会使其他 profile 的输出失效——每个（`profile`、`target`）组合均独立计算指纹。
+只有已设置的字段会被覆盖；基础 profile 的其余字段保持不变。每个
+（`target`、`profile`）组合都有独立的 `out/<full-target>/<profile>/` 目录树与
+Core 项目状态上下文。
 
 ## 特性
 

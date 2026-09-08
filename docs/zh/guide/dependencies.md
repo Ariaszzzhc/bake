@@ -11,6 +11,7 @@ mylib = { path = "../mylib" }
 fmt = { url = "https://github.com/fmtlib/fmt", tag = "11.0.2" }
 catch2 = { url = "https://github.com/catchorg/Catch2", branch = "devel" }
 fixed = { url = "https://github.com/org/repo", rev = "d5598e0f03e13c0b" }
+ranged = { url = "https://github.com/bake-pkgs/zstd", version = "^1.5" }
 
 # 归档 URL 是直接归档依赖；不带 ref。
 headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
@@ -18,7 +19,7 @@ headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
 
 ## 路径依赖与裸源码包
 
-路径依赖指向本地目录，并在每次构建时从磁盘解析。它们绕过包缓存，因此对依赖的编辑会立即参与下一次构建。这是工作区成员彼此依赖的方式；参见[工作区](workspaces.md)。路径依赖永不写入 `bake.lock`。
+路径依赖指向本地目录并绕过包缓存。对本地源码的编辑会参与下一次构建，复用项目声明时也如此。这是工作区成员彼此依赖的方式；参见[工作区](workspaces.md)。路径依赖永不写入 `bake.lock`。
 
 不带 `[package]` 声明的路径或已获取依赖是*裸源码包*。在 `build.cpp` 中通过 `b.dep_src_dir(alias)` 使用其源码目录：
 
@@ -26,7 +27,7 @@ headers = { url = "https://example.com/headers-1.2.0.tar.gz" }
 auto source_dir = b.dep_src_dir("headers");
 ```
 
-这样由构建脚本决定如何使用检出的源码。如果一个已声明的裸源码依赖从未通过 `dep_src_dir` 查询，bake 会在 configure 阶段发出包含 `never consumed` 的警告。
+这样由 `build.cpp` 描述如何使用检出的源码。如果一个已声明的裸源码依赖从未通过 `dep_src_dir` 查询，项目命令会发出包含 `never consumed` 的警告。复用缓存的项目声明时也会显示该警告。
 
 ## Git 依赖
 
@@ -43,9 +44,40 @@ default_branch = { url = "https://github.com/org/repo" }
 - `tag` 选择标签。
 - `branch` 选择分支。
 - `rev` 选择确切的 Git revision。
+- `version` 声明 semver 要求，由解析器选定标签。
 - 不带 ref 时，bake 会在构建时解析远端默认分支的 `HEAD`。
 
-`tag`、`branch` 和 `rev` 互斥：一个条目至多包含其中一个。每个选定的 Git ref 都会在锁文件中解析为 commit，因此普通构建会持续使用该 commit，直到 `bake update` 移动它。
+`tag`、`branch`、`rev` 与 `version` 互斥：一个条目至多包含其中一个。每个选定的 Git ref（包括为 `version` 要求选定的标签）都会在锁文件中解析为 commit，因此普通构建会持续使用该 commit，直到 `bake update` 移动它。
+
+### 版本约束
+
+Git 依赖可以不写固定 ref，而是声明一个 semver 要求：
+
+```toml
+[dependencies]
+zstd = { url = "https://github.com/bake-pkgs/zstd", version = "^1.5" }
+```
+
+解析器枚举仓库的 semver 标签（`git ls-remote --tags`），并为每个 URL 选定一个标签：
+
+- 已在锁中、且仍满足图中全部要求的标签 —— 普通构建从不移动已锁定的选择；
+- 否则取满足该 URL 全部要求的最高版本。同一 URL 上钉死的 `tag`
+  以等式约束参与求解，范围与钉死不会静默分歧。
+
+要求是在遍历包 manifest 的过程中发现的，因此某个包已展开后才到达的约束可能使先前
+的选择失效；此时解析以旧选择为下限重启。选择只升不降，因此必然收敛。无版本可满足时，
+bake 会列出每条要求及其声明它的包。
+
+要求语法：`1.2.3` 精确（允许前缀 `=`）、`^1.2.3` 脱字符（提升最左侧非零分量：
+`^0.2.3` 即 `< 0.3.0`，`^0.0.3` 即 `< 0.0.4`）、`~1.2.3` 波浪线（补丁级：
+`< 1.3.0`）、部分形式（`1.2` ≡ `~1.2`，`1` ≡ `~1`）与 `*`（任意发布版）。
+操作数允许前缀 `v`。预发布候选遵循 node-semver 规则：预发布版本只满足操作数在同一
+`major.minor.patch` 上也带预发布的那些要求 —— `^1.2.3` 永不匹配 `1.3.0-beta`，
+而 `^0.0.0-bbc0631` 能匹配 `0.0.0-bbc0631-r1`。不接受比较符列表（`>=1.2 <2`）。
+
+`version` 与 `tag`、`branch`、`rev` 互斥，也不能用于归档 URL。锁文件以 ref 类型
+`tag` 记录选定的标签；只有 `bake update` 会重新考虑它，把每个带约束的依赖移动到满足
+当前要求的最高标签。当锁定的标签不再满足要求时 `--locked` 会失败。
 
 取回方式：bake 优先通过托管方的源码归档端点（GitHub/GitLab 风格的
 `<仓库>/archive/<commit>.tar.gz`）按锁定的 commit 下载 Git 依赖；端点不存在或不可用时回退到完整
@@ -53,7 +85,7 @@ default_branch = { url = "https://github.com/org/repo" }
 
 ### 归档依赖
 
-以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz`、`.tar.zst`、`.tzst` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch` 或 `rev`；归档依赖带 ref 会报错。
+以 `.tar.gz`、`.tgz`、`.tar.bz2`、`.tbz2`、`.tar.xz`、`.txz`、`.tar.zst`、`.tzst` 或 `.zip` 结尾的 URL 会被识别为直接归档依赖。归档 URL 不要指定 `tag`、`branch`、`rev` 或 `version`；归档依赖带 ref 会报错。
 
 自举后的 bake 内嵌 libcurl 与 libarchive，下载与解压都在进程内完成；stage-0 引导二进制则调用系统 `curl`、`tar`、`unzip`。Git 传输（ref 解析、clone 兜底）仍使用 `git` 二进制。归档 URL 按 URL 锁定，已下载内容会记录完整性值。
 
@@ -102,7 +134,7 @@ musl_helpers = { url = "https://github.com/org/musl-helpers", branch = "main" }
 
 ### 增量解析
 
-当构建或更新需要刷新锁文件时，URL 和 ref 未变的已有条目会原样搬运。bake 不会再次运行 `git ls-remote`，也不会重新解析它。只有新增或变更的依赖，以及由 `bake update <dep>` 显式选中的依赖，才需要网络解析。若搬运条目在本机没有缓存（例如新克隆的仓库带着已提交的锁文件），`bake build` 会按锁定的 commit/URL 重新下载并校验树哈希——ref 不发生移动。
+当构建或更新需要刷新锁文件时，URL 和 ref 未变的已有条目会原样搬运。bake 不会再次运行 `git ls-remote`，也不会重新解析它。只有新增或变更的依赖，以及由 `bake update <dep>` 显式选中的依赖，才需要网络解析。完整 Bake（自托管）项目命令会根据锁文件中的完整性值校验每个远程缓存源码树，即使缓存标记、大小和修改时间都未变化。若搬运条目在本机没有缓存，或缓存内容不再匹配，普通 `bake build` 会按锁定的 URL 和 commit 恢复缓存，并校验原始树哈希——ref 不发生移动。
 
 `bake update` 是唯一会移动已锁定 ref 的命令。不带依赖名称时，它会重新解析所有依赖，并可能移动所有已锁定 ref；`bake build` 不会移动已锁定的 ref。
 
@@ -110,9 +142,9 @@ musl_helpers = { url = "https://github.com/org/musl-helpers", branch = "main" }
 
 | 标志 | 含义 |
 |---|---|
-| `--locked` | 若 `bake.lock` 缺失或已过期，则失败。 |
-| `--offline` | 绝不访问网络；若所需内容尚未在本地可用，则失败。 |
-| `--frozen` | 同时启用上述两项——适用于 CI 的配置。 |
+| `--locked` | 若 `bake.lock` 缺失或已过期，或已锁定的远程源码缺失或完整性校验失败，则失败。 |
+| `--offline` | 绝不访问网络；若存在 `bake.lock`，会按其完整性值校验缓存的远程源码，所需内容缺失或损坏时失败。`--offline` 不等同于 `--locked`。 |
+| `--frozen` | 同时启用上述两项——锁文件缺失或过期、已锁定的远程源码无效时，均会在不访问网络的情况下失败。 |
 
 ```bash
 bake build --frozen     # 完全遵从锁文件，不访问网络，不出意外

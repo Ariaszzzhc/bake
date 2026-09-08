@@ -73,12 +73,13 @@ Re-running `bake build` is cheap: bake fingerprints every action (content-based)
 
 ```
 out/
-└── aarch64-apple-darwin/    # one directory per target triple
-    ├── bin/                 # executables
-    ├── lib/                 # .a / .dylib
-    ├── .obj/                # object files
-    ├── .bmi/                # module PCMs
-    └── .bake/               # resolved declarations, fingerprints
+└── aarch64-apple-darwin/    # one directory per full target
+    └── dev/                 # dev, release, or a custom profile
+        ├── bin/             # executables
+        ├── lib/             # .a / .dylib
+        ├── .obj/            # object files
+        ├── .bmi/            # module PCMs
+        └── .bake/           # shared project state and build receipts
 ```
 
 `bake clean` removes `out/`. Full details in [Output and Cache Layout](../reference/output-and-cache.md).
@@ -115,5 +116,5 @@ int main() {
 ## Next steps
 
 - [Dependencies](../guide/dependencies.md)
-- [Build Scripts](../guide/build-scripts.md) — when default discovery is not enough
+- [Programmable Inputs](../guide/build-scripts.md) — when default discovery is not enough
 - [Testing](../guide/testing.md)

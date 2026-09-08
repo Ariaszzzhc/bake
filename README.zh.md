@@ -17,8 +17,9 @@ bake 把三样东西焊在一个可执行文件里：
 - **包管理器。**Git 依赖、归档依赖、路径依赖、workspace、lockfile，以及
   给 CI 用的 `--frozen`。
 - **编译器工具链。**bake 内嵌 LLVM、Clang、LLD，自带 libc++、compiler-rt、
-  musl、MinGW-w64 和 glibc 链接面。编译和链接都在进程内完成：没有编译器
-  子进程，永远不碰系统工具链。
+  musl、MinGW-w64 和 glibc 链接面。每一次编译、汇编、归档和链接调用都留在
+  bake binary 内。Core 可为已调度工作使用 Bake 自己拥有的子进程；自举之后
+  不需要外部编译器工具链。
 
 为什么要做这个？因为在 C/C++ 的世界里，工具链本身就是环境噪音——你拿到
 哪个 clang，取决于机器、包管理器和当天月相。bake 把整个工具链钉死在构建
@@ -50,8 +51,8 @@ $ bake build -t x86_64-linux-musl
    Building hello v0.1.0
    Compiling hello v0.1.0
     Finished in 1.1s
-$ file out/x86_64-linux-musl/bin/hello
-out/x86_64-linux-musl/bin/hello: ELF 64-bit LSB executable, x86-64, ... statically linked
+$ file out/x86_64-linux-musl/dev/bin/hello
+out/x86_64-linux-musl/dev/bin/hello: ELF 64-bit LSB executable, x86-64, ... statically linked
 ```
 
 没有工具链文件，没有 SDK，没有 `-DCMAKE_TOOLCHAIN_FILE`。新目标的首次构建
@@ -103,7 +104,8 @@ glibc；其余目标默认静态链接。
 
 同样在车上：全目标 `import std;` 与具名模块、原生构建的 asan/ubsan、三种
 对象格式的进程内 LLD，以及想直接用内嵌工具链时的 `bake cc` / `bake c++` /
-`bake ar`（`zig cc` 风格）。
+`bake ar`（`zig cc` 风格）。这些独立工具链命令不需要 `bake.toml`，也不会创建
+项目构建状态。
 
 ## 获取 bake
 
@@ -117,12 +119,19 @@ cd bake
 # 需要 CMake >= 3.30、Ninja、Clang >= 22（libc++）。
 cmake -G Ninja -B build && cmake --build build
 
-# Stage 1：bake 构建自己。
-./build/bake build
+# Stage 1：普通构建会获取未缓存源码，并遵从有效 lock。
+./build/bake build -j 2
+
+# 固定依赖已缓存后，重复构建可要求该缓存存在。
+./build/bake build --offline --locked -j 2
 ```
 
-`out/<host-triple>/bin/bake` 就是自举产物——从这以后它只向系统要内核。
-跑一下 `bake audit`，它会验证构建确实是自包含的。
+`build/bake` 是永久保留的 Stage 0 引导 binary，只包含 `build`、`update`
+和直接使用工具链的 `cc` / `c++` / `ar`。完整的 Stage 1 binary 位于
+`out/<host-triple>/dev/bin/bake`；`run`、`test`、`compdb`、`lsp` 等完整命令
+都由它提供。对于编译和链接，除内核接口外不需要已安装的 SDK 或编译器。Git
+传输仍可能调用 `git` 解析 ref 或在 clone 兜底时使用它。跑一下 `bake audit`
+可验证构建确实自包含。
 
 交叉编译 bake 本体：`./bootstrap/build x86_64-linux-musl`——它会先用 bake
 自己的编译器为目标平台重建 LLVM。
@@ -143,6 +152,8 @@ bake update [dep]    重新解析锁定的 ref（唯一会移动它们的命令�
 bake clean           删除 out/
 bake cc / c++ / ar   直接使用内嵌工具链
 bake audit           验证工具链自包含性
+bake compdb          不构建项目产物，导出 compile_commands.json
+bake lsp             stdio 语言服务器（完整 Stage 1 binary）
 ```
 
 常用旗标：`-t <triple>`、`--release` / `--profile <name>`、`-p <member>`、

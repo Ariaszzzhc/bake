@@ -18,8 +18,9 @@ bake is three things welded into one executable:
   workspaces, a lockfile, and `--frozen` for CI.
 - **A compiler toolchain.** bake embeds LLVM, Clang, and LLD, and vendors
   libc++, compiler-rt, musl, MinGW-w64, and the glibc link surface. It
-  compiles and links in-process: no compiler subprocesses, no system
-  toolchain, ever.
+  keeps every compiler, assembler, archiver, and linker invocation in the
+  bake binary. Core may use Bake-owned child processes for scheduled work;
+  no external compiler toolchain is required after bootstrap.
 
 Why bother? Because in C and C++ the toolchain itself is ambient state —
 which clang you get depends on the machine, the package manager, and the
@@ -53,8 +54,8 @@ $ bake build -t x86_64-linux-musl
    Building hello v0.1.0
    Compiling hello v0.1.0
     Finished in 1.1s
-$ file out/x86_64-linux-musl/bin/hello
-out/x86_64-linux-musl/bin/hello: ELF 64-bit LSB executable, x86-64, ... statically linked
+$ file out/x86_64-linux-musl/dev/bin/hello
+out/x86_64-linux-musl/dev/bin/hello: ELF 64-bit LSB executable, x86-64, ... statically linked
 ```
 
 No toolchain files, no SDK, no `-DCMAKE_TOOLCHAIN_FILE`. The first build for
@@ -110,7 +111,8 @@ by default.
 Also on board: `import std;` and named modules on every target, asan/ubsan
 on native builds, LLD in-process for all three object formats, and
 `bake cc` / `bake c++` / `bake ar` if you want the embedded toolchain `zig
-cc`-style, directly.
+cc`-style, directly. These standalone toolchain commands do not need a
+`bake.toml` and do not create project build state.
 
 ## Getting bake
 
@@ -124,13 +126,21 @@ cd bake
 # Needs CMake >= 3.30, Ninja, Clang >= 22 with libc++.
 cmake -G Ninja -B build && cmake --build build
 
-# Stage 1: bake builds itself.
-./build/bake build
+# Stage 1: normal build fetches uncached sources and honors a valid lock.
+./build/bake build -j 2
+
+# Once pinned dependencies are cached, the repeat can require that cache.
+./build/bake build --offline --locked -j 2
 ```
 
-`out/<host-triple>/bin/bake` is the self-hosted binary — from here on it
-needs nothing from the system but the kernel. Verify with `bake audit`,
-which checks that builds really are self-contained.
+`build/bake` is the permanent Stage 0 bootstrap. It contains only `build`,
+`update`, and the direct `cc` / `c++` / `ar` toolchain commands. The full
+Stage 1 binary lands at `out/<host-triple>/dev/bin/bake`; use that binary for
+the complete command surface, including `run`, `test`, `compdb`, and `lsp`.
+For compilation and linking, it needs no installed SDK or compiler beyond the
+kernel interface. Git transport may still invoke `git` for ref resolution and
+clone fallback. Verify it with `bake audit`, which checks that builds really
+are self-contained.
 
 To cross-compile bake itself: `./bootstrap/build x86_64-linux-musl` — it
 rebuilds LLVM for the target with bake's own compiler first.
@@ -150,6 +160,8 @@ bake update [dep]    re-resolve locked refs (the only command that moves them)
 bake clean           remove out/
 bake cc / c++ / ar   the embedded toolchain, directly
 bake audit           verify toolchain self-containment
+bake compdb          export compile_commands.json without building artifacts
+bake lsp             language server over stdio (full Stage 1 binary)
 ```
 
 Useful flags: `-t <triple>`, `--release` / `--profile <name>`, `-p <member>`,

@@ -8,6 +8,7 @@ module;
     #define NOMINMAX
   #endif
 #else
+  #include <sys/file.h>
   #include <sys/wait.h>
   #include <unistd.h>
   #include <fcntl.h>
@@ -143,6 +144,58 @@ private:
     std::filesystem::path m_path;
 };
 
+export class FileLock {
+public:
+    explicit FileLock(const Path& path) {
+        std::error_code error;
+        std::filesystem::create_directories(path.parent().fs(), error);
+        if (error) return;
+#ifdef _WIN32
+        handle_ = CreateFileW(path.fs().wstring().c_str(),
+                              GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle_ == INVALID_HANDLE_VALUE) return;
+        OVERLAPPED overlapped{};
+        locked_ = LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0,
+                             MAXDWORD, MAXDWORD, &overlapped);
+#else
+        fd_ = open(path.string().c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (fd_ >= 0) locked_ = flock(fd_, LOCK_EX) == 0;
+#endif
+    }
+
+    FileLock(const FileLock&) = delete;
+    FileLock& operator=(const FileLock&) = delete;
+
+    ~FileLock() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            if (locked_) {
+                OVERLAPPED overlapped{};
+                UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &overlapped);
+            }
+            CloseHandle(handle_);
+        }
+#else
+        if (fd_ >= 0) {
+            if (locked_) flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+#endif
+    }
+
+    bool locked() const { return locked_; }
+
+private:
+    bool locked_ = false;
+#ifdef _WIN32
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+#else
+    int fd_ = -1;
+#endif
+};
+
 export inline std::string to_string(const Path& p) { return p.string(); }
 
 // ===== Cross-platform PATH search =====
@@ -195,9 +248,20 @@ export inline std::optional<Path> find_in_path(const std::string& name) {
 export inline std::optional<std::string> read_file(const Path& path) {
     std::ifstream f(path.fs(), std::ios::binary);
     if (!f) return std::nullopt;
-    std::stringstream ss;
-    ss << f.rdbuf();
-    return ss.str();
+    std::string content;
+    std::error_code size_error;
+    const auto size = std::filesystem::file_size(path.fs(), size_error);
+    if (!size_error && size <= content.max_size())
+        content.reserve(static_cast<std::size_t>(size));
+    std::array<char, 64 * 1024> buffer;
+    while (f) {
+        f.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = f.gcount();
+        if (count > 0)
+            content.append(buffer.data(), static_cast<std::size_t>(count));
+    }
+    if (!f.eof()) return std::nullopt;
+    return content;
 }
 
 export inline bool write_file(const Path& path, std::string_view content) {
@@ -311,15 +375,22 @@ public:
             0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
         };
 
-        std::vector<std::uint8_t> msg(data, data + len);
-        std::uint64_t bit_len = static_cast<std::uint64_t>(len) * 8;
-        msg.push_back(0x80);
-        while (msg.size() % 64 != 56) msg.push_back(0x00);
-        for (int i = 7; i >= 0; --i)
-            msg.push_back(static_cast<std::uint8_t>(bit_len >> (i * 8)));
+        const std::size_t complete = len - len % 64;
+        for (std::size_t offset = 0; offset < complete; offset += 64)
+            process_block(data + offset, state);
 
-        for (std::size_t offset = 0; offset < msg.size(); offset += 64)
-            process_block(msg.data() + offset, state);
+        std::array<std::uint8_t, 128> tail{};
+        const std::size_t remaining = len - complete;
+        if (remaining != 0)
+            std::copy_n(data + complete, remaining, tail.begin());
+        tail[remaining] = 0x80;
+        const std::size_t tail_size = remaining < 56 ? 64 : 128;
+        const std::uint64_t bit_len = static_cast<std::uint64_t>(len) * 8;
+        for (int i = 0; i < 8; ++i)
+            tail[tail_size - 1 - i] =
+                static_cast<std::uint8_t>(bit_len >> (i * 8));
+        for (std::size_t offset = 0; offset < tail_size; offset += 64)
+            process_block(tail.data() + offset, state);
 
         std::array<std::uint8_t, 32> result{};
         for (int i = 0; i < 8; ++i) {
@@ -535,54 +606,31 @@ export std::vector<Path> glob(const Path& base, std::string_view pattern);
 namespace detail {
 
 inline bool glob_match(std::string_view text, std::string_view pattern) {
-    std::size_t ti = 0, pi = 0;
-    std::size_t star_t = std::string_view::npos, star_p = std::string_view::npos;
-    while (ti < text.size() || pi < pattern.size()) {
-        if (pi < pattern.size()) {
-            if (pi + 1 < pattern.size() && pattern[pi] == '*' && pattern[pi + 1] == '*') {
-                pi += 2;
-                if (pi < pattern.size() && pattern[pi] == '/') pi++;
-                star_p = pi;
-                star_t = ti;
-                continue;
-            }
-            if (pattern[pi] == '*') {
-                star_p = pi;
-                star_t = ti;
-                pi++;
-                continue;
-            }
-            if (pi < pattern.size() && ti < text.size() &&
-                (pattern[pi] == '?' || pattern[pi] == text[ti])) {
-                if (pattern[pi] == '?' && text[ti] == '/') {
-                    // ? does not match /
-                } else {
-                    pi++;
-                    ti++;
-                    continue;
-                }
-            }
-        }
-        if (star_p != std::string_view::npos) {
-            pi = star_p + 1;
-            if (pi <= pattern.size() && pattern[star_p] == '*' &&
-                (star_p == 0 || pattern[star_p - 1] != '*')) {
-                if (star_t < text.size() && text[star_t] != '/') {
-                    star_t++;
-                    ti = star_t;
-                    continue;
-                }
-            } else {
-                if (star_t < text.size()) {
-                    star_t++;
-                    ti = star_t;
-                    continue;
-                }
-            }
-        }
+    // `**` matches any sequence including '/'; `*` any sequence except '/';
+    // `?` exactly one character except '/'.
+    if (pattern.empty()) return text.empty();
+
+    if (pattern.starts_with("**")) {
+        std::string_view rest = pattern.substr(2);
+        // "**/" may also match zero segments: "src/**/*.cpp" hits "src/x.cpp".
+        if (!rest.empty() && rest.front() == '/' && glob_match(text, rest.substr(1)))
+            return true;
+        for (std::size_t i = 0; i <= text.size(); ++i)
+            if (glob_match(text.substr(i), rest)) return true;
         return false;
     }
-    return true;
+    if (pattern.front() == '*') {
+        std::string_view rest = pattern.substr(1);
+        for (std::size_t i = 0;; ++i) {
+            if (glob_match(text.substr(i), rest)) return true;
+            if (i == text.size() || text[i] == '/') return false;
+        }
+    }
+    if (text.empty()) return false;
+    if (pattern.front() == '?')
+        return text.front() != '/' && glob_match(text.substr(1), pattern.substr(1));
+    if (text.front() != pattern.front()) return false;
+    return glob_match(text.substr(1), pattern.substr(1));
 }
 
 } // namespace detail

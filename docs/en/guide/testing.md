@@ -4,11 +4,11 @@ bake's test story is registry-based: a package registers named tests, each backe
 
 ## Registering tests
 
-Tests are declared in `build.cpp` (tier 2 or 3 — see [Build Scripts](build-scripts.md)). Each registration names a test and the binary that implements it:
+Tests are declared in `build.cpp` (tier 2 or 3 — see [Programmable Inputs](build-scripts.md)). Each registration names a test and the binary that implements it:
 
 ```cpp
 // build.cpp
-import bake;
+import bake.build;
 
 int main() {
     bake::Builder b;

@@ -55,10 +55,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     add_link_options(-stdlib=libc++)
 endif()
 
-# ---- bake (single executable: CLI + compiler + engine + package) ----
+# ---- permanent Stage0 bootstrap ----
 
 add_executable(bake
-    bake/src/main.cpp
+    bake/src/stage0/main.cpp
 )
 
 target_sources(bake
@@ -70,18 +70,25 @@ target_sources(bake
             bake/src/net.cppm
             bake/src/archive.cppm
             bake/src/util.cppm
-            bake/src/buildsystem/project.cppm
-            bake/src/buildsystem/moid.cppm
-            bake/src/buildsystem/graph.cppm
+            bake/src/util/filetable.cppm
+            bake/src/util/cachestore.cppm
             bake/src/toolchain/lld.cppm
             bake/src/toolchain/target.cppm
-            bake/src/buildsystem/cmdgen.cppm
             bake/src/toolchain/runtime.cppm
             bake/src/toolchain/cc1.cppm
             bake/src/toolchain/cc1as.cppm
             bake/src/toolchain/driver.cppm
-            bake/src/buildsystem/engine.cppm
-            bake/src/buildsystem/package.cppm
+            bake/src/stage0/bootstrap/project.cppm
+            bake/src/stage0/bootstrap/semver.cppm
+            bake/src/stage0/bootstrap/moid.cppm
+            bake/src/stage0/bootstrap/graph.cppm
+            bake/src/stage0/bootstrap/sched.cppm
+            bake/src/stage0/bootstrap/cmdgen.cppm
+            bake/src/stage0/bootstrap/engine.cppm
+            bake/src/stage0/bootstrap/package.cppm
+            bake/src/stage0/bootstrap/cli.cppm
+            bake/src/stage0/bootstrap/build.cppm
+            bake/src/stage0/bootstrap/update.cppm
 )
 
 # stage0 implementation units of bake.json / bake.toml / bake.net /
@@ -181,20 +188,19 @@ install(FILES
 
 enable_testing()
 
-# C++ test runner — spawns the bake binary on real project fixtures.
+# The full fixture runner is built here for the Stage1 test script. It is not
+# registered as Stage0 coverage because most cases exercise product commands.
 add_executable(test_runner tests/test_runner.cpp)
 target_compile_features(test_runner PRIVATE cxx_std_17)
 target_compile_definitions(test_runner PRIVATE
     BAKE_SRC_DIR="${CMAKE_SOURCE_DIR}"
 )
 
-add_executable(graph_test tests/graph_test.cpp)
+add_executable(graph_test tests/bootstrap/graph_test.cpp)
 target_compile_features(graph_test PRIVATE cxx_std_23)
 set_target_properties(graph_test PROPERTIES CXX_MODULE_STD ON)
 
-# graph_test imports bake.graph + bake.moid (and their transitive deps).
-# Provide these as module sources directly — they are pure data structures
-# with no LLVM linkage, so no static libs needed.
+# The CMake parser and graph contracts exercise bootstrap implementations.
 target_sources(graph_test
     PUBLIC
         FILE_SET CXX_MODULES
@@ -203,9 +209,10 @@ target_sources(graph_test
             bake/src/toml.cppm
             bake/src/util.cppm
             bake/src/toolchain/target.cppm
-            bake/src/buildsystem/project.cppm
-            bake/src/buildsystem/moid.cppm
-            bake/src/buildsystem/graph.cppm
+            bake/src/stage0/bootstrap/project.cppm
+            bake/src/stage0/bootstrap/semver.cppm
+            bake/src/stage0/bootstrap/moid.cppm
+            bake/src/stage0/bootstrap/graph.cppm
 )
 
 target_sources(graph_test PRIVATE
@@ -228,15 +235,34 @@ target_sources(parser_test PRIVATE
     bake/src/stage0/toml.cpp
 )
 
-add_test(NAME parser_test COMMAND parser_test)
-
+add_test(NAME stage0_parser_contract COMMAND parser_test)
+add_test(NAME stage0_graph_contract COMMAND graph_test)
+add_executable(util_test tests/util_test.cpp)
+target_compile_features(util_test PRIVATE cxx_std_23)
+set_target_properties(util_test PROPERTIES CXX_MODULE_STD ON)
+target_sources(util_test
+    PUBLIC
+        FILE_SET CXX_MODULES
+        FILES bake/src/util.cppm
+)
+add_test(NAME util_contract COMMAND util_test)
 add_test(
-    NAME bake_test_suite
-    COMMAND test_runner $<TARGET_FILE:bake>
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    NAME stage0_bootstrap_smoke
+    COMMAND ${CMAKE_COMMAND}
+        -DBAKE_BINARY=$<TARGET_FILE:bake>
+        -DSMOKE_DIR=${CMAKE_CURRENT_BINARY_DIR}/stage0-smoke
+        -P ${CMAKE_SOURCE_DIR}/tests/bootstrap/stage0-smoke.cmake
 )
-set_tests_properties(bake_test_suite PROPERTIES
-    ENVIRONMENT "CXX=${CMAKE_CXX_COMPILER}"
+add_test(
+    NAME stage0_rejects_lsp
+    COMMAND ${CMAKE_COMMAND}
+        -DBAKE_BINARY=$<TARGET_FILE:bake>
+        -P ${CMAKE_SOURCE_DIR}/tests/bootstrap/stage0-reject.cmake
 )
-
-add_test(NAME graph_test COMMAND graph_test)
+set_tests_properties(
+    stage0_parser_contract
+    stage0_graph_contract
+    stage0_bootstrap_smoke
+    stage0_rejects_lsp
+    PROPERTIES LABELS stage0
+)

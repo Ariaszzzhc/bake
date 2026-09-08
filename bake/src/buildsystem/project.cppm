@@ -63,6 +63,7 @@ export struct Dependency {
     std::string tag;      // git ref: tag    (at most one ref key; none = default branch)
     std::string branch;   // git ref: branch
     std::string rev;      // git ref: commit
+    std::string version;  // semver requirement; resolver picks the tag
     std::string path;     // relative path (for path deps)
     bool is_path_dep = false;
     std::vector<std::string> features;  // features to activate on the target
@@ -364,11 +365,15 @@ export struct Manifest {
             if (auto v = (*t)["tag"].value<std::string>())    d.tag = *v;
             if (auto v = (*t)["branch"].value<std::string>()) d.branch = *v;
             if (auto v = (*t)["rev"].value<std::string>())    d.rev = *v;
+            // Semver requirement; the resolver picks the highest
+            // satisfying tag and records the choice in the lock.
+            if (auto v = (*t)["version"].value<std::string>())
+                d.version = *v;
             if (auto v = (*t)["path"].value<std::string>()) {
                 d.path = *v;
                 d.is_path_dep = true;
             }
-            if (auto* legacy = (*t)["options"].as_array()) {
+            if ((*t)["options"].as_array()) {
                 std::println(std::cerr,
                     "bake: dependency '{}' uses 'options', which was "
                     "replaced by 'features' in {}",
@@ -386,10 +391,11 @@ export struct Manifest {
 
             if (d.is_path_dep) {
                 if (d.path.empty() || !d.url.empty() ||
-                    !d.tag.empty() || !d.branch.empty() || !d.rev.empty()) {
+                    !d.tag.empty() || !d.branch.empty() || !d.rev.empty() ||
+                    !d.version.empty()) {
                     std::println(std::cerr,
                         "bake: path dependency '{}' must not mix "
-                        "url/tag/branch/rev in {}",
+                        "url/tag/branch/rev/version in {}",
                         name, toml_path.string());
                     return std::nullopt;
                 }
@@ -404,17 +410,17 @@ export struct Manifest {
             }
 
             const int ref_count = (!d.tag.empty()) + (!d.branch.empty()) +
-                                  (!d.rev.empty());
+                                  (!d.rev.empty()) + (!d.version.empty());
             if (ref_count > 1) {
                 std::println(std::cerr,
                     "bake: dependency '{}' in {} uses more than one of "
- "tag/branch/rev", name, toml_path.string());
+ "tag/branch/rev/version", name, toml_path.string());
                 return std::nullopt;
             }
             if (is_archive_url(d.url) && ref_count > 0) {
                 std::println(std::cerr,
                     "bake: archive dependency '{}' in {} must not use "
-                    "tag/branch/rev (the URL pins the content)",
+                    "tag/branch/rev/version (the URL pins the content)",
                     name, toml_path.string());
                 return std::nullopt;
             }
@@ -483,8 +489,7 @@ export struct Manifest {
 
         // [options] was replaced by [features] — fail loudly instead of
         // silently ignoring stale manifests.
-        if (auto* legacy = tbl["options"].as_table()) {
-            (void)legacy;
+        if (tbl["options"].as_table()) {
             std::println(std::cerr,
                 "bake: [options] was replaced by [features] in {}",
                 toml_path.string());
@@ -671,7 +676,7 @@ namespace {
 
 bool same_definition(const Dependency& a, const Dependency& b) {
     return a.url == b.url && a.tag == b.tag && a.branch == b.branch &&
-           a.rev == b.rev && a.path == b.path &&
+           a.rev == b.rev && a.version == b.version && a.path == b.path &&
            a.default_features == b.default_features &&
            a.features == b.features;
 }
