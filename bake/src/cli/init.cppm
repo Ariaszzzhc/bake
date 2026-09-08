@@ -4,18 +4,9 @@ export module bake.cli.init;
 
 import std;
 import bake.util;
-import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
-import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
 import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
+import bake.buildsystem.plan;
+import bake.buildsystem.project;
 import bake.cli;
 
 namespace bake::cli {
@@ -163,9 +154,5 @@ export int cmd_init(const ParsedArgs &args) {
 
   return 0;
 }
-
-// (source_index_from_lock lives in bake.buildsystem.query — the
-// lockfile→SourceIndex bridge shared by build, run, test, compdb, lsp.)
-
 
 } // namespace bake::cli

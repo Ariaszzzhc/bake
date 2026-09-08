@@ -11,6 +11,7 @@ module;
 #include <lld/Common/CommonLinkerContext.h>
 #include <lld/Common/Driver.h>
 #include <llvm/Object/ArchiveWriter.h>
+#include <llvm/Support/Path.h>
 #include <llvm/Support/raw_ostream.h>
 
 // LLD driver entry points must be declared in the global module fragment
@@ -89,6 +90,7 @@ export int bake_ar_write(const char *archive_name,
             llvm::consumeError(std::move(err));
             return 1;
         }
+        m->MemberName = llvm::sys::path::filename(m->MemberName);
         new_members.push_back(std::move(*m));
     }
 

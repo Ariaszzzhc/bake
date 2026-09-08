@@ -452,10 +452,8 @@ static void bakeExecuteJob(const Command *Cmd, const llvm::Triple &Triple,
         bake::prepare_runtime(target, needs_cxx_runtime, link_mode);
 
     bool is_shared_lib = false;
-    bool has_no_pie = false;
     for (auto& A : user_args) {
       if (A == "-shared" || A == "-Bshareable") is_shared_lib = true;
-      if (A == "-no-pie") has_no_pie = true;
     }
 
     std::vector<std::string> Prefix;  // before user args
@@ -1166,12 +1164,10 @@ static int clang_main(int Argc, const char **Argv,
   // "x86_64-linux-gnu.2.31") is kept for the link interception — LLVM's
   // normalized Triple cannot carry the version.
   std::string target_triple;
-  bool has_explicit_target = false;
   for (size_t i = 0; i + 1 < Args.size(); ++i) {
     if (StringRef(Args[i]) == "-target") {
       StringRef Spec(Args[i + 1]);
       g_explicit_target = bake::parse_target(Spec.str());
-      has_explicit_target = true;
       // Strip the version suffix before the driver parses the triple —
       // ".2.31" (glibc) and ".12" (darwin) are not valid LLVM environment
       // or OS components.

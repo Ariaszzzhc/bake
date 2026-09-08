@@ -5,12 +5,8 @@ import std;
 // ============================================================
 // bake.lsp — LSP server entry (stage-split interface)
 //
-// The language server itself is stage1-only: it rides on the
-// kotatsu async runtime and the bake.toolchain.compilation /
-// bake.buildsystem.query seams, none of which the CMake
-// bootstrap carries. Stage0 provides a stub implementation that
-// explains this; the self-hosted build compiles the real server
-// (src/lsp/lsp_core.cpp).
+// The language server itself is stage1-only. Stage0 provides the
+// bootstrap command surface, while Stage1 adapts LSP messages to Core.
 // ============================================================
 
 namespace bake {

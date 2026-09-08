@@ -1,14 +1,17 @@
-export module bake.lsp.proto;
+export module bake.core.analysis.proto;
 
 import std;
+import bake.core.occurrences;
 import bake.json;
+import bake.toolchain.compilation;
 
 // ============================================================
-// bake.lsp.proto — master ↔ worker wire protocol
+// bake.core.analysis.proto — Core frontend worker protocol
 //
-// The language server master owns the editor-facing protocol and
-// the symbol index; every Clang frontend run happens in a worker
-// process (`bake lsp-worker`). Both sides speak this protocol:
+// The language server owns the editor-facing protocol. Core owns
+// the symbol index and worker runtime; every Clang frontend run
+// happens in a worker process (`bake lsp-worker`). Both sides
+// speak this protocol:
 // length-prefixed JSON frames over the worker's stdin/stdout
 // pipes — 4-byte big-endian payload length, then the payload.
 //
@@ -16,12 +19,9 @@ import bake.json;
 // responses to requests by id; there is no worker-side
 // concurrency and therefore no interleaving.
 //
-// The payload types are deliberately self-contained (no
-// bake.toolchain imports): the codec stays testable and the
-// master never needs the compilation module to talk protocol.
 // ============================================================
 
-namespace bake::lsp_proto {
+namespace bake::analysis_proto {
 
 // ── wire types ──────────────────────────────────────────────
 
@@ -38,19 +38,6 @@ export struct WireCompletion {
     std::string detail;
     std::string kind;
     int priority = 0;
-};
-
-export struct WireOccurrence {
-    std::string usr;
-    std::string name;
-    std::string kind;
-    unsigned flags = 0;  // 1 decl | 2 def | 4 ref | 8 call
-    std::string file;
-    unsigned line = 1;
-    unsigned column = 1;
-    std::string decl_file;
-    unsigned decl_line = 0;
-    unsigned decl_column = 0;
 };
 
 export struct WirePchLoad {
@@ -90,7 +77,7 @@ export struct WireResponse {
     // results
     std::vector<WireDiagnostic> diagnostics;
     std::vector<WireCompletion> items;
-    std::vector<WireOccurrence> occurrences;
+    std::vector<SymbolOccurrence> occurrences;
 };
 
 // ── framing ─────────────────────────────────────────────────
@@ -106,28 +93,6 @@ export std::string encode_frame(std::string_view payload) {
     frame[3] = static_cast<char>(len & 0xff);
     frame.append(payload);
     return frame;
-}
-
-// Extract one complete frame from the front of `buffer` (data
-// accumulated so far). Returns nullopt while more bytes are
-// needed; on success the frame's payload is removed from the
-// buffer and returned. A length prefix that cannot ever arrive
-// (larger than any legal message) reports an error string.
-export std::expected<std::string, std::string> take_frame(
-        std::string& buffer) {
-    if (buffer.size() < 4) return std::unexpected("need more data");
-    std::uint32_t len = (static_cast<unsigned char>(buffer[0]) << 24) |
-                        (static_cast<unsigned char>(buffer[1]) << 16) |
-                        (static_cast<unsigned char>(buffer[2]) << 8) |
-                        static_cast<unsigned char>(buffer[3]);
-    // Responses for the largest TUs stay well under this; a bogus
-    // prefix means the stream desynchronized and must be torn down.
-    if (len > 512u * 1024 * 1024)
-        return std::unexpected("frame length prefix out of range");
-    if (buffer.size() - 4 < len) return std::unexpected("need more data");
-    std::string payload = buffer.substr(4, len);
-    buffer.erase(0, 4 + static_cast<std::size_t>(len));
-    return payload;
 }
 
 // ── codec ───────────────────────────────────────────────────
@@ -181,50 +146,11 @@ WireCompletion completion_from_json(const json::Value& v) {
     return c;
 }
 
-json::Value to_json(const WireOccurrence& o) {
-    json::Value v = json::Value::object();
-    v["usr"] = o.usr;
-    v["name"] = o.name;
-    v["kind"] = o.kind;
-    v["flags"] = std::int64_t(o.flags);
-    v["file"] = o.file;
-    v["line"] = std::int64_t(o.line);
-    v["col"] = std::int64_t(o.column);
-    v["dfile"] = o.decl_file;
-    v["dline"] = std::int64_t(o.decl_line);
-    v["dcol"] = std::int64_t(o.decl_column);
-    return v;
-}
-
-WireOccurrence occurrence_from_json(const json::Value& v) {
-    WireOccurrence o;
-    if (const json::Value* f = v.find("usr"))
-        o.usr = f->get<std::string>();
-    if (const json::Value* f = v.find("name"))
-        o.name = f->get<std::string>();
-    if (const json::Value* f = v.find("kind"))
-        o.kind = f->get<std::string>();
-    if (const json::Value* f = v.find("flags"))
-        o.flags = static_cast<unsigned>(f->get<std::int64_t>());
-    if (const json::Value* f = v.find("file"))
-        o.file = f->get<std::string>();
-    if (const json::Value* f = v.find("line"))
-        o.line = static_cast<unsigned>(f->get<std::int64_t>());
-    if (const json::Value* f = v.find("col"))
-        o.column = static_cast<unsigned>(f->get<std::int64_t>());
-    if (const json::Value* f = v.find("dfile"))
-        o.decl_file = f->get<std::string>();
-    if (const json::Value* f = v.find("dline"))
-        o.decl_line = static_cast<unsigned>(f->get<std::int64_t>());
-    if (const json::Value* f = v.find("dcol"))
-        o.decl_column = static_cast<unsigned>(f->get<std::int64_t>());
-    return o;
-}
-
 }  // namespace
 
 export std::string encode_request(const WireRequest& req) {
     json::Value root = json::Value::object();
+    root["schema"] = "bake-analysis-wire-v2";
     root["id"] = std::int64_t(req.id);
     root["op"] = req.op;
     json::Value argv = json::Value::array();
@@ -250,7 +176,7 @@ export std::string encode_request(const WireRequest& req) {
         pch["limit"] = std::int64_t(req.pch.region_limit);
         root["pch"] = std::move(pch);
     }
-    return encode_frame(root.dump());
+    return root.dump();
 }
 
 export std::expected<WireRequest, std::string> decode_request(
@@ -258,6 +184,10 @@ export std::expected<WireRequest, std::string> decode_request(
     try {
         json::Value root = json::Value::parse(payload);
         WireRequest req;
+        const json::Value* schema = root.find("schema");
+        if (!schema || !schema->is_string() ||
+            schema->get<std::string>() != "bake-analysis-wire-v2")
+            return std::unexpected("request wire identity mismatch");
         if (const json::Value* f = root.find("id"))
             req.id = static_cast<std::uint64_t>(f->get<std::int64_t>());
         if (const json::Value* f = root.find("op"))
@@ -307,6 +237,7 @@ export std::expected<WireRequest, std::string> decode_request(
 
 export std::string encode_response(const WireResponse& resp) {
     json::Value root = json::Value::object();
+    root["schema"] = "bake-analysis-wire-v2";
     root["id"] = std::int64_t(resp.id);
     root["ok"] = resp.ok;
     if (!resp.ok) {
@@ -330,10 +261,13 @@ export std::string encode_response(const WireResponse& resp) {
         root["items"] = std::move(arr);
     }
     if (!resp.occurrences.empty()) {
-        json::Value arr = json::Value::array();
-        for (const auto& o : resp.occurrences)
-            arr.push_back(to_json(o));
-        root["occs"] = std::move(arr);
+        auto batch = encode_occurrence_batch(resp.occurrences);
+        if (!batch) {
+            root["ok"] = false;
+            root["error"] = batch.error().message;
+            return encode_frame(root.dump());
+        }
+        root["occs"] = std::move(*batch);
     }
     return encode_frame(root.dump());
 }
@@ -343,6 +277,10 @@ export std::expected<WireResponse, std::string> decode_response(
     try {
         json::Value root = json::Value::parse(payload);
         WireResponse resp;
+        const json::Value* schema = root.find("schema");
+        if (!schema || !schema->is_string() ||
+            schema->get<std::string>() != "bake-analysis-wire-v2")
+            return std::unexpected("response wire identity mismatch");
         if (const json::Value* f = root.find("id"))
             resp.id = static_cast<std::uint64_t>(f->get<std::int64_t>());
         if (const json::Value* f = root.find("ok"))
@@ -373,8 +311,10 @@ export std::expected<WireResponse, std::string> decode_response(
                 resp.items.push_back(completion_from_json((*f)[i]));
         }
         if (const json::Value* f = root.find("occs")) {
-            for (std::size_t i = 0; i < f->size(); ++i)
-                resp.occurrences.push_back(occurrence_from_json((*f)[i]));
+            auto occurrences = decode_occurrence_batch(*f);
+            if (!occurrences)
+                return std::unexpected(occurrences.error().message);
+            resp.occurrences = std::move(*occurrences);
         }
         return resp;
     } catch (const json::Error& e) {
@@ -383,4 +323,4 @@ export std::expected<WireResponse, std::string> decode_response(
     }
 }
 
-}  // namespace bake::lsp_proto
+}  // namespace bake::analysis_proto

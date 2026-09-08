@@ -4,23 +4,12 @@ export module bake.cli.clean;
 
 import std;
 import bake.util;
-import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
 import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
-import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
 import bake.cli;
 
 namespace bake::cli {
 
-export int cmd_clean(const ParsedArgs &args) {
+export int cmd_clean(const ParsedArgs &) {
   auto root = find_project_root();
   if (!root) {
     std::println(std::cerr, "bake: no bake.toml found");

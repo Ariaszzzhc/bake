@@ -6,6 +6,7 @@ import bake.net;
 import bake.archive;
 import bake.buildsystem.project;
 import bake.buildsystem.semver;
+import bake.buildsystem.graph;
 import bake.json;
 namespace json = bake::json;
 
@@ -14,6 +15,18 @@ namespace json = bake::json;
 // ============================================================
 
 namespace bake {
+
+std::string cache_nonce() {
+    std::random_device random;
+    std::uniform_int_distribution<unsigned> distribution(0, 0xff);
+    std::string result;
+    for (int index = 0; index < 12; ++index) {
+        char byte[3];
+        std::snprintf(byte, sizeof(byte), "%02x", distribution(random));
+        result += byte;
+    }
+    return result;
+}
 
 // ===== Lockfile (JSON, flat identity-keyed entries) =====
 //
@@ -253,6 +266,32 @@ export Path get_cache_dir() {
 #endif
 }
 
+// Convert the resolved lock identities into the source lookup consumed by
+// graph resolution. Path dependencies remain manifest-owned and are therefore
+// absent from this index.
+export SourceIndex source_index_from_lock(const Path& root) {
+    SourceIndex index;
+    auto lockfile = Lockfile::load(root / "bake.lock");
+    if (!lockfile) return index;
+
+    const Path cache_dir = get_cache_dir();
+    for (const auto& [key, dep] : lockfile->deps) {
+        (void)key;
+        if (!dep.is_remote()) continue;
+
+        LockedSource source;
+        source.url = normalize_dependency_url(dep.url);
+        source.ref = dep.is_archive() ? "" : dep.ref;
+        source.ref_type = dep.is_archive() ? "archive" : dep.ref_type;
+        source.commit = dep.commit;
+        source.integrity = dep.integrity;
+        source.cache_hash = dep.cache_hash();
+        source.cache_dir = cache_dir / source.cache_hash;
+        index.entries.push_back(std::move(source));
+    }
+    return index;
+}
+
 // ===== Resolver configuration =====
 
 export struct ResolverConfig {
@@ -313,6 +352,10 @@ private:
     // Compute tree SHA-256 (normalized hash of all files in directory)
     std::string compute_tree_hash(const Path& dir);
 
+    // Publish a verified source tree, replacing stale bytes at the same
+    // content-addressed destination when necessary.
+    bool install_cached_sources(Path extracted, const std::string& tree_hash);
+
     // Obtain a remote dependency's source tree in a fresh work directory
     // under the cache. Archives download verbatim; git deps try the host's
     // tarball endpoint (GitHub/GitLab style) first and fall back to a full
@@ -328,15 +371,14 @@ private:
                          const Path& dest_dir);
 };
 
-// Tree hash of a source directory, used by the CLI layer's cache
-// verification. (engine intentionally never imports this module — the
-// build side consumes remote sources through the SourceIndex injected by
-// the composition root, never through the package domain.)
+// Tree hash of a source directory, used by package cache verification and
+// lockfile source identity.
 export inline std::string compute_tree_sha256(const Path& dir) {
     std::vector<std::pair<std::string, std::string>> entries;
 
     for (auto& entry : std::filesystem::recursive_directory_iterator(dir.fs())) {
-        // Skip bake-internal sentinel files — they are not part of the source.
+        // Skip legacy bake verification metadata — it is not source identity
+        // and is never trusted as proof of the current tree contents.
         if (entry.path().filename() == ".bake-verified") continue;
 
         // Use lexically_relative instead of filesystem::relative.
@@ -420,10 +462,6 @@ inline std::string repo_name_from_url(const std::string& url) {
 // Verify that cached source for every remote lock entry matches its integrity.
 // Detects tampering with cached dependencies. Called by the CLI layer.
 // Silent on cache miss (caller handles messaging); prints only on tamper.
-//
-// A `.bake-verified` sentinel is written inside each cache dir after a
-// successful full-tree verification. Subsequent calls compare the sentinel
-// to the expected hash and skip the expensive tree walk when they match.
 export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache_dir) {
     for (auto& [key, dep] : lockfile.deps) {
         if (!dep.is_remote()) continue;
@@ -433,15 +471,6 @@ export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache
         Path cache_path = cache_dir / hash;
         if (!cache_path.is_directory()) return false;
 
-        // Fast path: sentinel exists and matches expected hash.
-        Path sentinel = cache_path / ".bake-verified";
-        if (sentinel.is_regular_file()) {
-            if (auto content = read_file(sentinel)) {
-                if (*content == hash) continue;
-            }
-        }
-
-        // Slow path: full tree SHA-256.
         std::string actual_hash = compute_tree_sha256(cache_path);
         if (actual_hash != hash) {
             std::println(std::cerr,
@@ -451,7 +480,6 @@ export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache
             return false;
         }
 
-        write_file(sentinel, hash);
     }
     return true;
 }
@@ -569,15 +597,7 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
     // by both transports (stage0: tar/unzip, stage1: libarchive).
 
     // Create a uniquely-named temp directory for extraction.
-    std::random_device rd;
-    std::uniform_int_distribution<unsigned> dist(0, 0xFFFFFF);
-    std::string suffix;
-    for (int i = 0; i < 6; ++i) {
-        char hex[4];
-        std::snprintf(hex, sizeof(hex), "%02x", dist(rd) & 0xFF);
-        suffix += hex;
-    }
-    Path tmp_dir = cache_dir_ / (".extract-" + suffix);
+    Path tmp_dir = cache_dir_ / (".extract-" + cache_nonce());
     tmp_dir.remove_all();
     tmp_dir.mkdir_recursive();
 
@@ -613,6 +633,57 @@ inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir)
 
 inline std::string Resolver::compute_tree_hash(const Path& dir) {
     return compute_tree_sha256(dir);
+}
+
+inline bool Resolver::install_cached_sources(Path extracted,
+                                             const std::string& tree_hash) {
+    Path final_dir = cache_dir_ / tree_hash;
+    final_dir.parent().mkdir_recursive();
+    FileLock lock(cache_dir_ / ".locks" / (tree_hash + ".lock"));
+    if (!lock.locked()) {
+        std::println(std::cerr,
+                     "bake: failed to lock package cache entry {}",
+                     tree_hash.substr(0, 12));
+        return false;
+    }
+    if (final_dir.is_directory() && compute_tree_hash(final_dir) == tree_hash) {
+        extracted.remove_all();
+        return true;
+    }
+
+    Path displaced(cache_dir_.fs() /
+                   (".replaced-" + tree_hash.substr(0, 12) + "-" +
+                    cache_nonce()));
+    std::error_code error;
+    if (final_dir.exists()) {
+        std::filesystem::rename(final_dir.fs(), displaced.fs(), error);
+        if (error) {
+            std::println(std::cerr,
+                         "bake: failed to replace package cache entry {}: {}",
+                         tree_hash.substr(0, 12), error.message());
+            return false;
+        }
+    }
+
+    std::filesystem::rename(extracted.fs(), final_dir.fs(), error);
+    if (error) {
+        std::error_code rollback_error;
+        if (displaced.exists())
+            std::filesystem::rename(displaced.fs(), final_dir.fs(),
+                                    rollback_error);
+        if (rollback_error) {
+            std::println(std::cerr,
+                         "bake: prior package cache entry retained at '{}'; "
+                         "rollback failed: {}",
+                         displaced.string(), rollback_error.message());
+        }
+        std::println(std::cerr,
+                     "bake: failed to publish package cache entry {}: {}",
+                     tree_hash.substr(0, 12), error.message());
+        return false;
+    }
+    if (displaced.exists()) displaced.remove_all();
+    return true;
 }
 
 inline bool Resolver::fetch_via_clone(const std::string& url,
@@ -661,7 +732,7 @@ inline std::optional<Path> Resolver::fetch_sources(const std::string& url,
                  is_archive ? url.substr(url.find_last_of('/') + 1)
                             : repo_name_from_url(url));
 
-    Path download_dir = cache_dir_ / ".downloads";
+    Path download_dir = cache_dir_ / (".download-" + cache_nonce());
     std::string download_url = url;
     std::string file_name = SHA256::hex(url).substr(0, 24) +
                             archive_extension(url);
@@ -672,18 +743,22 @@ inline std::optional<Path> Resolver::fetch_sources(const std::string& url,
 
     if (auto archive = download_archive(download_url, file_name, download_dir)) {
         std::string transport_hash = file_hash(*archive);
-        Path extracted = cache_dir_ / (".work-" + transport_hash.substr(0, 12));
+        Path extracted = cache_dir_ / (".work-" +
+                                       transport_hash.substr(0, 12) + "-" +
+                                       cache_nonce());
         bool ok = extract_archive(*archive, extracted);
-        archive->remove();
+        download_dir.remove_all();
         if (ok) return extracted;
     }
+    download_dir.remove_all();
 
     // Archives have no clone transport. Git deps fall back to a full clone
     // when the host exposes no tarball endpoint.
     if (is_archive) return std::nullopt;
 
     std::println("  No tarball endpoint for {}; cloning", repo_name_from_url(url));
-    Path clone_dir = cache_dir_ / (".clone-" + commit.substr(0, 12));
+    Path clone_dir = cache_dir_ / (".clone-" + commit.substr(0, 12) + "-" +
+                                   cache_nonce());
     if (!fetch_via_clone(url, commit, clone_dir)) return std::nullopt;
     return clone_dir;
 }
@@ -729,15 +804,13 @@ inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep
 
     std::string tree_hash = compute_tree_hash(*extracted);
 
-    Path final_dir = cache_dir_ / tree_hash;
-    if (!final_dir.exists()) {
-        final_dir.parent().mkdir_recursive();
-        std::filesystem::rename(extracted->fs(), final_dir.fs());
-    } else {
+    if (!install_cached_sources(*extracted, tree_hash)) {
         extracted->remove_all();
+        return std::nullopt;
     }
 
     // Native sources carry their moid name as the lock annotation.
+    Path final_dir = cache_dir_ / tree_hash;
     std::string name;
     if (auto native = Manifest::load_moid(final_dir))
         name = native->moid->name;
@@ -761,7 +834,8 @@ inline bool Resolver::ensure_cached(const LockDep& dep) {
     if (hash.empty()) return true;
 
     Path cached = cache_dir_ / hash;
-    if (cached.is_directory()) return true;  // already cached
+    if (cached.is_directory() && compute_tree_hash(cached) == hash)
+        return true;
 
     // A git entry without a resolved commit cannot be fetched by
     // identity; the next resolve re-locks it.
@@ -786,10 +860,10 @@ inline bool Resolver::ensure_cached(const LockDep& dep) {
         return false;
     }
 
-    // Move to final cache location
-    Path final_dir = cache_dir_ / tree_hash;
-    final_dir.parent().mkdir_recursive();
-    std::filesystem::rename(extracted->fs(), final_dir.fs());
+    if (!install_cached_sources(*extracted, tree_hash)) {
+        extracted->remove_all();
+        return false;
+    }
     return true;
 }
 

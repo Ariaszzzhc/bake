@@ -1,0 +1,14 @@
+[package]
+name = "bake-stage1-contracts"
+version = "0.1.0"
+type = "lib"
+
+[language]
+cxx = "c++23"
+
+[dependencies]
+json = { url = "https://github.com/bake-pkgs/json", tag = "v3.12.2" }
+tomlplusplus = { url = "https://github.com/bake-pkgs/tomlplusplus", tag = "v3.4.3" }
+curl = { url = "https://github.com/bake-pkgs/curl", tag = "v8.17.0-r1" }
+libarchive = { url = "https://github.com/bake-pkgs/libarchive", tag = "v3.8.9-r1" }
+kotatsu = { url = "https://github.com/bake-pkgs/kotatsu", features = ["async", "deco", "json"] }

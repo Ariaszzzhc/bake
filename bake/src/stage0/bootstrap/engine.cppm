@@ -12,15 +12,15 @@ module;
 #include <unistd.h>
 #endif
 
-export module bake.buildsystem.engine;
+export module bake.stage0.engine;
 
 import std;
 import bake.util;
-import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
-import bake.buildsystem.cmdgen;
-import bake.buildsystem.sched;
+import bake.stage0.project;
+import bake.stage0.moid;
+import bake.stage0.graph;
+import bake.stage0.cmdgen;
+import bake.stage0.sched;
 import bake.toolchain.target;
 import bake.toolchain.runtime;
 import bake.json;
@@ -28,7 +28,7 @@ namespace json = bake::json;
 
 
 // ============================================================
-// bake.buildsystem.engine — MoidDeclaration, unified DAG, executor
+// bake.stage0.engine — MoidDeclaration, unified DAG, executor
 //
 // Two-phase architecture:
 //   Configure: resolve inputs + merge bake.toml config → MoidDeclaration JSON
@@ -418,74 +418,6 @@ export std::optional<ModuleInfo> scan_module_file(const Path& source) {
     return info;
 }
 
-// ===== Module topological sort =====
-
-// Compute the full transitive closure of module imports.
-export std::vector<std::string> module_import_closure(
-        const std::vector<std::string>& roots,
-        const std::map<std::string, std::vector<std::string>>& imports) {
-    std::set<std::string> visited;
-    std::vector<std::string> queue(roots.begin(), roots.end());
-    while (!queue.empty()) {
-        std::string mod = std::move(queue.back());
-        queue.pop_back();
-        if (!visited.insert(mod).second) continue;
-        auto it = imports.find(mod);
-        if (it != imports.end()) {
-            for (const auto& imp : it->second) {
-                if (!visited.count(imp)) queue.push_back(imp);
-            }
-        }
-    }
-    return std::vector<std::string>(visited.begin(), visited.end());
-}
-
-// Topological sort of module interfaces using Kahn's algorithm.
-// Returns module names in dependency order.
-inline std::vector<std::string> topo_sort_modules(
-        const std::map<std::string, ModuleInfo>& modules) {
-    std::map<std::string, int> in_degree;
-    std::map<std::string, std::vector<std::string>> adj;
-
-    for (auto& [name, info] : modules)
-        in_degree[name] = 0;
-
-    for (auto& [name, info] : modules) {
-        for (auto& imp : info.imports) {
-            if (modules.count(imp)) {
-                adj[imp].push_back(name);
-                in_degree[name]++;
-            }
-        }
-    }
-
-    std::vector<std::string> queue;
-    for (auto& [name, deg] : in_degree)
-        if (deg == 0) queue.push_back(name);
-    std::sort(queue.begin(), queue.end());
-
-    std::vector<std::string> sorted;
-    while (!queue.empty()) {
-        std::string node = queue.front();
-        queue.erase(queue.begin());
-        sorted.push_back(node);
-
-        for (auto& dependent : adj[node]) {
-            if (--in_degree[dependent] == 0)
-                queue.push_back(dependent);
-        }
-        std::sort(queue.begin(), queue.end());
-    }
-
-    if (sorted.size() != modules.size()) {
-        for (auto& [name, info] : modules)
-            if (std::find(sorted.begin(), sorted.end(), name) == sorted.end())
-                sorted.push_back(name);
-    }
-
-    return sorted;
-}
-
 // ===== Build action =====
 
 export struct BuildAction {
@@ -822,10 +754,6 @@ Path find_bake_build_source() {
     Path installed = prefix / "lib" / "bake" / "bake.build.cppm";
     if (installed.is_regular_file())
       return installed;
-    // 3. <prefix>/share/bake/bake.build.cppm (legacy)
-    Path shared = prefix / "share" / "bake" / "bake.build.cppm";
-    if (shared.is_regular_file())
-      return shared;
   }
   return {};
 }
@@ -2571,7 +2499,7 @@ export int execute_graph(BuildGraph& graph, int jobs, bool verbose) {
     };
 
     // The scheduling mechanics (ready queue, worker pool, fail-fast)
-    // live in bake.buildsystem.sched; this closure is the per-action
+    // live in bake.stage0.sched; this closure is the per-action
     // policy: announce, stage archive outputs, run, publish.
     TaskGraphSpec spec;
     spec.node_count = graph.actions.size();

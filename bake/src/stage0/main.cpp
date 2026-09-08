@@ -1,19 +1,7 @@
-// bake — stage0 composition root: the bootstrap entry. An
-// intermediate artifact whose only job is to build the self-hosted
-// bake (update → build, compiling through its own cc/c++/ar
-// multicall) and to run the fixture test suite. No help text, no
-// language server; unrecognized commands are refused tersely.
-
 import std;
-import bake.cli;
-import bake.cli.init;
-import bake.cli.build;
-import bake.cli.clean;
-import bake.cli.add;
-import bake.cli.remove;
-import bake.cli.update;
-import bake.cli.run;
-import bake.cli.test;
+import bake.stage0.cli;
+import bake.stage0.build;
+import bake.stage0.update;
 import bake.toolchain.driver;
 import bake.toolchain.lld;
 
@@ -33,20 +21,13 @@ int run(int argc, char *argv[]) {
       print_version();
       return 0;
     }
-    std::println(std::cerr,
-                 "bake (stage0): bootstrap binary — usage: bake "
-                 "<build|update|clean|init|add|remove|run|test|cc|c++|ar>");
-    return 1;
+    std::println("bake (stage0): bootstrap binary\n"
+                 "usage: bake <build|update|cc|c++|ar>");
+    return args.help ? 0 : 1;
   }
 
-  if (args.command == "init") return cmd_init(args);
   if (args.command == "build") return cmd_build(args);
-  if (args.command == "add") return cmd_add(args);
-  if (args.command == "remove") return cmd_remove(args);
   if (args.command == "update") return cmd_update(args);
-  if (args.command == "run") return cmd_run(args);
-  if (args.command == "test") return cmd_test(args);
-  if (args.command == "clean") return cmd_clean(args);
 
   if (args.command == "cc" || args.command == "c++")
     return bake_clang_main(argc, const_cast<const char **>(argv));

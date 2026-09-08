@@ -30,6 +30,17 @@ export struct TestRegistration {
     bool is_default = false;
 };
 
+export std::string binary_moid_id(std::string_view declaring_moid_id,
+                                  std::string_view binary_name) {
+    std::string id;
+    id.reserve(7 + declaring_moid_id.size() + 1 + binary_name.size());
+    id.append("binary:");
+    id.append(declaring_moid_id);
+    id.push_back(':');
+    id.append(binary_name);
+    return id;
+}
+
 export struct MoidDeclaration {
     std::string id;
     std::string name;
@@ -64,12 +75,6 @@ export struct MoidDeclaration {
     // dep_src_dir() — lets configure warn about declared-but-unused ones.
     std::vector<std::string> used_source_deps;
 };
-
-// Persisted-declaration store: out_dir/.bake/<identity-key>.moid.json.
-export Path moid_declaration_path(const Path& out_dir, std::string_view id) {
-    const std::string identity_key = SHA256::hex(id).substr(0, 24);
-    return out_dir / ".bake" / (identity_key + ".moid.json");
-}
 
 namespace {
 
@@ -529,6 +534,23 @@ std::expected<MoidDeclaration, std::string> declaration_from_json(
 
 } // namespace
 
+export json::Value moid_declaration_to_json(
+        const MoidDeclaration& declaration) {
+    return declaration_to_json(declaration);
+}
+
+export std::expected<MoidDeclaration, std::string>
+moid_declaration_from_json(const json::Value& document) {
+    auto declaration = declaration_from_json(document);
+    if (!declaration) return std::unexpected(declaration.error());
+    const std::string canonical = declaration_to_json(*declaration).dump();
+    if (canonical != document.dump()) {
+        return std::unexpected(
+            "moid declaration is not a strict canonical document");
+    }
+    return declaration;
+}
+
 export std::expected<MoidDeclaration, std::string>
 read_moid_declaration(const Path& path) {
     auto content = read_file(path);
@@ -543,18 +565,6 @@ read_moid_declaration(const Path& path) {
         return std::unexpected(
             "invalid moid declaration JSON: " + std::string(error.what()));
     }
-}
-
-export std::expected<void, std::string>
-write_moid_declaration(const Path& path, const MoidDeclaration& declaration) {
-    Json document = declaration_to_json(declaration);
-    auto validated = declaration_from_json(document);
-    if (!validated) return std::unexpected(validated.error());
-    if (!atomic_write_file(path, document.dump(2))) {
-        return std::unexpected(
-            "failed to write moid declaration '" + path.string() + "'");
-    }
-    return {};
 }
 
 } // namespace bake

@@ -373,7 +373,7 @@ export struct Manifest {
                 d.path = *v;
                 d.is_path_dep = true;
             }
-            if (auto* legacy = (*t)["options"].as_array()) {
+            if ((*t)["options"].as_array()) {
                 std::println(std::cerr,
                     "bake: dependency '{}' uses 'options', which was "
                     "replaced by 'features' in {}",
@@ -489,8 +489,7 @@ export struct Manifest {
 
         // [options] was replaced by [features] — fail loudly instead of
         // silently ignoring stale manifests.
-        if (auto* legacy = tbl["options"].as_table()) {
-            (void)legacy;
+        if (tbl["options"].as_table()) {
             std::println(std::cerr,
                 "bake: [options] was replaced by [features] in {}",
                 toml_path.string());

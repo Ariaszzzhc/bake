@@ -1,9 +1,9 @@
-export module bake.buildsystem.sched;
+export module bake.stage0.sched;
 
 import std;
 
 // ============================================================
-// bake.buildsystem.sched — bounded task-graph executor
+// bake.stage0.sched — bounded task-graph executor
 //
 // The scheduling core for parallel workloads over a static DAG;
 // the build executor is its consumer. Policy — what a

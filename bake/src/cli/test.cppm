@@ -1,112 +1,99 @@
-// bake.cli.test — the `test` command.
+module;
+
+#include <kota/async/io/loop.h>
+#include <kota/async/runtime/task.h>
 
 export module bake.cli.test;
 
 import std;
 import bake.util;
-import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
-import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
 import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
-import bake.cli.build;
+import bake.buildsystem.graph;
+import bake.buildsystem.moid;
+import bake.buildsystem.project;
+import bake.core.build;
+import bake.core.model;
+import bake.core.runtime;
+import bake.core.snapshot;
 import bake.cli;
+import bake.cli.build;
 
 namespace bake::cli {
+namespace {
 
-// ===== test command =====
-//
-// Orchestration layer: builds the project, then runs the test binaries that
-// build.cpp registered via b.add_test(). The tests' "testness" lives inside
-// the binaries; bake only discovers, builds, runs, and reports.
+struct Registration {
+  std::string owner;
+  std::string name;
+  std::string binary;
+  bool is_default = false;
+};
 
-export int cmd_test(const ParsedArgs &args) {
-  // Build first with dev profile.
-  int build_result = cmd_build(args);
-  if (build_result != 0)
-    return build_result;
-
-  auto root = find_project_root();
-  if (!root)
-    return 1;
-
-  auto manifest = Manifest::load(*root);
-  if (!manifest) {
-    std::println(std::cerr, "bake: failed to load bake.toml");
-    return 1;
-  }
-
-  auto selected_member =
-      resolve_workspace_member_selection(*manifest, args.get_option("p"));
-  if (!selected_member) {
-    std::println(std::cerr, "bake: {}", selected_member.error());
-    return 1;
-  }
-
-  BuildSelection selection;
-  selection.workspace_member = std::move(*selected_member);
-  ResolvePolicy policy;
-  policy.offline = args.has_option("offline") || args.has_option("frozen");
-  auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
-                          source_index_from_lock(*root));
-  if (!outer_graph) {
-    std::println(std::cerr, "bake: {}", outer_graph.error());
-    return 1;
-  }
-
-  // Must match what cmd_build used.
-  TargetSpec target;
-  if (auto t = args.get_option("target"))
-    target = parse_target(*t);
-  else if (auto t = args.get_option("t"))
-    target = parse_target(*t);
-  selection.target_triple = selection_triple(target);
-  std::string triple_dir =
-      target.is_native() ? detect_host_target().triple_ : target.triple_;
-  const Path out_dir = *root / "out" / triple_dir;
-
-  // Collect registrations from the selected roots, in declaration order.
-  struct Registration {
-    std::string name;
-    std::string binary;
-    bool is_default = false;
-  };
+std::vector<Registration> test_registrations(const BuiltProject &built) {
   std::vector<Registration> registrations;
-  for (const auto &id : outer_graph->roots) {
-    auto declaration =
-        read_moid_declaration(moid_declaration_path(out_dir, id.value));
-    if (!declaration) {
-      std::println(std::cerr, "bake: {}", declaration.error());
-      return 1;
-    }
-    for (const auto &test : declaration->tests)
-      registrations.push_back({test.name, test.binary, test.is_default});
+  for (const auto &root : built.project.snapshot->moid_graph.roots) {
+    auto node = built.project.snapshot->moid_graph.nodes.find(root);
+    if (node == built.project.snapshot->moid_graph.nodes.end())
+      continue;
+    for (const auto &test : node->second.declaration.tests)
+      registrations.push_back(
+          {binary_moid_id(root.value, test.binary), test.name, test.binary,
+           test.is_default});
+  }
+  return registrations;
+}
+
+const ArtifactIdentity *test_artifact(const BuiltProject &built,
+                                      const Registration &registration) {
+  const auto *ready = std::get_if<ReadyBuild>(&built.result.outcome);
+  if (!ready)
+    return nullptr;
+  const std::string output_name = library_name(
+      registration.binary, MoidType::Executable,
+      built.project.context.target);
+  const ArtifactIdentity *selected = nullptr;
+  for (const auto &artifact : ready->artifacts) {
+    if (artifact.owner_moid != registration.owner ||
+        artifact.output_name != output_name)
+      continue;
+    if (selected)
+      return nullptr;
+    selected = &artifact;
+  }
+  return selected;
+}
+
+kota::task<int> test_command(const ParsedArgs &args) {
+  auto &loop = kota::event_loop::current();
+  const auto concurrency = requested_concurrency(args);
+  CoreRuntime runtime(
+      loop, {.max_concurrency = concurrency,
+             .background_concurrency = concurrency > 1 ? concurrency - 1 : 1});
+  auto built = co_await build_project(runtime, args);
+  if (!built) {
+    co_await runtime.shutdown();
+    std::println(std::cerr, "bake: {}", built.error());
+    co_return 1;
   }
 
+  auto registrations = test_registrations(*built);
   if (registrations.empty()) {
+    co_await runtime.shutdown();
     std::println("bake: no tests registered");
-    return 0;
+    co_return 0;
   }
 
-  // --all runs everything; a positional names one test; otherwise the
-  // registration marked default runs (the last marker wins).
   std::vector<Registration> selected;
   if (args.has_option("all")) {
     selected = registrations;
   } else if (!args.positional.empty()) {
     for (const auto &registration : registrations)
-      if (registration.name == args.positional[0])
+      if (registration.name == args.positional.front())
         selected.push_back(registration);
     if (selected.empty()) {
-      std::println(std::cerr, "bake: no test named '{}'", args.positional[0]);
-      return 1;
+      co_await runtime.shutdown();
+      std::println(std::cerr, "bake: no test named '{}'",
+                   args.positional.front());
+      co_return 1;
     }
   } else {
     const Registration *default_test = nullptr;
@@ -114,29 +101,40 @@ export int cmd_test(const ParsedArgs &args) {
       if (registration.is_default)
         default_test = &registration;
     if (!default_test) {
+      co_await runtime.shutdown();
       std::println(std::cerr,
                    "bake: no default test registered; use 'bake test <name>' "
                    "or --all");
-      return 1;
+      co_return 1;
     }
     selected.push_back(*default_test);
   }
 
   int failures = 0;
+  CoreBuildService service(runtime);
   for (const auto &registration : selected) {
-    Path binary_path = out_dir / "bin" /
-        library_name(registration.binary, MoidType::Executable, target);
-    if (!binary_path.exists()) {
-      std::println(std::cerr, "bake: test binary '{}' not found at {}",
-                   registration.binary, binary_path.string());
+    const ArtifactIdentity *artifact = test_artifact(*built, registration);
+    if (!artifact) {
+      std::println(std::cerr,
+                   "bake: test binary '{}' is missing from this build result",
+                   registration.binary);
+      ++failures;
+      continue;
+    }
+    auto capture = service.capture_execution(
+        built->project, built->result, *artifact);
+    if (!capture) {
+      std::println(std::cerr, "bake: cannot prepare test binary '{}': {}",
+                   registration.binary, capture.error().message);
       ++failures;
       continue;
     }
     std::println("   Running {}", registration.name);
-    auto result = run_process(binary_path.string(), {}, *root);
-    if (result.success()) {
+    auto result = run_process(capture->executable().string(), {},
+                              built->project.context.workspace_root);
+    if (result.success())
       std::println("   Passed {}", registration.name);
-    } else {
+    else {
       std::println(std::cerr, "   Failed {} (exit {})", registration.name,
                    result.exit_code);
       ++failures;
@@ -146,7 +144,19 @@ export int cmd_test(const ParsedArgs &args) {
   if (failures > 0)
     std::println(std::cerr, "bake: {} of {} selected test(s) failed", failures,
                  selected.size());
-  return failures > 0 ? 1 : 0;
+  co_await runtime.shutdown();
+  co_return failures > 0 ? 1 : 0;
+}
+
+} // namespace
+
+export int cmd_test(const ParsedArgs &args) {
+  auto [result] = kota::run(test_command(args));
+  if (!result) {
+    std::println(std::cerr, "bake: test operation did not complete");
+    return 1;
+  }
+  return *result;
 }
 
 } // namespace bake::cli

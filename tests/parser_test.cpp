@@ -165,6 +165,7 @@ frameworks = [
 
 [dependencies]
 fmt = { url = "https://github.com/fmtlib/fmt", tag = "11.1.4" }
+mirrors = [{ url = "primary" }, { url = "backup" }]
 
 [numbers]
 opt = 3
@@ -197,6 +198,10 @@ off = false
           fmt->get("url")->value<std::string>() ==
               "https://github.com/fmtlib/fmt",
           "toml: inline table");
+    const auto* mirrors = tbl["dependencies"]["mirrors"].as_array();
+    check(mirrors != nullptr && mirrors->size() == 2 &&
+              (*mirrors)[1]["url"].value<std::string>() == "backup",
+          "toml: array of inline tables");
     check(tbl["numbers"]["opt"].value<std::int64_t>() == 3, "toml: int");
     check(tbl["numbers"]["big"].value<std::int64_t>() == 1000000,
           "toml: underscore integer");

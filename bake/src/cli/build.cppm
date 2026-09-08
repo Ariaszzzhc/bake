@@ -1,168 +1,137 @@
-// bake.cli.build — the `build` command.
+module;
+
+#include <kota/async/io/loop.h>
+#include <kota/async/runtime/task.h>
 
 export module bake.cli.build;
 
 import std;
 import bake.util;
-import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
-import bake.buildsystem.project;
-import bake.buildsystem.moid;
 import bake.buildsystem.graph;
-import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
+import bake.buildsystem.plan;
+import bake.core.build;
+import bake.core.model;
+import bake.core.project;
+import bake.core.runtime;
+import bake.core.snapshot;
 import bake.cli;
+import bake.cli.compdb;
+import bake.cli.project;
 
 namespace bake::cli {
 
-// ===== build command =====
+export struct BuiltProject {
+  ProjectHandle project;
+  BuildResult result;
+};
+
+export kota::task<std::expected<BuiltProject, std::string>>
+build_project(CoreRuntime &runtime, const ParsedArgs &args);
+
+namespace {
+
+std::string project_label(const ProjectHandle &project) {
+  const auto &graph = project.snapshot->moid_graph;
+  if (graph.roots.size() == 1) {
+    auto node = graph.nodes.find(graph.roots.front());
+    if (node != graph.nodes.end())
+      return node->second.declaration.name + " v" +
+             node->second.declaration.version;
+  }
+  std::string label = project.context.workspace_root.filename_string();
+  return label.empty() ? project.context.workspace_root.string() : label;
+}
+
+std::string build_failure(const BuildOutcome &outcome) {
+  return std::visit([](const auto &value) -> std::string {
+    using T = std::remove_cvref_t<decltype(value)>;
+    if constexpr (std::is_same_v<T, ReadyBuild>) {
+      return {};
+    } else if constexpr (std::is_same_v<T, FailedBuild>) {
+      return value.message;
+    } else if constexpr (std::is_same_v<T, CancelledBuild>) {
+      return value.reason;
+    } else {
+      return value.message;
+    }
+  }, outcome);
+}
+
+kota::task<int> build_command(const ParsedArgs &args) {
+  auto &loop = kota::event_loop::current();
+  const auto concurrency = requested_concurrency(args);
+  CoreRuntime runtime(
+      loop, {.max_concurrency = concurrency,
+             .background_concurrency = concurrency > 1 ? concurrency - 1 : 1});
+  auto built = co_await build_project(runtime, args);
+  co_await runtime.shutdown();
+  if (!built) {
+    std::println(std::cerr, "bake: {}", built.error());
+    co_return 1;
+  }
+  co_return 0;
+}
+
+} // namespace
+
+kota::task<std::expected<BuiltProject, std::string>>
+build_project(CoreRuntime &runtime, const ParsedArgs &args) {
+  auto project = co_await open_project(runtime, args);
+  if (!project)
+    co_return std::unexpected(project.error());
+
+  std::println("   Building {}", project_label(*project));
+  auto graph_export = write_graph_json(
+      project->snapshot->build_graph, project->paths.bake / "graph.json");
+  if (!graph_export)
+    co_return std::unexpected(graph_export.error());
+  BuildOptions options;
+  options.lane = RuntimeLane::foreground;
+  options.verbose = args.has_option("v") || args.has_option("verbose");
+  const bool verbose = options.verbose;
+  options.progress = [verbose](const BuildProgress &progress) {
+    if (progress.kind == BuildProgressKind::moid_started) {
+      if (progress.version.empty())
+        std::println("   Compiling {}", progress.moid);
+      else
+        std::println("   Compiling {} v{}", progress.moid, progress.version);
+      return;
+    }
+    if (!verbose)
+      return;
+    const std::string_view state =
+        progress.kind == BuildProgressKind::action_reused ? "cached" : "build";
+    std::println("    [{}] {}", state, progress.description);
+  };
+  const auto started = std::chrono::steady_clock::now();
+  CoreBuildService service(runtime);
+  auto operation = service.start(*project, std::move(options));
+  if (!operation)
+    co_return std::unexpected(operation.error().message);
+  BuildResult result = co_await operation->wait();
+  if (status_of(result.outcome) != ResultStatus::ready)
+    co_return std::unexpected(build_failure(result.outcome));
+  auto valid = service.validate_ready(*project, result);
+  if (!valid)
+    co_return std::unexpected(valid.error().message);
+  const auto elapsed = std::chrono::duration<double>(
+      std::chrono::steady_clock::now() - started).count();
+  std::println("    Finished in {:.2f}s", elapsed);
+
+  auto exported = write_compilation_database(
+      *project, project->context.workspace_root / "compile_commands.json");
+  if (!exported)
+    co_return std::unexpected(exported.error());
+  co_return BuiltProject{std::move(*project), std::move(result)};
+}
 
 export int cmd_build(const ParsedArgs &args) {
-  auto root = find_project_root();
-  if (!root) {
-    std::println(std::cerr, "bake: no bake.toml found");
+  auto [result] = kota::run(build_command(args));
+  if (!result) {
+    std::println(std::cerr, "bake: build operation did not complete");
     return 1;
   }
-
-  auto manifest = Manifest::load(*root);
-  if (!manifest) {
-    std::println(std::cerr, "bake: failed to load bake.toml");
-    return 1;
-  }
-
-  // Lockfile enforcement: resolve deps, verify cache, enforce
-  // --locked/--offline.
-  if (enforce_lock(*root, *manifest, args) != 0)
-    return 1;
-
-  auto selected_member =
-      resolve_workspace_member_selection(*manifest, args.get_option("p"));
-  if (!selected_member) {
-    std::println(std::cerr, "bake: {}", selected_member.error());
-    return 1;
-  }
-
-  auto root_features = parse_root_features(*manifest, args, *selected_member);
-  if (!root_features)
-    return 1;
-
-  BuildSelection selection;
-  selection.workspace_member = std::move(*selected_member);
-  selection.root_features = std::move(*root_features);
-  TargetSpec selection_target;
-  if (auto t = args.get_option("target"))
-    selection_target = parse_target(*t);
-  else if (auto t = args.get_option("t"))
-    selection_target = parse_target(*t);
-  selection.target_triple = selection_triple(selection_target);
-
-  ResolvePolicy policy;
-  policy.offline = args.has_option("offline") || args.has_option("frozen");
-
-  auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
-                          source_index_from_lock(*root));
-  if (!outer_graph) {
-    std::println(std::cerr, "bake: {}", outer_graph.error());
-    return 1;
-  }
-
-  // Profile selection.
-  std::string profile = "dev";
-  if (args.has_option("release"))
-    profile = "release";
-  if (auto p = args.get_option("profile"))
-    profile = *p;
-
-  // Validate profile name (built-in or user-declared)
-  if (profile != "dev" && profile != "release") {
-    bool found = false;
-    if (manifest) {
-      for (const auto& [name, _] : manifest->profiles)
-        if (name == profile) { found = true; break; }
-    }
-    if (!found) {
-      std::println(std::cerr,
-          "bake: unknown profile '{}' (declare it in bake.toml or use "
-          "'dev'/'release')", profile);
-      return 1;
-    }
-  }
-
-  TargetSpec target = detect_host_target();
-
-  // Cross-compile target from --target=<triple> or -t <triple>.
-  {
-    auto target_spec = args.get_option("target");
-    if (!target_spec)
-      target_spec = args.get_option("t");
-    if (target_spec) {
-      // Validate raw input has exactly 3 segments before parse_target
-      // normalizes away vendor segments like "unknown".
-      int dash_count = static_cast<int>(
-          std::count(target_spec->begin(), target_spec->end(), '-'));
-      if (dash_count != 2) {
-        std::println(std::cerr,
-                     "bake: invalid target triple '{}': expected exactly 3 "
-                     "segments (arch-os-libc), got {}",
-                     *target_spec, dash_count + 1);
-        return 1;
-      }
-      target = parse_target(*target_spec);
-    }
-  }
-
-  // Output directory with target isolation.
-  std::string triple_dir =
-      target.is_native() ? detect_host_target().triple_ : target.triple_;
-  Path out_dir = *root / "out" / triple_dir;
-  Path bake_dir = out_dir / ".bake";
-  bake_dir.mkdir_recursive();
-
-  const std::string label =
-      manifest->is_workspace()
-          ? root->filename_string().empty() ? root->string()
-                                            : root->filename_string()
-          : (manifest->has_moid()
-                 ? manifest->moid->name + " v" + manifest->moid->version
-                 : "project");
-
-  std::println("   Building {}", label);
-
-  // The std module is a compiler concern — the bake c++ shim provisions
-  // and injects it. The build system deliberately knows nothing about it.
-
-
-  auto configured =
-      configure_moid_graph(*outer_graph, target, out_dir, *root, profile);
-  if (!configured) {
-    std::println(std::cerr, "bake: {}", configured.error());
-    return 1;
-  }
-
-  auto graph = build_graph(*outer_graph, target, out_dir, *root);
-  if (!graph) {
-    std::println(std::cerr, "bake: {}", graph.error());
-    return 1;
-  }
-
-  // Write graph.json and compile_commands.json.
-  write_graph_json(*graph, bake_dir / "graph.json");
-  write_compdb_json(compile_db_from_graph(*graph, *root),
-                    *root / "compile_commands.json");
-
-  // Execute.
-  int jobs = 0;
-  if (auto j = args.get_option("j"))
-    jobs = std::atoi(j->c_str());
-  bool verbose = args.has_option("v") || args.has_option("verbose");
-
-  int result = execute_graph(*graph, jobs, verbose);
-  return result;
+  return *result;
 }
 
 } // namespace bake::cli

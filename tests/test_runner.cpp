@@ -147,11 +147,7 @@ static std::string read_file(const fs::path& path) {
     return content;
 }
 
-// Every build, including a native build, is isolated under out/<target>/.
-// Most tests build exactly one target and use this helper to avoid baking the
-// host triple into fixtures. Tests that intentionally build several targets
-// inspect target_output_dirs() directly.
-static std::vector<fs::path> target_output_dirs(const fs::path& project_root) {
+static std::vector<fs::path> target_roots(const fs::path& project_root) {
     std::vector<fs::path> result;
     const fs::path out = project_root / "out";
     if (!fs::is_directory(out)) return result;
@@ -166,11 +162,22 @@ static std::vector<fs::path> target_output_dirs(const fs::path& project_root) {
     return result;
 }
 
-static fs::path target_output_dir(const fs::path& project_root) {
-    const auto targets = target_output_dirs(project_root);
+static std::vector<fs::path> target_output_dirs(
+        const fs::path& project_root, std::string_view profile = "dev") {
+    std::vector<fs::path> result;
+    for (const auto& target : target_roots(project_root)) {
+        const fs::path output = target / profile;
+        if (fs::is_directory(output)) result.push_back(output);
+    }
+    return result;
+}
+
+static fs::path target_output_dir(const fs::path& project_root,
+                                  std::string_view profile = "dev") {
+    const auto targets = target_output_dirs(project_root, profile);
     if (targets.size() != 1) {
         throw std::runtime_error(
-            "expected exactly one out/<target> directory under " +
+            "expected exactly one out/<target>/<profile> directory under " +
             (project_root / "out").string() + ", found " +
             std::to_string(targets.size()));
     }
@@ -194,6 +201,12 @@ static std::optional<fs::path> find_moid_declaration(const fs::path& bake_dir) {
         constexpr std::string_view suffix = ".moid.json";
         if (filename.size() >= suffix.size() &&
             filename.compare(filename.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            return entry.path();
+        }
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(bake_dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json" &&
+            entry.path().parent_path().filename() == "snapshots") {
             return entry.path();
         }
     }
@@ -1315,7 +1328,6 @@ TestResult test_add_no_tag() {
     return {};
 }
 
-// Every build, including native, must write into one target-triple directory.
 TestResult test_target_output_layout() {
     auto dir = make_temp_dir("target_output");
     copy_fixture("simple_app", dir);
@@ -1324,15 +1336,15 @@ TestResult test_target_output_layout() {
     CHECK(r.success(), "build failed: " + r.stdout);
 
     CHECK(fs::is_directory(dir / "out"), "out/ directory not created");
-    const auto targets = target_output_dirs(dir);
+    const auto targets = target_roots(dir);
     CHECK_EQ(targets.size(), std::size_t(1),
              "native build must create exactly one out/<target> directory");
-    const fs::path out = targets.front();
-    CHECK_EQ(count_occurrences(out.filename().string(), "-"), std::size_t(2),
+    CHECK_EQ(count_occurrences(targets.front().filename().string(), "-"), std::size_t(2),
              "native output directory must use a three-segment target triple");
-    CHECK(fs::is_directory(out / "bin"), "out/<target>/bin/ not created");
-    CHECK(fs::is_directory(out / ".obj"), "out/<target>/.obj/ not created");
-    CHECK(fs::is_directory(out / ".bake"), "out/<target>/.bake/ not created");
+    const fs::path out = targets.front() / "dev";
+    CHECK(fs::is_directory(out / "bin"), "out/<target>/dev/bin/ not created");
+    CHECK(fs::is_directory(out / ".obj"), "out/<target>/dev/.obj/ not created");
+    CHECK(fs::is_directory(out / ".bake"), "out/<target>/dev/.bake/ not created");
     CHECK(!fs::exists(dir / "out/bin") && !fs::exists(dir / "out/lib") &&
               !fs::exists(dir / "out/.obj") && !fs::exists(dir / "out/.bake"),
           "native build leaked artifacts into the legacy target-less layout");
@@ -1581,6 +1593,226 @@ TestResult test_frozen_missing_cache() {
     return {};
 }
 
+TestResult test_frozen_cache_tamper() {
+#ifdef _WIN32
+    return {};
+#else
+    const std::string nonce = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    auto dir = make_temp_dir("frozen_cache_tamper-" + nonce);
+    auto remote = dir / "remote";
+    auto project = dir / "project";
+    auto fresh_project = dir / "fresh-project";
+    auto offline_project = dir / "offline-project";
+    auto repair_project = dir / "repair-project";
+    auto update_project = dir / "update-project";
+    auto test_home = dir / "home";
+
+    fs::create_directories(remote / "public");
+    fs::create_directories(remote / "src");
+    write_file(remote / "bake.toml",
+        "[package]\nname = \"cache-lib\"\nversion = \"0.1.0\"\n"
+        "type = \"lib\"\n[language]\nc = \"c17\"\n");
+    write_file(remote / "public/cache.h", "int cache_value(void);\n");
+    write_file(remote / "src/cache.c",
+        "#include <cache.h>\n/* " + nonce +
+        " */\nint cache_value(void) { return 41; }\n");
+
+    CHECK(run_cmd("git init -q", remote).success(),
+          "failed to initialize cache fixture repository");
+    CHECK(run_cmd("git config user.email bake-test@example.invalid", remote).success(),
+          "failed to configure cache fixture git email");
+    CHECK(run_cmd("git config user.name bake-test", remote).success(),
+          "failed to configure cache fixture git name");
+    CHECK(run_cmd("git config commit.gpgsign false", remote).success(),
+          "failed to disable cache fixture commit signing");
+    CHECK(run_cmd("git add .", remote).success(),
+          "failed to stage cache fixture repository");
+    CHECK(run_cmd("git commit -q -m fixture", remote).success(),
+          "failed to commit cache fixture repository");
+    auto revision = run_cmd("git rev-parse HEAD", remote);
+    CHECK(revision.success(), "failed to resolve cache fixture revision");
+    while (!revision.stdout.empty() &&
+           (revision.stdout.back() == '\n' || revision.stdout.back() == '\r')) {
+        revision.stdout.pop_back();
+    }
+
+    const std::string manifest =
+        "[package]\nname = \"cache-app\"\nversion = \"0.1.0\"\n"
+        "type = \"executable\"\n[language]\nc = \"c17\"\n\n"
+        "[dependencies]\ncache = { url = \"file://" + remote.string() +
+        "\", rev = \"" + revision.stdout + "\" }\n";
+    write_file(project / "bake.toml", manifest);
+    write_file(project / "src/main.c",
+        "#include <cache.h>\n"
+        "int main(void) { return cache_value() == 41 ? 0 : 1; }\n");
+    const std::string environment = isolated_cache_environment(test_home);
+
+    auto initial = run_bake("build -j 1", project, environment);
+    CHECK(initial.success(), "initial cache fixture build failed: " + initial.stdout);
+    const std::string lock_before = read_file(project / "bake.lock");
+    CHECK(!lock_before.empty(), "initial cache fixture build wrote no lock file");
+
+    const fs::path source_cache = isolated_source_cache(test_home);
+    std::vector<fs::path> cache_entries;
+    for (const auto& entry : fs::directory_iterator(source_cache)) {
+        if (entry.is_directory() &&
+            !entry.path().filename().string().starts_with('.')) {
+            cache_entries.push_back(entry.path());
+        }
+    }
+    CHECK_EQ(cache_entries.size(), std::size_t(1),
+             "isolated source cache did not contain exactly one locked entry");
+    const fs::path cache_entry = cache_entries.front();
+    const fs::path marker = cache_entry / ".bake-verified";
+
+    auto valid_frozen = run_bake("build --frozen --verbose -j 1", project,
+                                 environment);
+    CHECK(valid_frozen.success(),
+          "valid frozen cache was rejected: " + valid_frozen.stdout);
+    const std::string matching_marker = cache_entry.filename().string();
+    write_file(marker, matching_marker);
+    auto valid_warm = run_bake("build --frozen --verbose -j 1", project,
+                               environment);
+    CHECK(valid_warm.success(),
+          "warm valid frozen cache was rejected: " + valid_warm.stdout);
+
+    const fs::path executable =
+        native_executable_path(target_output_dir(project), "cache-app");
+    auto valid_run = run_cmd(executable.string(), project);
+    CHECK(valid_run.success(), "valid frozen cache produced the wrong executable");
+    const auto executable_mtime = fs::last_write_time(executable);
+
+    const fs::path cached_source = cache_entry / "src/cache.c";
+    const auto source_mtime = fs::last_write_time(cached_source);
+    std::string tampered_source = read_file(cached_source);
+    const auto value_position = tampered_source.find("return 41");
+    CHECK(value_position != std::string::npos,
+          "cached fixture source did not contain its semantic marker");
+    tampered_source.replace(value_position, 9, "return 99");
+    write_file(cached_source, tampered_source);
+    fs::last_write_time(cached_source, source_mtime);
+
+    auto matching = run_bake("build --frozen -j 1", project, environment);
+    auto changed_run = run_cmd(executable.string(), project);
+    CHECK(fs::remove(marker), "failed to remove matching cache marker");
+    auto missing = run_bake("build --frozen -j 1", project, environment);
+    write_file(marker, matching_marker);
+    auto restored = run_bake("build --frozen -j 1", project, environment);
+
+    write_file(fresh_project / "bake.toml", manifest);
+    write_file(fresh_project / "src/main.c",
+        "#include <cache.h>\n"
+        "int main(void) { return cache_value() == 41 ? 0 : 1; }\n");
+    write_file(fresh_project / "bake.lock", lock_before);
+    auto fresh = run_bake("build --frozen -j 1", fresh_project, environment);
+
+    write_file(offline_project / "bake.toml", manifest);
+    write_file(offline_project / "src/main.c",
+        "#include <cache.h>\n"
+        "int main(void) { return cache_value() == 41 ? 0 : 1; }\n");
+    write_file(offline_project / "bake.lock", lock_before);
+    auto offline = run_bake("build --offline -j 1", offline_project,
+                            environment);
+
+    const bool lock_unchanged_after_frozen =
+        read_file(project / "bake.lock") == lock_before;
+    const bool ready_unchanged_after_frozen =
+        fs::last_write_time(executable) == executable_mtime;
+    const bool fresh_ready_absent = target_output_dirs(fresh_project).empty();
+    const bool offline_ready_absent =
+        target_output_dirs(offline_project).empty();
+
+    write_file(repair_project / "bake.toml", manifest);
+    write_file(repair_project / "src/main.c",
+        "#include <cache.h>\n"
+        "int main(void) { return cache_value() == 41 ? 0 : 1; }\n");
+    write_file(repair_project / "bake.lock", lock_before);
+    CmdResult concurrently_repaired;
+    std::thread concurrent_repair([&] {
+        concurrently_repaired =
+            run_bake("build -j 1", repair_project, environment);
+    });
+    auto repaired = run_bake("build -j 1", project, environment);
+    concurrent_repair.join();
+    auto repaired_run = run_cmd(executable.string(), project);
+    CmdResult concurrent_run;
+    const auto repair_outputs = target_output_dirs(repair_project);
+    if (repair_outputs.size() == 1) {
+        const fs::path repair_executable =
+            native_executable_path(repair_outputs.front(), "cache-app");
+        if (fs::is_regular_file(repair_executable))
+            concurrent_run = run_cmd(repair_executable.string(), repair_project);
+    }
+    const bool lock_unchanged_after_repair =
+        read_file(project / "bake.lock") == lock_before &&
+        read_file(repair_project / "bake.lock") == lock_before;
+
+    std::string update_tamper = read_file(cached_source);
+    const auto update_value_position = update_tamper.find("return 41");
+    if (update_value_position != std::string::npos)
+        update_tamper.replace(update_value_position, 9, "return 99");
+    write_file(cached_source, update_tamper);
+    write_file(marker, matching_marker);
+    write_file(update_project / "bake.toml", manifest);
+    write_file(update_project / "src/main.c",
+        "#include <cache.h>\n"
+        "int main(void) { return cache_value() == 41 ? 0 : 1; }\n");
+    write_file(update_project / "bake.lock", lock_before);
+    auto updated = run_bake("update cache", update_project, environment);
+    if (fs::exists(marker)) fs::remove(marker);
+    auto updated_frozen = run_bake("build --frozen -j 1", update_project,
+                                   environment);
+    CmdResult updated_run;
+    const auto updated_outputs = target_output_dirs(update_project);
+    if (updated_outputs.size() == 1) {
+        const fs::path updated_executable =
+            native_executable_path(updated_outputs.front(), "cache-app");
+        if (fs::is_regular_file(updated_executable))
+            updated_run = run_cmd(updated_executable.string(), update_project);
+    }
+    const bool update_preserved_identity =
+        read_file(update_project / "bake.lock") == lock_before;
+
+    const std::string outcomes =
+        " matching=" + std::to_string(matching.exit_code) +
+        " changed-app=" + std::to_string(changed_run.exit_code) +
+        " missing=" + std::to_string(missing.exit_code) +
+        " restored=" + std::to_string(restored.exit_code) +
+        " fresh=" + std::to_string(fresh.exit_code) +
+        " offline=" + std::to_string(offline.exit_code) +
+        " repair=" + std::to_string(repaired.exit_code) +
+        " concurrent-repair=" +
+            std::to_string(concurrently_repaired.exit_code) +
+        " concurrent-app=" + std::to_string(concurrent_run.exit_code) +
+        " update=" + std::to_string(updated.exit_code) +
+        " update-frozen=" + std::to_string(updated_frozen.exit_code) +
+        " update-app=" + std::to_string(updated_run.exit_code);
+    fs::remove_all(dir);
+
+    CHECK(!matching.success() && !restored.success(),
+          "matching cache marker trusted tampered payload:" + outcomes);
+    CHECK(!missing.success() &&
+              missing.stdout.find("cache tampered") != std::string::npos,
+          "missing marker did not force strict tree verification:" + outcomes);
+    CHECK(!fresh.success() && fresh_ready_absent,
+          "fresh Core open accepted tampered locked sources:" + outcomes);
+    CHECK(updated.success() && updated_frozen.success() &&
+              updated_run.success() && update_preserved_identity,
+          "selected update did not replace a corrupt cache entry at the pinned ref:" +
+              outcomes);
+    CHECK(!offline.success() && offline_ready_absent,
+          "cold offline Core open accepted tampered locked sources:" + outcomes);
+    CHECK(lock_unchanged_after_frozen && ready_unchanged_after_frozen,
+          "failed frozen validation changed lock or ready product:" + outcomes);
+    CHECK(repaired.success() && concurrently_repaired.success() &&
+              repaired_run.success() && concurrent_run.success() &&
+              lock_unchanged_after_repair,
+          "concurrent normal builds did not repair the locked cache:" + outcomes);
+    return {};
+#endif
+}
+
 // Workspace members share one output root within the selected target.
 TestResult test_workspace_target_output() {
     auto dir = make_temp_dir("ws_target_output");
@@ -1674,12 +1906,23 @@ TestResult test_canonical_engine_namespaces() {
               "action ids do not contain the canonical storage key '" + owner + "'");
     }
 
-    const std::string fingerprints =
-        read_file(out / ".bake/fingerprints.json");
-    for (const auto& id : action_ids) {
-        CHECK(fingerprints.find("\"" + id + "\"") != std::string::npos,
-              "fingerprint state omitted canonical action id '" + id + "'");
+    std::string receipts;
+    const fs::path core = out / ".bake/core";
+    CHECK(fs::is_directory(core), "same-name build did not persist Core state");
+    for (const auto& entry : fs::recursive_directory_iterator(core)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json" &&
+            entry.path().parent_path().parent_path().filename() ==
+                "build-actions") {
+            receipts += read_file(entry.path());
+        }
     }
+    for (const auto& id : action_ids) {
+        CHECK(receipts.find("\"action\":\"" + id + "\"") !=
+                  std::string::npos,
+              "Core action receipts omitted canonical action id '" + id + "'");
+    }
+    CHECK(receipts.find("\"cache_key\":") != std::string::npos,
+          "Core action receipts omitted cache identities");
 
     return {};
 }
@@ -2178,6 +2421,48 @@ TestResult test_build_cpp_target_env() {
     CHECK(cross.success(),
           "cross build.cpp saw empty BAKE_TARGET: " + cross.stdout);
 
+    return {};
+}
+
+TestResult test_build_cpp_output() {
+    auto dir = make_temp_dir("build_cpp_output");
+    write_file(dir / "bake.toml",
+        "[package]\nname = \"script-output\"\nversion = \"0.1.0\"\n"
+        "[language]\nc = \"c17\"\n");
+    write_file(dir / "build.cpp",
+        "import bake.build;\nimport std;\n"
+        "int main() {\n"
+        "    std::println(\"DECLARATION_STDOUT\");\n"
+        "    std::println(std::cerr, \"DECLARATION_STDERR\");\n"
+        "    bake::Builder b;\n"
+        "    b.sources(\"src/main.c\");\n"
+        "    return b.build();\n"
+        "}\n");
+    write_file(dir / "src/main.c", "int main(void) { return 0; }\n");
+
+    auto first = run_bake("build --verbose", dir);
+    CHECK(first.success(), "build.cpp output fixture failed: " + first.stdout);
+    CHECK(first.stdout.find("DECLARATION_STDOUT") != std::string::npos &&
+              first.stdout.find("DECLARATION_STDERR") != std::string::npos,
+          "successful build.cpp output was discarded: " + first.stdout);
+
+    auto warm = run_bake("build --verbose", dir);
+    CHECK(warm.success(), "cached declaration build failed: " + warm.stdout);
+    CHECK(warm.stdout.find("declaration_evaluate=0") != std::string::npos &&
+              warm.stdout.find("DECLARATION_STDOUT") == std::string::npos &&
+              warm.stdout.find("DECLARATION_STDERR") == std::string::npos,
+          "cached declaration replayed output or ran again: " + warm.stdout);
+
+    write_file(dir / "build.cpp",
+        "import std;\n"
+        "int main() {\n"
+        "    std::println(std::cerr, \"DECLARATION_FAILURE\");\n"
+        "    return 1;\n"
+        "}\n");
+    auto failed = run_bake("build", dir);
+    CHECK(!failed.success() &&
+              failed.stdout.find("DECLARATION_FAILURE") != std::string::npos,
+          "failing build.cpp lost its diagnostic: " + failed.stdout);
     return {};
 }
 
@@ -2711,12 +2996,14 @@ TestResult test_build_cpp_options() {
 
     auto unknown = run_option_bake("build --feature missing");
     CHECK(!unknown.success(), "undeclared feature should fail");
-    CHECK(unknown.stdout.find("unknown feature 'missing'") != std::string::npos,
-          "unknown feature did not report its name: " + unknown.stdout);
+    CHECK(unknown.stdout.find(
+              "feature 'missing' is not declared by package 'option-app'") !=
+              std::string::npos,
+          "unknown feature did not report its name and package: " + unknown.stdout);
 
     auto run_via_bake = run_option_bake("run");
     CHECK(run_via_bake.success(),
-          "bake run could not read out/<target>/.bake/build.json: " +
+          "bake run could not execute the current build result: " +
               run_via_bake.stdout);
     CHECK(run_via_bake.stdout.find("portable|0\n") != std::string::npos,
           "bake run executed the wrong build.cpp output: " +
@@ -3824,7 +4111,7 @@ TestResult test_target_scoped_dependency() {
     auto musl = run_bake("build -t x86_64-linux-musl", project, home_env);
     CHECK(musl.success(),
           "musl build must see the scoped dependency: " + musl.stdout);
-    CHECK(fs::exists(project / "out" / "x86_64-linux-musl" / "bin" /
+    CHECK(fs::exists(project / "out" / "x86_64-linux-musl" / "dev" / "bin" /
                      "scope-app"),
           "musl binary missing");
 
@@ -3880,6 +4167,14 @@ TestResult test_unused_source_dep_warning() {
               unused_build.stdout.find("never consumed") !=
                   std::string::npos,
           "expected unused-source-dep warning: " + unused_build.stdout);
+
+    auto cached_unused = run_bake("build --verbose", unused_project, home_env);
+    CHECK(cached_unused.success() &&
+              cached_unused.stdout.find("Core resolve=0") != std::string::npos &&
+              cached_unused.stdout.find("'raw'") != std::string::npos &&
+              cached_unused.stdout.find("never consumed") != std::string::npos,
+          "cached declaration lost the unused-source warning: " +
+              cached_unused.stdout);
 
     // Consumed: build.cpp pulls the raw sources in via dep_src_dir.
     write_file(used_project / "bake.toml",
@@ -4150,9 +4445,9 @@ TestResult test_profile_configuration() {
           "implicit dev profile flags are incomplete: " + commands);
     CHECK(!contains_command_token(commands, "-flto=thin"),
           "dev profile leaked release-only flags: " + commands);
-    const fs::path exe = native_executable_path(
-        target_output_dir(dir), "profile-configuration");
-    auto dev_run = run_cmd(exe.string(), dir);
+    const fs::path dev_exe = native_executable_path(
+        target_output_dir(dir, "dev"), "profile-configuration");
+    auto dev_run = run_cmd(dev_exe.string(), dir);
     CHECK(dev_run.success() && dev_run.stdout == "NDEBUG=0\n",
           "dev profile unexpectedly defined NDEBUG: " + dev_run.stdout);
 
@@ -4166,7 +4461,9 @@ TestResult test_profile_configuration() {
     CHECK(!contains_command_token(commands, "-g"),
           "release profile unexpectedly emitted full debug information: " +
               commands);
-    auto release_run = run_cmd(exe.string(), dir);
+    const fs::path release_exe = native_executable_path(
+        target_output_dir(dir, "release"), "profile-configuration");
+    auto release_run = run_cmd(release_exe.string(), dir);
     CHECK(release_run.success() && release_run.stdout == "NDEBUG=1\n",
           "release profile did not define NDEBUG: " + release_run.stdout);
 
@@ -4186,7 +4483,7 @@ TestResult test_profile_configuration() {
               !contains_command_token(commands, "-flto=thin") &&
               !contains_command_token(commands, "-Wall"),
           "user release profile did not override built-in fields: " + commands);
-    auto overridden_run = run_cmd(exe.string(), dir);
+    auto overridden_run = run_cmd(release_exe.string(), dir);
     CHECK(overridden_run.success() && overridden_run.stdout == "NDEBUG=1\n",
           "overriding release fields removed NDEBUG: " + overridden_run.stdout);
 
@@ -4204,7 +4501,7 @@ TestResult test_profile_configuration() {
           "full LTO was incorrectly converted to thin LTO: " + commands);
 
     const std::string graph = read_file(
-        target_output_dir(dir) / ".bake/graph.json");
+        target_output_dir(dir, "bench") / ".bake/graph.json");
     CHECK(contains_command_token(graph, "-Wl,-S"),
           "custom profile strip flag is absent from the link action: " + graph);
 
@@ -4227,9 +4524,9 @@ TestResult test_target_conditions() {
     auto build = run_bake("build -t x86_64-linux-musl", dir);
     CHECK(build.success(), "target-conditioned build failed: " + build.stdout);
 
-    const fs::path out = dir / "out/x86_64-linux-musl";
+    const fs::path out = dir / "out/x86_64-linux-musl/dev";
     CHECK(fs::is_directory(out),
-          "explicit target did not use out/x86_64-linux-musl");
+          "explicit target did not use out/x86_64-linux-musl/dev");
     CHECK(fs::exists(out / "bin/target-conditions"),
           "target-conditioned executable was not produced");
 
@@ -4266,7 +4563,7 @@ TestResult test_target_conditions() {
           "Darwin framework target table failed to configure: " +
               darwin.stdout);
     auto declaration = find_moid_declaration(
-        darwin_dir / "out/aarch64-apple-darwin/.bake");
+        darwin_dir / "out/aarch64-apple-darwin/dev/.bake");
     CHECK(declaration.has_value(),
           "Darwin framework declaration was not persisted");
     const auto frameworks =
@@ -4396,7 +4693,7 @@ TestResult test_cross_gnu() {
     auto build = run_bake("build -t x86_64-linux-gnu", dir);
     CHECK(build.success(), "glibc cross build failed: " + build.stdout);
 
-    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu";
+    const fs::path out = dir / "out/x86_64-linux-gnu/dev/bin/cross-gnu";
     CHECK(fs::exists(out), "glibc cross executable missing");
 
     auto elf = inspect_elf64(out);
@@ -4419,7 +4716,7 @@ TestResult test_cross_gnu() {
     // aarch64 variant.
     auto arm = run_bake("build -t aarch64-linux-gnu", dir);
     CHECK(arm.success(), "aarch64 glibc cross build failed: " + arm.stdout);
-    auto arm_elf = inspect_elf64(dir / "out/aarch64-linux-gnu/bin/cross-gnu");
+    auto arm_elf = inspect_elf64(dir / "out/aarch64-linux-gnu/dev/bin/cross-gnu");
     CHECK(arm_elf.valid && arm_elf.interp == "/lib/ld-linux-aarch64.so.1",
           "aarch64 PT_INTERP wrong: " + arm_elf.interp);
 
@@ -4430,7 +4727,7 @@ TestResult test_cross_gnu() {
     copy_fixture("cross_gnu", dir31);
     auto v31 = run_bake("build -t x86_64-linux-gnu.2.31", dir31);
     CHECK(v31.success(), "glibc 2.31 target build failed: " + v31.stdout);
-    CHECK(fs::exists(dir31 / "out/x86_64-linux-gnu/bin/cross-gnu"),
+    CHECK(fs::exists(dir31 / "out/x86_64-linux-gnu.2.31/dev/bin/cross-gnu"),
           "versioned-target build produced no binary in the triple dir");
 
     // Static linking on glibc is rejected with musl guidance.
@@ -4457,7 +4754,7 @@ TestResult test_cross_gnu_prereq() {
     // links, and carries the GLIBC_2.30 version reference.
     auto v36 = run_bake("build -t x86_64-linux-gnu.2.36", dir);
     CHECK(v36.success(), "glibc 2.36 prereq build failed: " + v36.stdout);
-    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-prereq";
+    const fs::path out = dir / "out/x86_64-linux-gnu.2.36/dev/bin/cross-gnu-prereq";
     CHECK(fs::exists(out), "2.36 target binary missing");
     auto elf = inspect_elf64(out);
     CHECK(elf.valid, "2.36 output is not a valid ELF64 binary");
@@ -4542,7 +4839,7 @@ TestResult test_cross_gnu_cpp() {
 
     auto build = run_bake("build -t x86_64-linux-gnu", dir);
     CHECK(build.success(), "glibc C++ cross build failed: " + build.stdout);
-    const fs::path out = dir / "out/x86_64-linux-gnu/bin/cross-gnu-cpp";
+    const fs::path out = dir / "out/x86_64-linux-gnu/dev/bin/cross-gnu-cpp";
     CHECK(fs::exists(out), "glibc C++ executable missing");
     auto elf = inspect_elf64(out);
     CHECK(elf.valid && elf.interp == "/lib64/ld-linux-x86-64.so.2",
@@ -4715,7 +5012,7 @@ TestResult test_target_output_isolation() {
 
     auto native = run_bake("build", dir);
     CHECK(native.success(), "native isolation build failed: " + native.stdout);
-    auto outputs = target_output_dirs(dir);
+    auto outputs = target_roots(dir);
     CHECK_EQ(outputs.size(), std::size_t(1),
              "native isolation build did not create one target directory");
     const std::string native_target = outputs.front().filename().string();
@@ -4725,20 +5022,20 @@ TestResult test_target_output_isolation() {
 
     auto cross = run_bake("build -t " + cross_target, dir);
     CHECK(cross.success(), "cross-target isolation build failed: " + cross.stdout);
-    outputs = target_output_dirs(dir);
+    outputs = target_roots(dir);
     CHECK_EQ(outputs.size(), std::size_t(2),
              "native and cross builds did not retain two isolated target roots");
 
     for (const auto& target : {native_target, cross_target}) {
-        const fs::path out = dir / "out" / target;
+        const fs::path out = dir / "out" / target / "dev";
         CHECK(fs::is_directory(out / "bin") &&
                   fs::is_directory(out / ".obj") &&
                   fs::is_directory(out / ".bake"),
               "target output is incomplete for " + target);
         CHECK(!read_file(out / ".bake/graph.json").empty(),
               "target graph is missing for " + target);
-        CHECK(!read_file(out / ".bake/fingerprints.json").empty(),
-              "target fingerprints are missing for " + target);
+        CHECK(fs::is_directory(out / ".bake/core"),
+              "target Core state is missing for " + target);
     }
     CHECK(!fs::exists(dir / "out/bin") &&
               !fs::exists(dir / "out/.bake"),
@@ -4772,6 +5069,7 @@ static std::vector<TestCase> all_tests = {
     {"lock_consistency",              test_lock_consistency},
     {"lock_transitive_consistency",   test_lock_transitive_consistency},
     {"frozen_missing_cache",          test_frozen_missing_cache},
+    {"frozen_cache_tamper",           test_frozen_cache_tamper},
     {"add_duplicate",                 test_add_duplicate},
     {"add_duplicate_compact",         test_add_duplicate_compact},
     {"add_no_tag",                    test_add_no_tag},
@@ -4798,6 +5096,7 @@ static std::vector<TestCase> all_tests = {
     {"run_build_cpp_declaration",     test_run_build_cpp_declaration},
     {"build_cpp_binary_module_imports", test_build_cpp_binary_module_imports},
     {"build_cpp_target_env",          test_build_cpp_target_env},
+    {"build_cpp_output",              test_build_cpp_output},
     {"header_incremental_rebuild",    test_header_incremental_rebuild},
     {"dependency_binaries_stay_out",  test_dependency_binaries_stay_out},
     {"source_less_executable_rejects_stale_output", test_source_less_executable_rejects_stale_output},

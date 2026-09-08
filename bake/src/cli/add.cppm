@@ -4,18 +4,7 @@ export module bake.cli.add;
 
 import std;
 import bake.util;
-import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
 import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
-import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
 import bake.cli.dep_edit;
 import bake.cli;
 

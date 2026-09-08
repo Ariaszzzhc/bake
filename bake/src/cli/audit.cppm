@@ -5,17 +5,6 @@ export module bake.cli.audit;
 import std;
 import bake.util;
 import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
-import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
-import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
 import bake.cli;
 
 namespace bake::cli {
@@ -26,7 +15,7 @@ namespace bake::cli {
 // system SDK headers or libraries beyond the kernel interface (dyld,
 // libSystem.B.dylib on macOS).
 
-export int cmd_audit(const ParsedArgs &args) {
+export int cmd_audit(const ParsedArgs &) {
   Path exe = get_self_exe_path();
   if (exe.string().empty())
     exe = "bake";

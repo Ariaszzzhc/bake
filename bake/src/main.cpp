@@ -74,7 +74,7 @@ int run(int argc, char *argv[]) {
   if (args.command == "compdb")
     return cmd_compdb(args);
   if (args.command == "lsp")
-    return bake::lsp_main(args.positional);
+    return bake::lsp_main(args.raw_arguments);
   // Internal: spawned by `bake lsp` for every frontend job.
   if (args.command == "lsp-worker")
     return bake::lsp_worker_main(args.positional);

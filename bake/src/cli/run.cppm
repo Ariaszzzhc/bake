@@ -1,136 +1,127 @@
-// bake.cli.run — the `run` command.
+module;
+
+#include <kota/async/io/loop.h>
+#include <kota/async/runtime/task.h>
 
 export module bake.cli.run;
 
 import std;
 import bake.util;
-import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
-import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
 import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
-import bake.cli.build;
+import bake.buildsystem.graph;
+import bake.buildsystem.moid;
+import bake.buildsystem.project;
+import bake.core.build;
+import bake.core.model;
+import bake.core.runtime;
+import bake.core.snapshot;
 import bake.cli;
+import bake.cli.build;
 
 namespace bake::cli {
+namespace {
 
-// ===== run command =====
+const ArtifactIdentity *main_executable(const BuiltProject &built,
+                                        std::string &error) {
+  const auto *ready = std::get_if<ReadyBuild>(&built.result.outcome);
+  if (!ready) {
+    error = "build result is not ready";
+    return nullptr;
+  }
+
+  struct Candidate {
+    std::string owner;
+    std::string name;
+  };
+  std::vector<Candidate> candidates;
+  for (const auto &root : built.project.snapshot->moid_graph.roots) {
+    auto node = built.project.snapshot->moid_graph.nodes.find(root);
+    if (node == built.project.snapshot->moid_graph.nodes.end() ||
+        node->second.declaration.type != MoidType::Executable)
+      continue;
+    candidates.push_back({root.value, node->second.declaration.name});
+  }
+  if (candidates.empty()) {
+    error = "cannot run non-executable package";
+    return nullptr;
+  }
+  if (candidates.size() > 1) {
+    std::ranges::sort(candidates, {}, &Candidate::owner);
+    std::string choices;
+    for (const auto &candidate : candidates) {
+      if (!choices.empty())
+        choices += ", ";
+      choices += candidate.owner + " (" + candidate.name + ")";
+    }
+    error = "multiple executable packages selected; use -p <member> to "
+            "choose one: " + choices;
+    return nullptr;
+  }
+
+  const auto &candidate = candidates.front();
+  const std::string output_name = library_name(
+      candidate.name, MoidType::Executable, built.project.context.target);
+  const ArtifactIdentity *selected = nullptr;
+  for (const auto &artifact : ready->artifacts) {
+    if (artifact.owner_moid != candidate.owner ||
+        artifact.output_name != output_name)
+      continue;
+    if (selected) {
+      error = "build result contains duplicate executable artifacts";
+      return nullptr;
+    }
+    selected = &artifact;
+  }
+  if (!selected)
+    error = "build result does not contain the selected executable";
+  return selected;
+}
+
+kota::task<int> run_command(const ParsedArgs &args) {
+  auto &loop = kota::event_loop::current();
+  const auto concurrency = requested_concurrency(args);
+  CoreRuntime runtime(
+      loop, {.max_concurrency = concurrency,
+             .background_concurrency = concurrency > 1 ? concurrency - 1 : 1});
+  auto built = co_await build_project(runtime, args);
+  if (!built) {
+    co_await runtime.shutdown();
+    std::println(std::cerr, "bake: {}", built.error());
+    co_return 1;
+  }
+
+  std::string error;
+  const ArtifactIdentity *executable = main_executable(*built, error);
+  if (!executable) {
+    co_await runtime.shutdown();
+    std::println(std::cerr, "bake: {}", error);
+    co_return 1;
+  }
+
+  CoreBuildService service(runtime);
+  auto capture = service.capture_execution(
+      built->project, built->result, *executable);
+  if (!capture) {
+    co_await runtime.shutdown();
+    std::println(std::cerr, "bake: {}", capture.error().message);
+    co_return 1;
+  }
+
+  auto result = run_process(capture->executable().string(), args.positional,
+                            built->project.context.workspace_root);
+  co_await runtime.shutdown();
+  co_return result.exit_code;
+}
+
+} // namespace
 
 export int cmd_run(const ParsedArgs &args) {
-  // First build
-  int build_result = cmd_build(args);
-  if (build_result != 0)
-    return build_result;
-
-  // Find the built executable
-  auto root = find_project_root();
-  if (!root)
-    return 1;
-
-  Path exe_path;
-
-  auto manifest = Manifest::load(*root);
-  if (!manifest) {
-    std::println(std::cerr, "bake: failed to load bake.toml");
+  auto [result] = kota::run(run_command(args));
+  if (!result) {
+    std::println(std::cerr, "bake: run operation did not complete");
     return 1;
   }
-
-  auto selected_member =
-      resolve_workspace_member_selection(*manifest, args.get_option("p"));
-  if (!selected_member) {
-    std::println(std::cerr, "bake: {}", selected_member.error());
-    return 1;
-  }
-
-  BuildSelection selection;
-  selection.workspace_member = std::move(*selected_member);
-  ResolvePolicy policy;
-  policy.offline = args.has_option("offline") || args.has_option("frozen");
-  auto outer_graph = resolve_moid_graph(*manifest, selection, policy,
-                          source_index_from_lock(*root));
-  if (!outer_graph) {
-    std::println(std::cerr, "bake: {}", outer_graph.error());
-    return 1;
-  }
-
-  std::vector<MoidDeclaration> executables;
-
-  // Parse cross-compile target (must match what cmd_build used).
-  TargetSpec target;
-  if (auto t = args.get_option("target"))
-    target = parse_target(*t);
-  else if (auto t = args.get_option("t"))
-    target = parse_target(*t);
-  selection.target_triple = selection_triple(target);
-  std::string triple_dir =
-      target.is_native() ? detect_host_target().triple_ : target.triple_;
-  const Path out_dir = *root / "out" / triple_dir;
-
-  for (const auto &id : outer_graph->roots) {
-    auto declaration =
-        read_moid_declaration(moid_declaration_path(out_dir, id.value));
-    if (!declaration) {
-      std::println(std::cerr, "bake: {}", declaration.error());
-      return 1;
-    }
-    if (declaration->id != id.value) {
-      std::println(std::cerr,
-                   "bake: persisted declaration identity does not match "
-                   "selected moid '{}'",
-                   id.value);
-      return 1;
-    }
-    if (declaration->type == MoidType::Executable)
-      executables.push_back(std::move(*declaration));
-  }
-
-  if (executables.empty()) {
-    std::println(std::cerr, "bake: cannot run non-executable package");
-    return 1;
-  }
-  std::sort(
-      executables.begin(), executables.end(),
-      [](const auto &left, const auto &right) { return left.id < right.id; });
-  if (executables.size() > 1) {
-    std::string candidates;
-    for (const auto &declaration : executables) {
-      if (!candidates.empty())
-        candidates += ", ";
-      candidates += declaration.id + " (" + declaration.name + ")";
-    }
-    std::println(std::cerr,
-                 "bake: multiple executable packages selected; use -p <member> "
-                 "to choose one: {}",
-                 candidates);
-    return 1;
-  }
-
-  const auto &executable = executables.front();
-
-  exe_path =
-      out_dir / "bin" / library_name(executable.name, executable.type, target);
-
-  if (!exe_path.exists()) {
-    std::println(std::cerr, "bake: built executable not found at {}",
-                 exe_path.string());
-    return 1;
-  }
-
-  // Build command line: executable + remaining args
-  std::vector<std::string> run_args;
-  for (auto &p : args.positional) {
-    run_args.push_back(p);
-  }
-
-  auto result = run_process(exe_path.string(), run_args, *root);
-  return result.exit_code;
+  return *result;
 }
 
 } // namespace bake::cli

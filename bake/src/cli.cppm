@@ -1,5 +1,5 @@
-// bake.cli — argument parsing, help text and the lock-enforcement
-// shared by every command implementation (bake.cli.* modules).
+// bake.cli — argument parsing and help text shared by every command
+// implementation (bake.cli.* modules).
 // The composition roots (src/main.cpp, src/stage0/main.cpp) own the
 // dispatch tables; this module owns everything the commands share.
 
@@ -7,18 +7,7 @@ export module bake.cli;
 
 import std;
 import bake.util;
-import bake.toolchain.target;
-import bake.toolchain.lld;
-import bake.toolchain.driver;
-import bake.toolchain.runtime;
 import bake.buildsystem.project;
-import bake.buildsystem.moid;
-import bake.buildsystem.graph;
-import bake.buildsystem.cmdgen;
-import bake.buildsystem.engine;
-import bake.buildsystem.package;
-import bake.buildsystem.query;
-import bake.json;
 
 #ifndef BAKE_VERSION
 #define BAKE_VERSION "0.1.0"
@@ -32,6 +21,9 @@ export struct ParsedArgs {
   std::string command;                 // subcommand (empty if none)
   std::vector<std::string> positional; // positional arguments
   std::vector<std::string> options;    // --flag or --key=value
+  // Every argv token except the subcommand, preserved in its original order
+  // for command-specific parsers such as the LSP entry point.
+  std::vector<std::string> raw_arguments;
   bool help = false;
   bool version = false;
 
@@ -76,7 +68,8 @@ export ParsedArgs parse_args(int argc, char *argv[]) {
   auto takes_value = [](std::string_view opt) {
     return opt == "--tag" || opt == "--type" || opt == "--std" ||
            opt == "--target" || opt == "--glibc-version" || opt == "--feature" ||
-           opt == "--profile" || opt == "-j" || opt == "-p" || opt == "-t";
+           opt == "--profile" || opt == "--index-jobs" || opt == "-j" ||
+           opt == "-p" || opt == "-t";
   };
 
   int i = 1;
@@ -85,28 +78,36 @@ export ParsedArgs parse_args(int argc, char *argv[]) {
 
     if (arg == "--help" || arg == "-h") {
       args.help = true;
+      args.raw_arguments.push_back(arg);
     } else if (arg == "--version" || arg == "-V") {
       args.version = true;
+      args.raw_arguments.push_back(arg);
     } else if (starts_with(arg, "--") ||
                (arg.size() > 1 && arg[0] == '-' && arg[1] != '\0')) {
       // It's an option
       if (contains(arg, "=")) {
         args.options.push_back(arg);
+        args.raw_arguments.push_back(arg);
       } else if (takes_value(arg)) {
         if (i + 1 < argc) {
           args.options.push_back(arg + "=" + argv[i + 1]);
+          args.raw_arguments.push_back(arg);
+          args.raw_arguments.push_back(argv[i + 1]);
           ++i;
         } else {
           // Missing value — push as empty to trigger validation errors
           args.options.push_back(std::string(arg) + "=");
+          args.raw_arguments.push_back(arg);
         }
       } else {
         args.options.push_back(arg);
+        args.raw_arguments.push_back(arg);
       }
     } else if (args.command.empty()) {
       args.command = arg;
     } else {
       args.positional.push_back(arg);
+      args.raw_arguments.push_back(arg);
     }
     ++i;
   }
@@ -116,10 +117,8 @@ export ParsedArgs parse_args(int argc, char *argv[]) {
 
 // ===== Shared feature-flag helpers =====
 
-namespace {
-
-std::optional<std::vector<std::string>>
-parse_feature_flags(const ParsedArgs &args) {
+export std::optional<std::vector<std::string>>
+parse_requested_features(const ParsedArgs &args) {
   std::vector<std::string> names;
   for (const auto &option : args.options) {
     if (!starts_with(option, "--feature="))
@@ -135,12 +134,11 @@ parse_feature_flags(const ParsedArgs &args) {
   }
   return names;
 }
-} // namespace
 
 export std::optional<std::vector<std::string>>
 parse_root_features(const Manifest &root, const ParsedArgs &args,
                     const std::optional<std::string> &selected_member) {
-  auto names = parse_feature_flags(args);
+  auto names = parse_requested_features(args);
   if (!names)
     return std::nullopt;
   if (names->empty())
@@ -184,16 +182,20 @@ parse_root_features(const Manifest &root, const ParsedArgs &args,
   return names;
 }
 
-// The triple used for target-scoped dependency filtering — same
-// convention as the engine's target-condition matching: native builds
-// carry the detected host triple.
-export std::string selection_triple(const TargetSpec &target) {
-  return target.is_native() ? detect_host_target().triple_ : target.triple_;
-}
-
 // ===== Help text =====
 
 export void print_version() { std::println("bake {}", BAKE_VERSION); }
+
+export std::string bake_version() { return BAKE_VERSION; }
+
+export std::size_t requested_concurrency(const ParsedArgs &args) {
+  if (auto jobs = args.get_option("j")) {
+    int parsed = std::atoi(jobs->c_str());
+    if (parsed > 0)
+      return static_cast<std::size_t>(parsed);
+  }
+  return std::max(1u, std::thread::hardware_concurrency());
+}
 
 export void print_help() {
   std::println(
@@ -302,107 +304,6 @@ export void print_command_help(std::string_view cmd) {
   } else {
     print_help();
   }
-}
-
-// ===== Lock enforcement =====
-
-// Check and resolve the lockfile before building. Returns 0 if the lock is
-// consistent or was successfully (re)resolved. Returns non-zero on failure.
-// On success, root/bake.lock is guaranteed to exist and be consistent.
-//
-// --locked/--frozen: full enforcement — consistency check + cache verification.
-// --offline (without --locked): skip — let resolve_moid_graph produce specific
-//   ownership diagnostics from the lockfile state.
-// Normal: resolve if needed, verify/redownload cache.
-export int enforce_lock(const Path &root, const Manifest &manifest,
-                 const ParsedArgs &args) {
-  if (Manifest::has_only_path_deps(manifest))
-    return 0;
-
-  // Lock usage policy, named after the CLI flags:
-  //   Update — check consistency; resolve/redownload as needed (default)
-  //   Locked — require a fresh lock and intact cache; never write
-  //   Frozen — Locked plus a hard network ban (--offline implies the rest)
-  enum class LockUsage { Update, Locked, Frozen };
-  const LockUsage usage = args.has_option("frozen")   ? LockUsage::Frozen
-                          : args.has_option("locked") ? LockUsage::Locked
-                                                      : LockUsage::Update;
-  const bool offline =
-      args.has_option("offline") || usage == LockUsage::Frozen;
-  const bool locked = usage != LockUsage::Update;
-
-  Path lock_path = root / "bake.lock";
-  auto lockfile = Lockfile::load(lock_path);
-
-  bool needs_resolve = !lockfile || !lockfile->is_consistent(manifest, root);
-
-  // CLI root features change the dependency closure: re-resolve so their
-  // conditional dependencies enter the lock (hints carry the rest).
-  std::set<std::string> cli_features;
-  {
-    auto member =
-        resolve_workspace_member_selection(manifest, args.get_option("p"));
-    if (!member) {
-      std::println(std::cerr, "bake: {}", member.error());
-      return 1;
-    }
-    auto names = parse_root_features(manifest, args, *member);
-    if (!names)
-      return 1;
-    cli_features.insert(names->begin(), names->end());
-    if (!cli_features.empty())
-      needs_resolve = true;
-  }
-
-  // For --locked/--frozen: full enforcement.
-  if (locked) {
-    if (needs_resolve) {
-      std::println(std::cerr, "bake: lock file missing or stale (--locked)");
-      return 1;
-    }
-    if (lockfile && !verify_lock_cache(*lockfile, get_cache_dir())) {
-      std::println(std::cerr, "bake: cache verification failed — cached "
-                              "sources missing or corrupted");
-      return 1;
-    }
-    return 0;
-  }
-
-  // For --offline without --locked: don't intercept. Let resolve_moid_graph
-  // produce specific ownership diagnostics from the lockfile.
-  if (offline)
-    return 0;
-
-  // Normal build: verify cache when lock is consistent.
-  if (!needs_resolve && lockfile) {
-    if (!verify_lock_cache(*lockfile, get_cache_dir())) {
-      Resolver resolver;
-      if (!resolver.redownload(*lockfile, ResolverConfig{}) ||
-          !verify_lock_cache(*lockfile, get_cache_dir())) {
-        std::println(std::cerr, "bake: re-download failed. Run 'bake update' "
-                                "to re-resolve from scratch.");
-        return 1;
-      }
-    }
-    return 0;
-  }
-
-  // Normal build, lock missing/stale: resolve dependencies. Entries whose
-  // url+ref still match the stale lock are carried over — only new or
-  // changed dependencies touch the network.
-  Resolver resolver;
-  auto new_lock = resolver.resolve(manifest, ResolverConfig{},
-                                   lockfile ? &*lockfile : nullptr,
-                                   cli_features);
-  if (!new_lock) {
-    std::println(std::cerr, "bake: failed to resolve dependencies");
-    return 1;
-  }
-  if (!new_lock->save(lock_path)) {
-    std::println(std::cerr, "bake: failed to write bake.lock");
-    return 1;
-  }
-  return 0;
 }
 
 } // namespace bake::cli

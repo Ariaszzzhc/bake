@@ -1,0 +1,1335 @@
+export module bake.stage0.package;
+
+import std;
+import bake.util;
+import bake.net;
+import bake.archive;
+import bake.stage0.project;
+import bake.stage0.semver;
+import bake.json;
+namespace json = bake::json;
+
+// ============================================================
+// bake.stage0.package — Resolver, Fetcher, Cache
+// ============================================================
+
+namespace bake {
+
+// ===== Lockfile (JSON, flat identity-keyed entries) =====
+//
+// Format:
+// {
+//   "deps": {
+//     "git:<url>@<commit>":     { "url": "...", "ref": "...", "ref_type": "tag",
+//                                 "commit": "...", "integrity": "sha256-...",
+//                                 "name": "fmt" },
+//     "archive:<url>":          { "url": "...", "ref_type": "archive",
+//                                 "integrity": "sha256-..." }
+//   }
+// }
+//
+// Identity rules (lock key): uniform locator identity —
+//   git dep:     "git:<normalized-url>@<commit>"
+//   archive dep: "archive:<normalized-url>"
+// "name" is a display annotation ([package].name of native sources), not
+// part of identity. Path dependencies are manifest-only and never locked.
+
+export struct LockDep {
+    std::string key;          // identity key
+    std::string name;         // display annotation ([package].name, native only)
+    std::string url;          // as declared
+    std::string ref;          // ref value (tag/branch/commit; "" = default branch)
+    std::string ref_type;     // "tag" | "branch" | "rev" | "head" | "archive"
+    std::string commit;       // resolved commit (git deps only)
+    std::string integrity;    // "sha256-<tree-hash>"
+
+    bool is_remote() const { return !url.empty(); }
+    bool is_archive() const { return ref_type == "archive"; }
+
+    // Extract the bare hex hash from "sha256-<hex>".
+    std::string cache_hash() const {
+        if (integrity.empty()) return {};
+        auto pos = integrity.find('-');
+        return pos == std::string::npos ? integrity : integrity.substr(pos + 1);
+    }
+};
+
+export struct Lockfile {
+    std::map<std::string, LockDep> deps;   // identity key → dep
+
+    static std::optional<Lockfile> load(const Path& path) {
+        if (!path.is_regular_file()) return std::nullopt;
+
+        auto content = read_file(path);
+        if (!content) return std::nullopt;
+
+        Lockfile lf;
+
+        json::Value doc;
+        try {
+            doc = json::Value::parse(*content);
+        } catch (...) {
+            return std::nullopt;
+        }
+
+        if (!doc.is_object()) return std::nullopt;
+        const json::Value* deps_it = doc.find("deps");
+        if (!deps_it || !deps_it->is_object()) return std::nullopt;
+
+        for (const auto& item : deps_it->items()) {
+            const auto& val = item.value();
+            if (!val.is_object()) continue;
+            LockDep dep;
+            dep.key = item.key();
+            if (auto v = val.value("url", ""); !v.empty()) dep.url = v;
+            if (auto v = val.value("ref", ""); !v.empty()) dep.ref = v;
+            if (auto v = val.value("ref_type", ""); !v.empty()) dep.ref_type = v;
+            if (auto v = val.value("commit", ""); !v.empty()) dep.commit = v;
+            if (auto v = val.value("integrity", ""); !v.empty()) dep.integrity = v;
+            if (auto v = val.value("name", ""); !v.empty()) dep.name = v;
+            // Entries without a URL (pre-rename path entries) are dropped;
+            // the next resolve rebuilds the lock without them.
+            if (!dep.is_remote()) continue;
+            lf.deps[dep.key] = std::move(dep);
+        }
+
+        return lf;
+    }
+
+    bool save(const Path& path) const {
+        json::Value doc = json::Value::object();
+        json::Value deps_obj = json::Value::object();
+
+        for (auto& [key, dep] : deps) {
+            json::Value entry = json::Value::object();
+            entry["url"] = dep.url;
+            if (dep.is_archive()) {
+                entry["ref_type"] = "archive";
+                entry["integrity"] = dep.integrity;
+            } else {
+                entry["ref"] = dep.ref;
+                entry["ref_type"] = dep.ref_type;
+                entry["commit"] = dep.commit;
+                entry["integrity"] = dep.integrity;
+            }
+            if (!dep.name.empty()) entry["name"] = dep.name;
+            deps_obj[key] = std::move(entry);
+        }
+
+        doc["deps"] = std::move(deps_obj);
+
+        std::string content = doc.dump(2) + "\n";
+        return atomic_write_file(path, content);
+    }
+
+    // Find a locked remote dep by normalized URL + ref identity
+    // (ref_type + ref value; archives match on URL alone).
+    const LockDep* find_remote(const std::string& dep_url,
+                               const std::string& ref_type,
+                               const std::string& ref) const {
+        std::string norm = normalize_dependency_url(dep_url);
+        for (auto& [key, dep] : deps) {
+            if (!dep.is_remote()) continue;
+            if (normalize_dependency_url(dep.url) == norm &&
+                dep.ref_type == ref_type && dep.ref == ref) {
+                return &dep;
+            }
+        }
+        return nullptr;
+    }
+
+    // The unique tag entry locked for a URL, if exactly one exists.
+    // Version-constrained dependencies resolve to this under a
+    // pre-existing lock; ambiguity (two tags of one URL) returns null so
+    // callers solve fresh or report.
+    const LockDep* find_tag_entry(const std::string& dep_url) const {
+        std::string norm = normalize_dependency_url(dep_url);
+        const LockDep* found = nullptr;
+        for (auto& [key, dep] : deps) {
+            if (!dep.is_remote()) continue;
+            if (normalize_dependency_url(dep.url) == norm &&
+                dep.ref_type == "tag") {
+                if (found) return nullptr;
+                found = &dep;
+            }
+        }
+        return found;
+    }
+
+    // Recursively check staleness across every declared scope (global and
+    // all [target.*] tables): every remote dep in the closure must have a
+    // matching lock entry with a resolved commit (git) and integrity.
+    // Orphan entries are not staleness — the next resolve rebuilds the lock
+    // from the closure and prunes them (remove also prunes explicitly).
+    bool is_consistent(const Manifest& manifest, const Path& root) const {
+        std::set<Path> visited;
+        return check_consistency(manifest, root, visited);
+    }
+
+  private:
+    bool check_consistency(const Manifest& manifest, const Path& root,
+                           std::set<Path>& visited) const {
+        // Workspace members are first-class dependency scopes: their
+        // declarations must be locked too.
+        for (const auto& member : Manifest::member_manifests(manifest)) {
+            if (!check_consistency(member, root, visited)) return false;
+        }
+
+        std::vector<const std::map<std::string, Dependency>*> scopes;
+        scopes.push_back(&manifest.dependencies);
+        for (const auto& condition : manifest.targets)
+            scopes.push_back(&condition.dependencies);
+
+        for (auto* scope : scopes) {
+            for (auto& [alias, dep] : *scope) {
+                (void)alias;
+                if (dep.is_path_dep) {
+                    // Recurse into path dep manifests
+                    Path dep_dir = (manifest.project_dir / dep.path.c_str())
+                                       .lexically_normal();
+                    Path dep_toml = dep_dir / "bake.toml";
+                    if (!dep_toml.is_regular_file()) continue;
+                    auto canonical = dep_dir.absolute();
+                    if (visited.insert(canonical).second) {
+                        auto sub = Manifest::load(dep_dir);
+                        if (sub && sub->has_moid()) {
+                            sub->project_dir = dep_dir;
+                            if (!check_consistency(*sub, root, visited))
+                                return false;
+                        }
+                    }
+                    continue;
+                }
+
+                // Remote dep: must have a lock entry with full identity.
+                std::string ref_type = dep.is_archive() ? "archive" : "";
+                std::string ref;
+                if (ref_type.empty()) {
+                    auto pair = dep.git_ref();
+                    ref_type = pair.first;
+                    ref = pair.second;
+                }
+
+                const LockDep* locked = nullptr;
+                if (!dep.version.empty()) {
+                    // Version-constrained: the lock must pin a tag for
+                    // this URL that still satisfies the requirement.
+                    locked = find_tag_entry(dep.url);
+                    if (locked) {
+                        auto req = semver::Req::parse(dep.version);
+                        auto got = semver::Version::parse(locked->ref);
+                        if (!req || !got) {
+                            locked = nullptr;
+                        } else {
+                            std::vector<semver::Req> only{*req};
+                            if (!semver::satisfies_all(*got, only))
+                                locked = nullptr;
+                        }
+                    }
+                } else {
+                    locked = find_remote(dep.url, ref_type, ref);
+                }
+                if (!locked) return false;
+                if (locked->integrity.empty()) return false;
+                if (!dep.is_archive() && locked->commit.empty()) return false;
+            }
+        }
+        return true;
+    }
+
+
+};
+
+// Get the global source cache directory
+export Path get_cache_dir() {
+#ifdef _WIN32
+    const char* home = std::getenv("LOCALAPPDATA");
+    if (!home) home = "C:\\";
+    return Path(home) / "bake" / "src";
+#else
+    const char* home = std::getenv("HOME");
+    if (!home) home = "/tmp";
+    return Path(home) / ".cache" / "bake" / "src";
+#endif
+}
+
+// ===== Resolver configuration =====
+
+export struct ResolverConfig {
+    bool offline = false;
+    bool frozen = false;
+};
+
+// ===== Resolver =====
+
+export class Resolver {
+public:
+    Resolver(Path cache_dir = get_cache_dir()) : cache_dir_(std::move(cache_dir)) {}
+
+    // Resolve the remote dependency closure from every declared scope of
+    // the manifest (global + all [target.*] tables). Existing lock entries
+    // matching a declared url+ref are carried over verbatim — the network
+    // is only touched for new or changed dependencies. Returns a fresh
+    // lockfile covering exactly the closure (orphan entries pruned).
+    std::optional<Lockfile> resolve(const Manifest& manifest,
+                                    const ResolverConfig& config,
+                                    const Lockfile* hints = nullptr,
+                                    const std::set<std::string>&
+                                        root_features = {});
+
+    // Resolve a single remote dependency (network): ref → commit →
+    // download → extract → tree hash. Returns the lock entry.
+    std::optional<LockDep> resolve_dependency(const Dependency& dep);
+
+    // Re-download cached sources for all lock entries using existing locked
+    // commits/URLs. Does NOT re-resolve refs. Used when cache is
+    // missing/corrupted but lock is valid.
+    bool redownload(const Lockfile& lockfile, const ResolverConfig& config);
+
+    // Fetch a single locked entry's sources by identity (no ref
+    // re-resolution, tree hash verified). No-op when already cached.
+    bool ensure_cached(const LockDep& dep);
+
+private:
+    Path cache_dir_;
+
+    // ref → commit via git ls-remote. "rev" passes through verbatim,
+    // "head" resolves the remote's HEAD.
+    std::optional<std::string> resolve_ref(const std::string& url,
+                                           const std::string& ref_type,
+                                           const std::string& ref);
+
+    // Download an archive URL verbatim to dest_dir/<file_name>.
+    std::optional<Path> download_archive(const std::string& url,
+                                         const std::string& file_name,
+                                         const Path& dest_dir);
+
+    // Compute SHA-256 of a file
+    std::string file_hash(const Path& file);
+
+    // Safely extract a tarball/zip to a directory (strips top-level prefix)
+    bool extract_archive(const Path& archive, const Path& dest_dir);
+
+    // Compute tree SHA-256 (normalized hash of all files in directory)
+    std::string compute_tree_hash(const Path& dir);
+
+    // Obtain a remote dependency's source tree in a fresh work directory
+    // under the cache. Archives download verbatim; git deps try the host's
+    // tarball endpoint (GitHub/GitLab style) first and fall back to a full
+    // `git clone` + checkout when the host has none. Returns the extracted
+    // directory; the caller moves it into the content cache.
+    std::optional<Path> fetch_sources(const std::string& url, bool is_archive,
+                                      const std::string& commit);
+
+    // Clone url and check out an exact commit into dest_dir. .git is
+    // transport detail — the cache holds bare sources, and dropping it
+    // keeps the tree identical to the tarball transport.
+    bool fetch_via_clone(const std::string& url, const std::string& commit,
+                         const Path& dest_dir);
+};
+
+// Tree hash of a source directory, used by the CLI layer's cache
+// verification. (engine intentionally never imports this module — the
+// build side consumes remote sources through the SourceIndex injected by
+// the composition root, never through the package domain.)
+export inline std::string compute_tree_sha256(const Path& dir) {
+    std::vector<std::pair<std::string, std::string>> entries;
+
+    for (auto& entry : std::filesystem::recursive_directory_iterator(dir.fs())) {
+        // Skip bake-internal sentinel files — they are not part of the source.
+        if (entry.path().filename() == ".bake-verified") continue;
+
+        // Use lexically_relative instead of filesystem::relative.
+        // filesystem::relative() resolves symlinks, so a symlink and its
+        // target would hash identically. lexically_relative() does a pure
+        // lexical computation that preserves the symlink's own path identity.
+        auto rel = entry.path().lexically_relative(dir.fs());
+        std::string path = rel.string();
+
+        for (auto& c : path) {
+            if (c == '\\') c = '/';
+        }
+
+        // The tree identity is path + kind + content. Permission bits are
+        // deliberately excluded: they are extractor and OS detail, not
+        // source identity. tar preserves them, unzip discards them, the
+        // libarchive transport normalizes them — and the platforms
+        // themselves disagree (lstat reports symlink modes as 0777 on
+        // Linux but 0755 on macOS), which made identical tarballs hash
+        // differently across machines.
+        auto status = entry.symlink_status();
+
+        std::string contribution = path;
+        contribution += '|';
+
+        if (std::filesystem::is_symlink(status)) {
+            std::error_code ec;
+            contribution += "S:";
+            contribution += std::filesystem::read_symlink(entry.path(), ec).string();
+        } else if (std::filesystem::is_regular_file(status)) {
+            contribution += "F:";
+            contribution += SHA256::hex_file(Path(entry.path()));
+        } else if (std::filesystem::is_directory(status)) {
+            contribution += "D";
+        } else {
+            continue;
+        }
+
+        entries.push_back({path, contribution});
+    }
+
+    std::sort(entries.begin(), entries.end());
+
+    std::string combined;
+    for (auto& [path, data] : entries) {
+        combined += data;
+        combined += '\n';
+    }
+
+    return SHA256::hex(combined);
+}
+
+// Extract a short display name from an identity key.
+//   "brotli"                               → "brotli"
+//   "git:https://github.com/Mbed-TLS/mbedtls@abc123" → "mbedtls"
+inline std::string display_name_for_key(const std::string& key) {
+    if (!key.starts_with("git:")) return key;
+    // Strip "git:" prefix, take URL up to '@', extract last path segment.
+    std::string url = key.substr(4);
+    auto at = url.find('@');
+    if (at != std::string::npos) url = url.substr(0, at);
+    // Remove trailing slash.
+    while (!url.empty() && url.back() == '/') url.pop_back();
+    auto slash = url.find_last_of('/');
+    if (slash != std::string::npos) return url.substr(slash + 1);
+    return url;
+}
+
+// Extract repo name from a URL (last path segment, no extension).
+//   "https://github.com/curl/curl" → "curl"
+inline std::string repo_name_from_url(const std::string& url) {
+    std::string u = url;
+    while (!u.empty() && u.back() == '/') u.pop_back();
+    auto slash = u.find_last_of('/');
+    std::string name = (slash != std::string::npos) ? u.substr(slash + 1) : u;
+    auto dot = name.find_last_of('.');
+    if (dot != std::string::npos) name = name.substr(0, dot);
+    return name;
+}
+
+// Verify that cached source for every remote lock entry matches its integrity.
+// Detects tampering with cached dependencies. Called by the CLI layer.
+// Silent on cache miss (caller handles messaging); prints only on tamper.
+//
+// A `.bake-verified` sentinel is written inside each cache dir after a
+// successful full-tree verification. Subsequent calls compare the sentinel
+// to the expected hash and skip the expensive tree walk when they match.
+export inline bool verify_lock_cache(const Lockfile& lockfile, const Path& cache_dir) {
+    for (auto& [key, dep] : lockfile.deps) {
+        if (!dep.is_remote()) continue;
+        std::string hash = dep.cache_hash();
+        if (hash.empty()) continue;
+
+        Path cache_path = cache_dir / hash;
+        if (!cache_path.is_directory()) return false;
+
+        // Fast path: sentinel exists and matches expected hash.
+        Path sentinel = cache_path / ".bake-verified";
+        if (sentinel.is_regular_file()) {
+            if (auto content = read_file(sentinel)) {
+                if (*content == hash) continue;
+            }
+        }
+
+        // Slow path: full tree SHA-256.
+        std::string actual_hash = compute_tree_sha256(cache_path);
+        if (actual_hash != hash) {
+            std::println(std::cerr,
+                "bake: cache tampered for '{}' (expected {}, got {})",
+                display_name_for_key(key), hash.substr(0, 12),
+                actual_hash.substr(0, 12));
+            return false;
+        }
+
+        write_file(sentinel, hash);
+    }
+    return true;
+}
+
+// ===== Implementation =====
+
+inline std::optional<std::string> Resolver::resolve_ref(
+        const std::string& url, const std::string& ref_type,
+        const std::string& ref) {
+    // A pinned commit resolves to itself.
+    if (ref_type == "rev") return ref;
+
+    // Build the ls-remote refspecs:
+    //   tag    → the tag ref and its peeled form (^{} gives the commit for
+    //            annotated tags; lightweight tags only have the plain ref)
+    //   branch → the branch ref
+    //   head   → the remote's default branch
+    std::vector<std::string> cmd = {"git", "ls-remote", url};
+    if (ref_type == "tag") {
+        cmd.push_back("refs/tags/" + ref);
+        cmd.push_back("refs/tags/" + ref + "^{}");
+    } else if (ref_type == "branch") {
+        cmd.push_back("refs/heads/" + ref);
+    } else {
+        cmd.push_back("HEAD");
+    }
+
+    auto result = run_process(cmd, Path(), true);
+    if (!result.success()) return std::nullopt;
+
+    // Prefer the peeled (^{}) entry; fall back to the first plain ref.
+    std::string commit;
+    std::string fallback_commit;
+
+    auto& out = result.stdout_output;
+    std::size_t pos = 0;
+    while (pos < out.size()) {
+        std::size_t tab = out.find('\t', pos);
+        if (tab == std::string::npos) break;
+        std::size_t eol = out.find('\n', tab);
+        if (eol == std::string::npos) eol = out.size();
+
+        std::string sha = out.substr(pos, tab - pos);
+        std::string found_ref = out.substr(tab + 1, eol - tab - 1);
+
+        // Trim whitespace
+        while (!sha.empty() &&
+               (sha.back() == '\n' || sha.back() == '\r' || sha.back() == ' '))
+            sha.pop_back();
+
+        if (found_ref.find("^{}") != std::string::npos) {
+            commit = sha;  // peeled commit — always prefer
+        } else if (fallback_commit.empty()) {
+            fallback_commit = sha;
+        }
+
+        pos = eol + 1;
+    }
+
+    if (!commit.empty()) return commit;
+    if (!fallback_commit.empty()) return fallback_commit;
+    return std::nullopt;
+}
+
+inline std::string Resolver::file_hash(const Path& file) {
+    return SHA256::hex_file(file);
+}
+
+// Build the archive download URL for a given host.
+inline std::string build_archive_url(const std::string& url, const std::string& commit) {
+    // Normalize: strip trailing .git
+    std::string base = url;
+    if (ends_with(base, ".git")) {
+        base = base.substr(0, base.size() - 4);
+    }
+
+    // Detect host
+    if (base.find("gitlab.com") != std::string::npos ||
+        base.find("gitlab") != std::string::npos) {
+        // GitLab: <base>/-/archive/<commit>/<repo>.tar.gz
+        std::size_t last_slash = base.find_last_of('/');
+        std::string repo = (last_slash != std::string::npos)
+                           ? base.substr(last_slash + 1) : "repo";
+        return base + "/-/archive/" + commit + "/" + repo + ".tar.gz";
+    }
+
+    // GitHub and GitHub-compatible hosts (default):
+    // <base>/archive/<commit>.tar.gz
+    return base + "/archive/" + commit + ".tar.gz";
+}
+
+inline std::optional<Path> Resolver::download_archive(const std::string& url,
+                                                       const std::string& file_name,
+                                                       const Path& dest_dir) {
+    dest_dir.mkdir_recursive();
+
+    Path archive_path = dest_dir / file_name;
+
+    if (!net::download(url, archive_path)) {
+        std::println(std::cerr, "bake: failed to download {}", url);
+        return std::nullopt;
+    }
+
+    if (!archive_path.is_regular_file() || archive_path.string() == "") {
+        std::println(std::cerr, "bake: downloaded file missing");
+        return std::nullopt;
+    }
+
+    return archive_path;
+}
+
+inline bool Resolver::extract_archive(const Path& archive, const Path& dest_dir) {
+    // The safety policy — path/link rejection, resource caps, and
+    // post-extraction verification — is enforced inside bake.archive
+    // by both transports (stage0: tar/unzip, stage1: libarchive).
+
+    // Create a uniquely-named temp directory for extraction.
+    std::random_device rd;
+    std::uniform_int_distribution<unsigned> dist(0, 0xFFFFFF);
+    std::string suffix;
+    for (int i = 0; i < 6; ++i) {
+        char hex[4];
+        std::snprintf(hex, sizeof(hex), "%02x", dist(rd) & 0xFF);
+        suffix += hex;
+    }
+    Path tmp_dir = cache_dir_ / (".extract-" + suffix);
+    tmp_dir.remove_all();
+    tmp_dir.mkdir_recursive();
+
+    if (!arch::extract(archive, tmp_dir)) {
+        tmp_dir.remove_all();
+        return false;
+    }
+
+    // Find the top-level directory (tarballs usually have one prefix dir).
+    std::string prefix_dir;
+    int top_count = 0;
+    for (auto& entry : std::filesystem::directory_iterator(tmp_dir.fs())) {
+        top_count++;
+        if (top_count == 1 && entry.is_directory()) {
+            prefix_dir = entry.path().filename().string();
+        }
+    }
+
+    if (top_count == 1 && !prefix_dir.empty()) {
+        Path prefix_path = tmp_dir / prefix_dir;
+        dest_dir.remove_all();
+        dest_dir.parent().mkdir_recursive();
+        std::filesystem::rename(prefix_path.fs(), dest_dir.fs());
+        tmp_dir.remove_all();
+    } else {
+        dest_dir.remove_all();
+        dest_dir.parent().mkdir_recursive();
+        std::filesystem::rename(tmp_dir.fs(), dest_dir.fs());
+    }
+
+    return true;
+}
+
+inline std::string Resolver::compute_tree_hash(const Path& dir) {
+    return compute_tree_sha256(dir);
+}
+
+inline bool Resolver::fetch_via_clone(const std::string& url,
+                                      const std::string& commit,
+                                      const Path& dest_dir) {
+    dest_dir.remove_all();
+
+    std::vector<std::string> clone = {"git", "clone", "--quiet", "--no-checkout",
+                                      url, dest_dir.string()};
+    if (!run_process(clone, Path(), true).success()) {
+        std::println(std::cerr, "bake: failed to clone {}", url);
+        dest_dir.remove_all();
+        return false;
+    }
+
+    auto checkout = [&]() {
+        return run_process({"git", "-C", dest_dir.string(), "checkout",
+                            "--quiet", "--detach", commit},
+                           Path(), true)
+            .success();
+    };
+
+    // The commit is normally reachable from a branch or tag in a standard
+    // clone. If it is not (deleted branch, uploaded-only object), ask the
+    // server for the SHA directly before giving up.
+    if (!checkout()) {
+        run_process({"git", "-C", dest_dir.string(), "fetch", "--quiet",
+                     "origin", commit},
+                    Path(), true);
+        if (!checkout()) {
+            std::println(std::cerr, "bake: commit {} not found in {}",
+                         commit, url);
+            dest_dir.remove_all();
+            return false;
+        }
+    }
+
+    (dest_dir / ".git").remove_all();
+    return true;
+}
+
+inline std::optional<Path> Resolver::fetch_sources(const std::string& url,
+                                                   bool is_archive,
+                                                   const std::string& commit) {
+    std::println("  Downloading {}",
+                 is_archive ? url.substr(url.find_last_of('/') + 1)
+                            : repo_name_from_url(url));
+
+    Path download_dir = cache_dir_ / ".downloads";
+    std::string download_url = url;
+    std::string file_name = SHA256::hex(url).substr(0, 24) +
+                            archive_extension(url);
+    if (!is_archive) {
+        download_url = build_archive_url(url, commit);
+        file_name = commit + ".tar.gz";
+    }
+
+    if (auto archive = download_archive(download_url, file_name, download_dir)) {
+        std::string transport_hash = file_hash(*archive);
+        Path extracted = cache_dir_ / (".work-" + transport_hash.substr(0, 12));
+        bool ok = extract_archive(*archive, extracted);
+        archive->remove();
+        if (ok) return extracted;
+    }
+
+    // Archives have no clone transport. Git deps fall back to a full clone
+    // when the host exposes no tarball endpoint.
+    if (is_archive) return std::nullopt;
+
+    std::println("  No tarball endpoint for {}; cloning", repo_name_from_url(url));
+    Path clone_dir = cache_dir_ / (".clone-" + commit.substr(0, 12));
+    if (!fetch_via_clone(url, commit, clone_dir)) return std::nullopt;
+    return clone_dir;
+}
+
+
+inline std::optional<LockDep> Resolver::resolve_dependency(const Dependency& dep) {
+    if (!dep.is_remote()) return std::nullopt;  // path deps are manifest-only
+
+    // Version requirements are solved (rewritten to a concrete tag)
+    // before queueing; reaching here unsolved is an internal error.
+    if (!dep.version.empty()) return std::nullopt;
+
+    const bool is_archive = dep.is_archive();
+    std::string ref_type = is_archive ? "archive" : "";
+    std::string ref;
+    std::string commit;
+
+    if (!is_archive) {
+        auto pair = dep.git_ref();
+        ref_type = pair.first;
+        ref = pair.second;
+
+        if (ref_type == "rev") {
+            commit = ref;  // pinned commit resolves to itself
+        } else {
+            std::println("  Resolving {} of {}",
+                         ref_type == "head" ? "default branch" : ref_type + " '" + ref + "'",
+                         repo_name_from_url(dep.url));
+            auto resolved = resolve_ref(dep.url, ref_type, ref);
+            if (!resolved) {
+                std::println(std::cerr,
+                    "bake: failed to resolve {} '{}' for {}",
+                    ref_type, ref, dep.url);
+                return std::nullopt;
+            }
+            commit = *resolved;
+        }
+    }
+
+    // Download, extract, tree-hash, move into the content cache.
+    auto extracted = fetch_sources(dep.url, is_archive, commit);
+    if (!extracted) return std::nullopt;
+
+    std::string tree_hash = compute_tree_hash(*extracted);
+
+    Path final_dir = cache_dir_ / tree_hash;
+    if (!final_dir.exists()) {
+        final_dir.parent().mkdir_recursive();
+        std::filesystem::rename(extracted->fs(), final_dir.fs());
+    } else {
+        extracted->remove_all();
+    }
+
+    // Native sources carry their moid name as the lock annotation.
+    std::string name;
+    if (auto native = Manifest::load_moid(final_dir))
+        name = native->moid->name;
+
+    LockDep node;
+    node.url = dep.url;
+    node.ref = is_archive ? "" : ref;
+    node.ref_type = ref_type;
+    node.commit = is_archive ? "" : commit;
+    node.integrity = "sha256-" + tree_hash;
+    node.name = std::move(name);
+    node.key = is_archive
+        ? "archive:" + normalize_dependency_url(dep.url)
+        : "git:" + normalize_dependency_url(dep.url) + "@" + commit;
+
+    return node;
+}
+
+inline bool Resolver::ensure_cached(const LockDep& dep) {
+    std::string hash = dep.cache_hash();
+    if (hash.empty()) return true;
+
+    Path cached = cache_dir_ / hash;
+    if (cached.is_directory()) return true;  // already cached
+
+    // A git entry without a resolved commit cannot be fetched by
+    // identity; the next resolve re-locks it.
+    if (!dep.is_archive() && dep.commit.empty()) return true;
+
+    cache_dir_.mkdir_recursive();
+
+    // Download by locked identity (no ref re-resolution)
+    auto extracted = fetch_sources(dep.url, dep.is_archive(), dep.commit);
+    if (!extracted) {
+        std::println(std::cerr, "bake: download failed for '{}'", dep.key);
+        return false;
+    }
+
+    // Verify the tree hash against the lock
+    std::string tree_hash = compute_tree_hash(*extracted);
+    if (tree_hash != hash) {
+        std::println(std::cerr,
+            "bake: tree hash mismatch for '{}' (expected {}, got {})",
+            dep.key, hash.substr(0, 12), tree_hash.substr(0, 12));
+        extracted->remove_all();
+        return false;
+    }
+
+    // Move to final cache location
+    Path final_dir = cache_dir_ / tree_hash;
+    final_dir.parent().mkdir_recursive();
+    std::filesystem::rename(extracted->fs(), final_dir.fs());
+    return true;
+}
+
+inline bool Resolver::redownload(const Lockfile& lockfile, const ResolverConfig& config) {
+    if (config.offline || config.frozen) {
+        std::println(std::cerr, "bake: cannot re-download in offline/frozen mode");
+        return false;
+    }
+
+    for (auto& [key, dep] : lockfile.deps) {
+        (void)key;
+        if (!dep.is_remote()) continue;
+        if (!ensure_cached(dep)) return false;
+    }
+
+    return true;
+}
+inline std::optional<Lockfile> Resolver::resolve(const Manifest& manifest,
+                                                 const ResolverConfig& config,
+                                                 const Lockfile* hints,
+                                                 const std::set<std::string>&
+                                                     root_features) {
+    if (config.offline || config.frozen) {
+        std::println(std::cerr, "bake: cannot resolve dependencies in offline/frozen mode");
+        return std::nullopt;
+    }
+
+    cache_dir_.mkdir_recursive();
+
+    Lockfile lockfile;
+
+    // ===== Version solving ==============================================
+    //
+    // `version = "..."` dependencies carry a semver requirement instead
+    // of a git ref. The solver registers every requirement seen in the
+    // closure, then picks a tag per URL:
+    //
+    //   1. a tag carried by an existing lock (hints) that satisfies all
+    //      registered requirements — builds never move a locked choice;
+    //   2. otherwise the highest version tag satisfying every
+    //      requirement (and any exact tag pinned on the same URL),
+    //      never below a choice made by an earlier pass.
+    //
+    // Requirements are discovered while walking manifests, so a choice
+    // can be invalidated by a constraint arriving after the package was
+    // already expanded. The BFS then restarts with the stale selection
+    // as a floor; selections are monotone, so passes converge.
+
+    // Tag lists per normalized URL — shared across passes (one
+    // ls-remote per URL per resolve()).
+    std::map<std::string, std::vector<std::string>> tag_lists;
+
+    // Selection floors per URL: tag chosen by any pass. Never lowered.
+    std::map<std::string, std::string> floors;
+
+    auto list_tags = [&](const std::string& url) {
+        std::string key = normalize_dependency_url(url);
+        if (auto it = tag_lists.find(key); it != tag_lists.end())
+            return it->second;
+        std::vector<std::string> tags;
+        auto result =
+            run_process({"git", "ls-remote", "--tags", url}, Path(), true);
+        if (result.success()) {
+            auto& out = result.stdout_output;
+            std::size_t pos = 0;
+            while (pos < out.size()) {
+                std::size_t tab = out.find('\t', pos);
+                if (tab == std::string::npos) break;
+                std::size_t eol = out.find('\n', tab);
+                if (eol == std::string::npos) eol = out.size();
+                std::string ref = out.substr(tab + 1, eol - tab - 1);
+                constexpr std::string_view prefix = "refs/tags/";
+                if (ref.starts_with(prefix) &&
+                    ref.find("^{}") == std::string::npos)
+                    tags.push_back(ref.substr(prefix.size()));
+                pos = eol + 1;
+            }
+        } else {
+            std::println(std::cerr, "bake: failed to list tags of {}",
+                         url);
+        }
+        tag_lists.emplace(key, tags);
+        return tags;
+    };
+
+    // BFS queue: (dep, parent manifest dir, features the consumer
+    // activated on this dependency, parent display name).
+    //
+    // The lock carries the union over every target and every reachable
+    // feature activation: default features always, explicit activations
+    // arriving on dependency edges. Conflicts are not checked here —
+    // they are a per-build-target concern validated during graph
+    // resolution.
+    struct QueueEntry {
+        Dependency dep;
+        Path manifest_dir;
+        std::set<std::string> features;
+        std::string parent;
+    };
+    std::vector<QueueEntry> queue;
+
+    // Per-pass state, rebuilt on every restart.
+    std::map<std::string, std::set<std::string>> activated_by_key;
+    std::map<Path, std::set<std::string>> activated_by_path;
+    // Requirements registered this pass: url -> (requirement, parent).
+    struct Requirement {
+        semver::Req req;
+        std::string parent;
+    };
+    std::map<std::string, std::vector<Requirement>> requirements;
+    // Exact tag pins seen this pass: url -> (tag, parent).
+    std::map<std::string, std::pair<std::string, std::string>> pins;
+    // URL -> tag whose sources were expanded this pass.
+    std::map<std::string, std::string> expanded;
+
+    auto active_features_of = [&](const Manifest& m,
+                                  const std::set<std::string>& extra)
+            -> std::optional<std::set<std::string>> {
+        for (const auto& name : extra) {
+            if (!m.features.count(name)) {
+                std::println(std::cerr,
+                             "bake: feature '{}' is not declared by "
+                             "package '{}'",
+                             name,
+                             m.moid ? m.moid->name : std::string("<unknown>"));
+                return std::nullopt;
+            }
+        }
+        // Explicit activation demotes conflicting defaults so their
+        // dependencies are neither resolved nor locked (mirrors graph
+        // resolution — see demote_conflicting_defaults).
+        return demote_conflicting_defaults(m, extra);
+    };
+
+    auto enqueue_scopes = [&](const Manifest& m,
+                              const std::set<std::string>& active,
+                              const std::string& parent) {
+        std::vector<const std::map<std::string, Dependency>*> scopes;
+        scopes.push_back(&m.dependencies);
+        for (const auto& condition : m.targets)
+            scopes.push_back(&condition.dependencies);
+        for (const auto& name : active)
+            scopes.push_back(&m.features.at(name).dependencies);
+        for (auto* scope : scopes)
+            for (auto& [name, dep] : *scope)
+                queue.push_back({dep, m.project_dir,
+                                 {dep.features.begin(), dep.features.end()},
+                                 parent});
+    };
+
+    // Pick a tag for a version-constrained dependency. Registers the
+    // requirement, folds same-URL tag pins in as exact constraints, and
+    // prefers a satisfying carried lock entry over the maximum.
+    auto choose_tag = [&](const Dependency& dep,
+                          const std::string& parent)
+            -> std::optional<std::string> {
+        std::string key = normalize_dependency_url(dep.url);
+
+        auto req = semver::Req::parse(dep.version);
+        if (!req) {
+            std::println(std::cerr,
+                         "bake: dependency '{}' has invalid version "
+                         "requirement '{}' in {}",
+                         dep.name, dep.version, parent);
+            return std::nullopt;
+        }
+        auto& list = requirements[key];
+        bool known = false;
+        for (const auto& r : list)
+            if (r.req.text == req->text) known = true;
+        if (!known) list.push_back({*req, parent});
+
+        // A same-URL exact tag participates as an equality constraint.
+        if (auto pin = pins.find(key); pin != pins.end()) {
+            if (auto pinned = semver::Version::parse(pin->second.first)) {
+                bool have = false;
+                for (const auto& r : list)
+                    if (r.req.kind == semver::Req::Kind::Exact &&
+                        r.req.lo == *pinned)
+                        have = true;
+                if (!have)
+                    list.push_back({semver::Req::parse("=" + pin->second.first)
+                                        .value_or(semver::Req{}),
+                                    pin->second.second});
+            } else {
+                std::println(std::cerr,
+                             "bake: dependency '{}' pins tag '{}' while "
+                             "'{}' constrains the same URL by version — "
+                             "unify or pin a semver tag",
+                             pin->second.second, pin->second.first, parent);
+                return std::nullopt;
+            }
+        }
+
+        auto satisfies_all = [&](const semver::Version& v) {
+            std::vector<semver::Req> reqs;
+            reqs.reserve(list.size());
+            for (const auto& r : list) reqs.push_back(r.req);
+            return semver::satisfies_all(v, reqs);
+        };
+
+        // Prefer the locked choice while it satisfies everything.
+        if (hints) {
+            if (const LockDep* hint = hints->find_tag_entry(dep.url)) {
+                auto got = semver::Version::parse(hint->ref);
+                if (got) {
+                    std::vector<semver::Req> only;
+                    only.push_back(*req);
+                    if (semver::satisfies_all(*got, only)) return hint->ref;
+                }
+            }
+        }
+
+        const auto& tags = list_tags(dep.url);
+        std::vector<std::pair<semver::Version, std::string>> candidates;
+        for (const auto& tag : tags)
+            if (auto v = semver::Version::parse(tag))
+                candidates.emplace_back(*v, tag);
+        // Highest first.
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& a, const auto& b) {
+                      if (auto c = a.first <=> b.first; c != 0)
+                          return c > 0;
+                      return a.second > b.second;
+                  });
+
+        std::optional<semver::Version> floor;
+        if (auto f = floors.find(key); f != floors.end())
+            floor = semver::Version::parse(f->second);
+
+        for (const auto& [v, tag] : candidates) {
+            if (!satisfies_all(v)) continue;
+            if (floor && v < *floor) continue;
+            return tag;
+        }
+
+        std::println(std::cerr,
+                     "bake: no version of '{}' satisfies:", dep.url);
+        for (const auto& r : list)
+            std::println(std::cerr, "  '{}' (required by {})", r.req.text,
+                         r.parent);
+        if (candidates.empty()) {
+            std::println(std::cerr, "  (the repository has no semver tags)");
+        } else {
+            std::string available;
+            for (std::size_t i = 0;
+                 i < candidates.size() && i < 10; ++i) {
+                if (!available.empty()) available += ", ";
+                available += candidates[i].second;
+            }
+            std::println(std::cerr, "  available: {}", available);
+        }
+        return std::nullopt;
+    };
+
+    for (int pass = 0;; ++pass) {
+        if (pass > 32) {
+            std::println(std::cerr,
+                         "bake: version resolution did not converge");
+            return std::nullopt;
+        }
+        bool restart = false;
+        queue.clear();
+        activated_by_key.clear();
+        activated_by_path.clear();
+        requirements.clear();
+        pins.clear();
+        expanded.clear();
+        lockfile = Lockfile{};
+        std::size_t entry_count = 0;
+        std::set<std::string> seen_refs;
+
+        auto dedup_key = [](const Dependency& dep) {
+            if (dep.is_archive())
+                return normalize_dependency_url(dep.url) + "\narchive\n";
+            auto pair = dep.git_ref();
+            return normalize_dependency_url(dep.url) + "\n" + pair.first +
+                   "\n" + pair.second;
+        };
+
+        {
+            // CLI root features participate in lock resolution: their
+            // conditional dependencies must be resolved and locked.
+            std::string root_name =
+                manifest.moid ? manifest.moid->name : std::string("root");
+            auto root_active =
+                active_features_of(manifest, root_features);
+            if (!root_active) return std::nullopt;
+            enqueue_scopes(manifest, *root_active, root_name);
+
+            // Workspace members are first-class dependency scopes: their
+            // declarations resolve and lock exactly like the root's.
+            for (auto& member : Manifest::member_manifests(manifest)) {
+                auto member_active = active_features_of(member, {});
+                if (!member_active) return std::nullopt;
+                enqueue_scopes(member, *member_active,
+                               member.moid ? member.moid->name
+                                           : std::string("member"));
+            }
+        }
+
+        const std::size_t MAX_ENTRIES = 256;
+
+        while (!queue.empty()) {
+            if (entry_count >= MAX_ENTRIES) {
+                std::println(std::cerr,
+                             "bake: dependency graph exceeds limit ({} entries)",
+                             MAX_ENTRIES);
+                return std::nullopt;
+            }
+
+            auto entry = queue.front();
+            queue.erase(queue.begin());
+            Dependency dep = entry.dep;
+            std::string norm_url =
+                dep.is_remote() ? normalize_dependency_url(dep.url) : "";
+
+            // Version-constrained: pick the tag now, then flow through
+            // the regular tag path below.
+            if (!dep.version.empty()) {
+                auto tag = choose_tag(dep, entry.parent);
+                if (!tag) return std::nullopt;
+                if (auto done = expanded.find(norm_url);
+                    done != expanded.end() && done->second != *tag) {
+                    restart = true;  // expanded a superseded selection
+                    break;
+                }
+                floors[norm_url] = *tag;
+                dep.tag = *tag;
+                dep.version.clear();
+            } else if (dep.is_remote() && !dep.is_archive() &&
+                       !dep.tag.empty()) {
+                // Remember exact pins so later same-URL version
+                // constraints can fold them in (and refuse non-semver
+                // mixes).
+                pins.emplace(norm_url, std::pair{dep.tag, entry.parent});
+            }
+
+            if (dep.is_path_dep) {
+                Path dep_dir = (entry.manifest_dir / dep.path.c_str())
+                                   .lexically_normal();
+                Path dep_toml = dep_dir / "bake.toml";
+                if (dep_toml.is_regular_file()) {
+                    auto sub_manifest = Manifest::load_moid(dep_dir);
+                    if (sub_manifest) {
+                        sub_manifest->project_dir = dep_dir;
+                        auto& seen = activated_by_path[dep_dir.absolute()];
+                        bool grew = false;
+                        for (const auto& name : entry.features)
+                            if (seen.insert(name).second) grew = true;
+                        if (grew || seen.empty()) {
+                            auto active =
+                                active_features_of(*sub_manifest, seen);
+                            if (!active) return std::nullopt;
+                            enqueue_scopes(*sub_manifest, *active,
+                                           sub_manifest->moid
+                                               ? sub_manifest->moid->name
+                                               : dep.name);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            // A first visit resolves over the network; a later visit
+            // only matters when it activated additional features, in
+            // which case the newly reachable feature dependencies are
+            // enqueued below.
+            auto& accumulated = activated_by_key[dedup_key(dep)];
+            bool grew = false;
+            for (const auto& name : entry.features)
+                if (accumulated.insert(name).second) grew = true;
+            if (!seen_refs.insert(dedup_key(dep)).second && !grew) continue;
+
+            std::string ref_type = dep.is_archive() ? "archive" : "";
+            std::string ref;
+            if (ref_type.empty()) {
+                auto pair = dep.git_ref();
+                ref_type = pair.first;
+                ref = pair.second;
+            }
+
+            // Locked-as-hints: url+ref unchanged → carry the entry
+            // verbatim. No ls-remote, no download. The closure through
+            // the carried entry is still re-enqueued: the hint lock may
+            // have been pruned since it was written, and missing
+            // transitives then resolve normally instead of failing the
+            // graph later.
+            if (hints && !grew) {
+                const LockDep* hint =
+                    hints->find_remote(dep.url, ref_type, ref);
+                if (hint && !hint->integrity.empty() &&
+                    (dep.is_archive() || !hint->commit.empty())) {
+                    if (lockfile.deps.emplace(hint->key, *hint).second)
+                    entry_count++;
+                    if (ref_type == "tag")
+                        expanded[norm_url] = ref;
+                    // Fresh machine with a committed lock: the carried
+                    // entry may have no local cache. Fetch by locked
+                    // identity (no ref movement) so the closure walk
+                    // below — and the graph build later — both find the
+                    // sources. Offline/frozen builds skip this and fail
+                    // at cache verification.
+                    if (!config.offline && !config.frozen &&
+                        !ensure_cached(*hint))
+                        return std::nullopt;
+                    std::string hash = hint->cache_hash();
+                    if (!hash.empty()) {
+                        Path dep_cache = cache_dir_ / hash;
+                        if (auto sub_manifest =
+                                Manifest::load_moid(dep_cache)) {
+                            sub_manifest->project_dir = dep_cache;
+                            auto active = active_features_of(*sub_manifest,
+                                                             accumulated);
+                            if (!active) return std::nullopt;
+                            enqueue_scopes(
+                                *sub_manifest, *active,
+                                sub_manifest->moid
+                                    ? sub_manifest->moid->name
+                                    : hint->name);
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            // Resolve the dependency (network).
+            auto lock_dep = resolve_dependency(dep);
+            if (!lock_dep) return std::nullopt;
+
+            lockfile.deps[lock_dep->key] = *lock_dep;
+            entry_count++;
+            if (ref_type == "tag") expanded[norm_url] = ref;
+
+            // Recurse into native cached sources for transitive deps.
+            std::string hash = lock_dep->cache_hash();
+            if (!hash.empty()) {
+                Path dep_cache = cache_dir_ / hash;
+                if (auto sub_manifest = Manifest::load_moid(dep_cache)) {
+                    sub_manifest->project_dir = dep_cache;
+                    auto active =
+                        active_features_of(*sub_manifest, accumulated);
+                    if (!active) return std::nullopt;
+                    enqueue_scopes(*sub_manifest, *active,
+                                   sub_manifest->moid
+                                       ? sub_manifest->moid->name
+                                       : lock_dep->name);
+                }
+            }
+        }
+
+        if (!restart) break;
+        std::println("  version constraints moved a resolved package; "
+                     "re-resolving");
+    }
+
+    return lockfile;
+}
+
+// Rebuild a lockfile restricted to the entries reachable from the
+// manifest's declared closure (every scope, defaults plus the feature
+// activations requested on dependency edges, with conflicting defaults
+// demoted). Zero network: reachability walks path-dep manifests and
+// cached native sources through lock entries.
+// Used by `bake remove` to drop entries the manifest no longer references.
+export Lockfile prune_lock(const Manifest& manifest, const Lockfile& lock) {
+    Lockfile pruned;
+
+    std::map<Path, std::set<std::string>> visited;
+    std::function<void(const Manifest&, const std::set<std::string>&)> walk =
+        [&](const Manifest& m, const std::set<std::string>& activated) {
+            const std::set<std::string> effective =
+                demote_conflicting_defaults(m, activated);
+            // Workspace members are first-class dependency scopes.
+            for (const auto& member : Manifest::member_manifests(m))
+                walk(member, {});
+            std::vector<const std::map<std::string, Dependency>*> scopes;
+            scopes.push_back(&m.dependencies);
+            for (const auto& condition : m.targets)
+                scopes.push_back(&condition.dependencies);
+            for (const auto& name : effective)
+                if (m.features.count(name))
+                    scopes.push_back(&m.features.at(name).dependencies);
+            for (auto* scope : scopes) {
+                for (auto& [alias, dep] : *scope) {
+                    (void)alias;
+                    if (dep.is_path_dep) {
+                        Path dep_dir = (m.project_dir / dep.path.c_str())
+                                           .lexically_normal();
+                        if ((dep_dir / "bake.toml").is_regular_file()) {
+                            auto& seen = visited[dep_dir.absolute()];
+                            bool grew = false;
+                            for (const auto& name : dep.features)
+                                if (seen.insert(name).second) grew = true;
+                            if (grew || seen.size() == dep.features.size()) {
+                                if (auto sub = Manifest::load_moid(dep_dir)) {
+                                    sub->project_dir = dep_dir;
+                                    walk(*sub, seen);
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    std::string ref_type = dep.is_archive() ? "archive" : "";
+                    std::string ref;
+                    if (ref_type.empty()) {
+                        auto pair = dep.git_ref();
+                        ref_type = pair.first;
+                        ref = pair.second;
+                    }
+                    const LockDep* entry =
+                        dep.version.empty()
+                            ? lock.find_remote(dep.url, ref_type, ref)
+                            : lock.find_tag_entry(dep.url);
+                    if (!entry) continue;  // lock was already stale here
+                    pruned.deps.emplace(entry->key, *entry);
+
+                    // Recurse into cached native sources for transitive
+                    // reach, tracking feature activations per source.
+                    Path cache_dir =
+                        get_cache_dir() / entry->cache_hash();
+                    if (cache_dir.is_directory()) {
+                        auto& seen = visited[cache_dir.absolute()];
+                        bool grew = false;
+                        for (const auto& name : dep.features)
+                            if (seen.insert(name).second) grew = true;
+                        if (grew || seen.size() == dep.features.size()) {
+                            if (auto sub = Manifest::load_moid(cache_dir)) {
+                                sub->project_dir = cache_dir;
+                                walk(*sub, seen);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+    walk(manifest, {});
+    return pruned;
+}
+
+
+} // namespace bake

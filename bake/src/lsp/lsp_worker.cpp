@@ -13,20 +13,18 @@ module;
 #include <unistd.h>
 
 module bake.lsp;
-// TEMP-DEBUG
 
 import std;
-import bake.lsp.proto;
+import bake.core.analysis.proto;
 import bake.toolchain.compilation;
 
 namespace bake {
 
 namespace {
 
-using lsp_proto::WireRequest;
-using lsp_proto::WireResponse;
-using lsp_proto::WireDiagnostic;
-using lsp_proto::WireOccurrence;
+using analysis_proto::WireRequest;
+using analysis_proto::WireResponse;
+using analysis_proto::WireDiagnostic;
 
 // Blocking exact-size read; false on EOF or error.
 bool read_exact(int fd, char* dst, std::size_t size) {
@@ -115,7 +113,7 @@ WireResponse run_one(const WireRequest& req) {
             req.argv, req.remap, req.main_file, req.line, req.column);
         resp.ok = true;
         for (auto& item : items) {
-            lsp_proto::WireCompletion w;
+            analysis_proto::WireCompletion w;
             w.label = std::move(item.label);
             w.detail = std::move(item.detail);
             w.kind = std::move(item.kind);
@@ -123,28 +121,9 @@ WireResponse run_one(const WireRequest& req) {
             resp.items.push_back(std::move(w));
         }
     } else if (req.op == "collect") {
-        auto occurrences =
-            run_symbol_collection(req.argv, req.remap, req.main_file);
         resp.ok = true;
-        for (auto& occ : occurrences) {
-            unsigned flags = 0;
-            if (occ.is_decl) flags |= 1;
-            if (occ.is_def) flags |= 2;
-            if (occ.is_ref) flags |= 4;
-            if (occ.is_call) flags |= 8;
-            WireOccurrence w;
-            w.usr = std::move(occ.usr);
-            w.name = std::move(occ.name);
-            w.kind = std::move(occ.kind);
-            w.flags = flags;
-            w.file = std::move(occ.file);
-            w.line = occ.line;
-            w.column = occ.column;
-            w.decl_file = std::move(occ.decl_file);
-            w.decl_line = occ.decl_line;
-            w.decl_column = occ.decl_column;
-            resp.occurrences.push_back(std::move(w));
-        }
+        resp.occurrences =
+            run_symbol_collection(req.argv, req.remap, req.main_file);
     } else {
         resp.ok = false;
         resp.error = "unknown op '" + req.op + "'";
@@ -158,17 +137,17 @@ int lsp_worker_main([[maybe_unused]] const std::vector<std::string>& args) {
     for (;;) {
         auto frame = read_frame();
         if (!frame) return 0;  // master closed the pipe: clean exit
-        auto req = lsp_proto::decode_request(*frame);
+        auto req = analysis_proto::decode_request(*frame);
         if (!req) {
             // A malformed stream cannot be resynchronized; answer
             // with an error and quit so the master respawns clean.
             WireResponse resp;
             resp.ok = false;
             resp.error = req.error();
-            write_frame(lsp_proto::encode_response(resp));
+            write_frame(analysis_proto::encode_response(resp));
             return 1;
         }
-        if (!write_frame(lsp_proto::encode_response(run_one(*req))))
+        if (!write_frame(analysis_proto::encode_response(run_one(*req))))
             return 1;  // master went away mid-reply
     }
 }

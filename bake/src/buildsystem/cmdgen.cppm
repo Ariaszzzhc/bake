@@ -129,6 +129,18 @@ export std::vector<std::string> make_link_command(const TargetSpec& target,
     if (lc.type == MoidType::Dylib) {
         cmd.push_back("-shared");
         cmd.push_back("-fPIC");
+        const auto has_linker_option = [&](std::string_view option) {
+            return std::ranges::any_of(
+                lc.extra_flags, [&](const std::string& flag) {
+                    return flag.contains(option);
+                });
+        };
+        if (target.is_darwin() && !has_linker_option("install_name"))
+            cmd.push_back("-Wl,-install_name,@rpath/" +
+                          lc.output.filename_string());
+        if (!target.is_darwin() && !target.is_windows() &&
+            !has_linker_option("soname"))
+            cmd.push_back("-Wl,-soname," + lc.output.filename_string());
     }
 
     for (const auto& object : lc.objects)
@@ -154,6 +166,18 @@ export std::vector<std::string> make_link_command(const TargetSpec& target,
 
     for (const auto& flag : lc.extra_flags)
         cmd.push_back(flag);
+
+    const bool has_shared_dependency = std::ranges::any_of(
+        lc.libraries, [](const Path& library) {
+            const auto extension = library.extension().string();
+            return extension == ".dylib" || extension == ".so" ||
+                   extension == ".dll";
+        });
+    if (has_shared_dependency && !target.is_windows()) {
+        cmd.push_back(target.is_darwin()
+            ? "-Wl,-rpath,@loader_path/../lib"
+            : "-Wl,-rpath,$ORIGIN/../lib");
+    }
 
     cmd.push_back("-o");
     cmd.push_back(lc.output.string());
